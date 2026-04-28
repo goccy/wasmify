@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package wasmify;
+
+option go_package = "github.com/goccy/wasmify/proto/wasmify";
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.MessageOptions {
+  bool wasm_handle = 50000;
+  // Immediate (primary) C++ base class. For single inheritance this
+  // is the only parent.
+  string wasm_parent = 50002;
+  // Secondary parents for C++ multiple inheritance. When the C++
+  // class extends two or more bases, `wasm_parent` names the first
+  // and this repeated option lists the remaining bases (already
+  // resolved to proto message names).
+  repeated string wasm_parents = 50012;
+  bool wasm_list_type = 50005;
+  bool wasm_map_type = 50006;
+  string wasm_source_file = 50007;
+  bool wasm_abstract = 50009;
+  // Doc comment lifted from the C++ class declaration. Emitted as a
+  // Go doc comment on the generated handle struct / interface.
+  string wasm_message_comment = 50014;
+}
+
+extend google.protobuf.FieldOptions {
+  // Doc comment lifted from the C++ field declaration.
+  string wasm_field_comment = 50015;
+}
+
+extend google.protobuf.ServiceOptions {
+  bool wasm_callback = 50001;
+  string wasm_service_source_file = 50008;
+  int32 wasm_service_id = 50010;
+}
+
+extend google.protobuf.MethodOptions {
+  string wasm_method_type = 50003;
+  string wasm_original_name = 50004;
+  int32 wasm_method_id = 50011;
+  // Doc comment lifted from the C++ method declaration.
+  string wasm_method_comment = 50016;
+}
+
+extend google.protobuf.EnumOptions {
+  // Doc comment lifted from the C++ enum declaration.
+  string wasm_enum_comment = 50017;
+}
+
+extend google.protobuf.EnumValueOptions {
+  // Doc comment lifted from the C++ enumerator declaration.
+  string wasm_enum_value_comment = 50018;
+}
+
+extend google.protobuf.FileOptions {
+  // Actual C++ namespace of the source library (e.g. "googlesql").
+  // Used by resolveAbstractHandle to map runtime C++ typeid strings
+  // back to Go concrete factories. Without it, the plugin would have
+  // to guess based on the proto package, which is arbitrary.
+  string wasm_cpp_namespace = 50013;
+}

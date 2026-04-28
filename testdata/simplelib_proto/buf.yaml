@@ -1,0 +1,6 @@
+version: v2
+modules:
+  - path: .
+    name: buf.build/goccy/wasmify-test
+deps:
+  - buf.build/protocolbuffers/wellknowntypes

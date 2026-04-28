@@ -1,0 +1,1140 @@
+syntax = "proto3";
+
+package wasmify.simplelib_proto;
+
+option go_package = "github.com/goccy/wasmify/gen/simplelib_proto";
+
+import "wasmify/options.proto";
+
+option (wasmify.wasm_cpp_namespace) = "calc";
+
+enum Value {
+  VALUE_UNSPECIFIED = 0;
+  VALUE_START = 2;
+  VALUE_END = 3;
+}
+
+enum AnchorRaw {
+  ANCHOR_RAW_UNSPECIFIED = 0;
+  ANCHOR_RAW_ANCHOR_UNSPECIFIED = 1;
+  ANCHOR_RAW_START = 2;
+  ANCHOR_RAW_END = 3;
+}
+
+enum ImplicitColor {
+  option (wasmify.wasm_enum_comment) = "Implicit enum exercises the auto-increment fallback: clang emits no\n ConstantExpr for `A`, `B`, `C` because there is no `= N` initialiser,\n so the parser must compute prev+1 to recover 0, 1, 2.";
+  IMPLICIT_COLOR_UNSPECIFIED = 0;
+  IMPLICIT_COLOR_IMPLICIT_RED = 1;
+  IMPLICIT_COLOR_IMPLICIT_GREEN = 2;
+  IMPLICIT_COLOR_IMPLICIT_BLUE = 3;
+}
+
+enum Operation {
+  option (wasmify.wasm_enum_comment) = "Simple enum for operations";
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_ADD = 1;
+  OPERATION_SUBTRACT = 2;
+  OPERATION_MULTIPLY = 3;
+  OPERATION_DIVIDE = 4;
+}
+
+message Anchor {
+}
+
+message AnchorEnums {
+  option (wasmify.wasm_message_comment) = "AnchorEnums mimics the shape that protobuf-generated headers use:\n the underlying enumerators live at file/class scope with mangled\n names, then a wrapper class re-exports them via a typedef + an\n `enum` whose enumerators are initialised from the mangled aliases.\n clang wraps each initialiser in ImplicitCastExpr (because the inner\n `enum` has no fixed underlying type), so the parser must look one\n level deeper than ConstantExpr to recover the integer value. This\n reproduces the `Anchor::Start = Anchor::End = 1` collapse that the\n fix in findEnumConstantValue addresses.";
+}
+
+message Animal {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "(B) Multi-level chain. Every accessor defined at each level must be\n callable directly on the leaf Dog handle.";
+  uint64 ptr = 1;
+}
+
+message Calculator {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "Calculator class with methods and inheritance";
+  uint64 ptr = 1;
+}
+
+message Canine {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Mammal";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Circle {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Shape";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Dog {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Canine";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message HeadingNode {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "TextNode";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Logger {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_abstract) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "Abstract interface that users can implement from Go. The bridge emits a\n trampoline that dispatches each pure-virtual through the callback wire\n (wasmify_callback_invoke) so a Go type can satisfy the C++ vtable.";
+  uint64 ptr = 1;
+}
+
+message Mammal {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Animal";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message ManagedFactory {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "ManagedValue exercises the \"concrete class with non-public destructor\"\n case that googlesql's type hierarchy uses. Lifetime is owned by\n ManagedFactory (analogous to TypeFactory); user code only ever sees\n raw pointers and must not delete them. The bridge must still emit a\n Service for ManagedValue with all its accessors, but must NOT emit a\n Free RPC (the caller can't safely delete).";
+  uint64 ptr = 1;
+}
+
+message ManagedValue {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Named {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "(C) Multiple inheritance. Product picks up Named and Priced accessors\n side by side. Both sides of the diamond are non-virtual; the Go struct\n must embed both parents so method promotion reaches either tree.";
+  uint64 ptr = 1;
+}
+
+message Priced {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Product {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Named";
+  option (wasmify.wasm_parents) = "Priced";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Result {
+  option (wasmify.wasm_message_comment) = "POD struct for computation results";
+  string error_message = 1;
+  bool ok = 2;
+  double value = 3;
+}
+
+message ScientificCalculator {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Calculator";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "Derived class";
+  uint64 ptr = 1;
+}
+
+message Shape {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_abstract) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "(A) Abstract base for downcast-via-assertion test.";
+  uint64 ptr = 1;
+}
+
+message ShapeBox {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message Square {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_parent) = "Shape";
+  option (wasmify.wasm_source_file) = "calculator.h";
+  uint64 ptr = 1;
+}
+
+message StatefulCounter {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "StatefulCounter: a class with MIXED public and private state used to\n regression-test handle-based state preservation across the bridge.\n\n - `label` is a public field (visible via the direct accessor below)\n - `sum_` and `call_count_` are private state that can only be observed\n   through the public methods `total()` and `call_count()`.\n - No virtual methods, so the existing handle-promotion rules based on\n   virtual dispatch do NOT apply; this class exercises the code path\n   that reclassifies mixed-field classes via HasPrivateFields.\n\n If the bridge treated this as a value type, each `add()` call would run\n against a freshly-constructed temporary and `sum_` would reset between\n calls. The test `TestStatefulCounterStatePreservation` verifies that\n does not happen.";
+  uint64 ptr = 1;
+}
+
+message TextNode {
+  option (wasmify.wasm_handle) = true;
+  option (wasmify.wasm_abstract) = true;
+  option (wasmify.wasm_source_file) = "calculator.h";
+  option (wasmify.wasm_message_comment) = "TextNode / HeadingNode regression-test the abstract-handle naming\n rule. TextNode itself ends in \"Node\", so the generator must emit the\n Go interface as `TextNode` (not the doubled `TextNodeNode`) and\n rename the abstract struct to `TextNodeBase` so it does not collide\n with the interface. HeadingNode is a concrete descendant whose struct\n embeds `*TextNodeBase`.";
+  uint64 ptr = 1;
+}
+
+message AddRequest {
+  double a = 1;
+  double b = 2;
+}
+
+message AddResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message AggregateResultsRequest {
+  repeated double values = 1;
+}
+
+message AggregateResultsResponse {
+  repeated Result result = 1;
+  string error = 15;
+}
+
+message FormatResultRequest {
+  Result r = 1;
+}
+
+message FormatResultResponse {
+  string result = 1;
+  string error = 15;
+}
+
+message RunWithLoggerRequest {
+  Logger logger = 1;
+  string message = 2;
+}
+
+message RunWithLoggerResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message VersionRequest {
+}
+
+message VersionResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message Empty {}
+
+service SimplelibProto {
+  option (wasmify.wasm_service_id) = 0;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Add(AddRequest) returns (AddResponse) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_comment) = "Free functions";
+  }
+  rpc AggregateResults(AggregateResultsRequest) returns (AggregateResultsResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc FormatResult(FormatResultRequest) returns (FormatResultResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc RunWithLogger(RunWithLoggerRequest) returns (RunWithLoggerResponse) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_comment) = "Exercises the Logger callback end-to-end: invokes both virtuals on the\n supplied logger and returns the level it reported.";
+  }
+  rpc Version(VersionRequest) returns (VersionResponse) {
+    option (wasmify.wasm_method_id) = 4;
+  }
+}
+
+service AnimalService {
+  option (wasmify.wasm_service_id) = 1;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc SetSpecies(AnimalSetSpeciesRequest) returns (AnimalSetSpeciesResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc Species(AnimalSpeciesRequest) returns (AnimalSpeciesResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(Animal) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message AnimalSetSpeciesRequest {
+  Animal handle = 1;
+  string s = 2;
+}
+
+message AnimalSetSpeciesResponse {
+  string error = 15;
+}
+
+message AnimalSpeciesRequest {
+  Animal handle = 1;
+}
+
+message AnimalSpeciesResponse {
+  string result = 1;
+  string error = 15;
+}
+
+service CalculatorService {
+  option (wasmify.wasm_service_id) = 2;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(CalculatorNewRequest) returns (Calculator) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc AddToHistory(CalculatorAddToHistoryRequest) returns (CalculatorAddToHistoryResponse) {
+    option (wasmify.wasm_method_id) = 1;
+    option (wasmify.wasm_method_comment) = "History";
+  }
+  rpc ClearHistory(CalculatorClearHistoryRequest) returns (CalculatorClearHistoryResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Compute(CalculatorComputeRequest) returns (CalculatorComputeResponse) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_comment) = "Basic operations";
+  }
+  rpc ComputeSafe(CalculatorComputeSafeRequest) returns (CalculatorComputeSafeResponse) {
+    option (wasmify.wasm_method_id) = 4;
+  }
+  rpc GetHistory(CalculatorGetHistoryRequest) returns (CalculatorGetHistoryResponse) {
+    option (wasmify.wasm_method_id) = 5;
+  }
+  rpc Name(CalculatorNameRequest) returns (CalculatorNameResponse) {
+    option (wasmify.wasm_method_id) = 6;
+    option (wasmify.wasm_method_comment) = "Name";
+  }
+  rpc SetName(CalculatorSetNameRequest) returns (CalculatorSetNameResponse) {
+    option (wasmify.wasm_method_id) = 7;
+  }
+  rpc Free(Calculator) returns (Empty) {
+    option (wasmify.wasm_method_id) = 8;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message CalculatorNewRequest {
+}
+
+message CalculatorAddToHistoryRequest {
+  Calculator handle = 1;
+  double value = 2;
+}
+
+message CalculatorAddToHistoryResponse {
+  string error = 15;
+}
+
+message CalculatorClearHistoryRequest {
+  Calculator handle = 1;
+}
+
+message CalculatorClearHistoryResponse {
+  string error = 15;
+}
+
+message CalculatorComputeRequest {
+  Calculator handle = 1;
+  Operation op = 2;
+  double a = 3;
+  double b = 4;
+}
+
+message CalculatorComputeResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message CalculatorComputeSafeRequest {
+  Calculator handle = 1;
+  Operation op = 2;
+  double a = 3;
+  double b = 4;
+}
+
+message CalculatorComputeSafeResponse {
+  Result result = 1;
+  string error = 15;
+}
+
+message CalculatorGetHistoryRequest {
+  Calculator handle = 1;
+}
+
+message CalculatorGetHistoryResponse {
+  repeated double result = 1;
+  string error = 15;
+}
+
+message CalculatorNameRequest {
+  Calculator handle = 1;
+}
+
+message CalculatorNameResponse {
+  string result = 1;
+  string error = 15;
+}
+
+message CalculatorSetNameRequest {
+  Calculator handle = 1;
+  string name = 2;
+}
+
+message CalculatorSetNameResponse {
+  string error = 15;
+}
+
+service CanineService {
+  option (wasmify.wasm_service_id) = 3;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Breed(CanineBreedRequest) returns (CanineBreedResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc SetBreed(CanineSetBreedRequest) returns (CanineSetBreedResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(Canine) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message CanineBreedRequest {
+  Canine handle = 1;
+}
+
+message CanineBreedResponse {
+  string result = 1;
+  string error = 15;
+}
+
+message CanineSetBreedRequest {
+  Canine handle = 1;
+  string b = 2;
+}
+
+message CanineSetBreedResponse {
+  string error = 15;
+}
+
+service CircleService {
+  option (wasmify.wasm_service_id) = 4;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(CircleNewRequest) returns (Circle) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc Area(CircleAreaRequest) returns (CircleAreaResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Radius(CircleRadiusRequest) returns (CircleRadiusResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Free(Circle) returns (Empty) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message CircleNewRequest {
+  double r = 1;
+}
+
+message CircleAreaRequest {
+  Circle handle = 1;
+}
+
+message CircleAreaResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message CircleRadiusRequest {
+  Circle handle = 1;
+}
+
+message CircleRadiusResponse {
+  double result = 1;
+  string error = 15;
+}
+
+service DogService {
+  option (wasmify.wasm_service_id) = 5;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(DogNewRequest) returns (Dog) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc BarkVolume(DogBarkVolumeRequest) returns (DogBarkVolumeResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc SetBarkVolume(DogSetBarkVolumeRequest) returns (DogSetBarkVolumeResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Free(Dog) returns (Empty) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message DogNewRequest {
+}
+
+message DogBarkVolumeRequest {
+  Dog handle = 1;
+}
+
+message DogBarkVolumeResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message DogSetBarkVolumeRequest {
+  Dog handle = 1;
+  int32 v = 2;
+}
+
+message DogSetBarkVolumeResponse {
+  string error = 15;
+}
+
+service HeadingNodeService {
+  option (wasmify.wasm_service_id) = 6;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(HeadingNodeNewRequest) returns (HeadingNode) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc Render(HeadingNodeRenderRequest) returns (HeadingNodeRenderResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(HeadingNode) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message HeadingNodeNewRequest {
+  int32 level = 1;
+  string text = 2;
+}
+
+message HeadingNodeRenderRequest {
+  HeadingNode handle = 1;
+}
+
+message HeadingNodeRenderResponse {
+  string result = 1;
+  string error = 15;
+}
+
+service LoggerService {
+  option (wasmify.wasm_service_id) = 7;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Level(LoggerLevelRequest) returns (LoggerLevelResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc Log(LoggerLogRequest) returns (LoggerLogResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc FromCallback(LoggerFromCallbackRequest) returns (Logger) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "callback_factory";
+  }
+  rpc Free(Logger) returns (Empty) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message LoggerFromCallbackRequest {
+  int32 callback_id = 1;
+}
+
+message LoggerLevelRequest {
+  Logger handle = 1;
+}
+
+message LoggerLevelResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message LoggerLogRequest {
+  Logger handle = 1;
+  string message = 2;
+}
+
+message LoggerLogResponse {
+  string error = 15;
+}
+
+service MammalService {
+  option (wasmify.wasm_service_id) = 8;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Legs(MammalLegsRequest) returns (MammalLegsResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc SetLegs(MammalSetLegsRequest) returns (MammalSetLegsResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(Mammal) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message MammalLegsRequest {
+  Mammal handle = 1;
+}
+
+message MammalLegsResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message MammalSetLegsRequest {
+  Mammal handle = 1;
+  int32 n = 2;
+}
+
+message MammalSetLegsResponse {
+  string error = 15;
+}
+
+service ManagedFactoryService {
+  option (wasmify.wasm_service_id) = 9;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(ManagedFactoryNewRequest) returns (ManagedFactory) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc Make(ManagedFactoryMakeRequest) returns (ManagedFactoryMakeResponse) {
+    option (wasmify.wasm_method_id) = 1;
+    option (wasmify.wasm_method_comment) = "Creates and owns a new ManagedValue. Caller must not delete.";
+  }
+  rpc Free(ManagedFactory) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message ManagedFactoryNewRequest {
+}
+
+message ManagedFactoryMakeRequest {
+  ManagedFactory handle = 1;
+  int32 kind = 2;
+  string tag = 3;
+}
+
+message ManagedFactoryMakeResponse {
+  ManagedValue result = 1;
+  string error = 15;
+}
+
+service ManagedValueService {
+  option (wasmify.wasm_service_id) = 10;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Kind(ManagedValueKindRequest) returns (ManagedValueKindResponse) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_comment) = "Accessors are public.";
+  }
+  rpc Tag(ManagedValueTagRequest) returns (ManagedValueTagResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+}
+
+message ManagedValueKindRequest {
+  ManagedValue handle = 1;
+}
+
+message ManagedValueKindResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message ManagedValueTagRequest {
+  ManagedValue handle = 1;
+}
+
+message ManagedValueTagResponse {
+  string result = 1;
+  string error = 15;
+}
+
+service NamedService {
+  option (wasmify.wasm_service_id) = 11;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc NamedName(NamedNamedNameRequest) returns (NamedNamedNameResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc SetNamedName(NamedSetNamedNameRequest) returns (NamedSetNamedNameResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(Named) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message NamedNamedNameRequest {
+  Named handle = 1;
+}
+
+message NamedNamedNameResponse {
+  string result = 1;
+  string error = 15;
+}
+
+message NamedSetNamedNameRequest {
+  Named handle = 1;
+  string n = 2;
+}
+
+message NamedSetNamedNameResponse {
+  string error = 15;
+}
+
+service PricedService {
+  option (wasmify.wasm_service_id) = 12;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc PricedPrice(PricedPricedPriceRequest) returns (PricedPricedPriceResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc SetPricedPrice(PricedSetPricedPriceRequest) returns (PricedSetPricedPriceResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(Priced) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message PricedPricedPriceRequest {
+  Priced handle = 1;
+}
+
+message PricedPricedPriceResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message PricedSetPricedPriceRequest {
+  Priced handle = 1;
+  double p = 2;
+}
+
+message PricedSetPricedPriceResponse {
+  string error = 15;
+}
+
+service ProductService {
+  option (wasmify.wasm_service_id) = 13;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(ProductNewRequest) returns (Product) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc SetStock(ProductSetStockRequest) returns (ProductSetStockResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Stock(ProductStockRequest) returns (ProductStockResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Free(Product) returns (Empty) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message ProductNewRequest {
+}
+
+message ProductSetStockRequest {
+  Product handle = 1;
+  int32 s = 2;
+}
+
+message ProductSetStockResponse {
+  string error = 15;
+}
+
+message ProductStockRequest {
+  Product handle = 1;
+}
+
+message ProductStockResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+service ScientificCalculatorService {
+  option (wasmify.wasm_service_id) = 14;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Power(ScientificCalculatorPowerRequest) returns (ScientificCalculatorPowerResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc Sqrt(ScientificCalculatorSqrtRequest) returns (ScientificCalculatorSqrtResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Free(ScientificCalculator) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message ScientificCalculatorPowerRequest {
+  ScientificCalculator handle = 1;
+  double base = 2;
+  double exp = 3;
+}
+
+message ScientificCalculatorPowerResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message ScientificCalculatorSqrtRequest {
+  ScientificCalculator handle = 1;
+  double value = 2;
+}
+
+message ScientificCalculatorSqrtResponse {
+  double result = 1;
+  string error = 15;
+}
+
+service ShapeService {
+  option (wasmify.wasm_service_id) = 15;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Area(ShapeAreaRequest) returns (ShapeAreaResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc FromCallback(ShapeFromCallbackRequest) returns (Shape) {
+    option (wasmify.wasm_method_id) = 1;
+    option (wasmify.wasm_method_type) = "callback_factory";
+  }
+  rpc Free(Shape) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message ShapeFromCallbackRequest {
+  int32 callback_id = 1;
+}
+
+message ShapeAreaRequest {
+  Shape handle = 1;
+}
+
+message ShapeAreaResponse {
+  double result = 1;
+  string error = 15;
+}
+
+service ShapeBoxService {
+  option (wasmify.wasm_service_id) = 16;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(ShapeBoxNewRequest) returns (ShapeBox) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc Add(ShapeBoxAddRequest) returns (ShapeBoxAddResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Get(ShapeBoxGetRequest) returns (ShapeBoxGetResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Size(ShapeBoxSizeRequest) returns (ShapeBoxSizeResponse) {
+    option (wasmify.wasm_method_id) = 3;
+  }
+  rpc Free(ShapeBox) returns (Empty) {
+    option (wasmify.wasm_method_id) = 4;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message ShapeBoxNewRequest {
+}
+
+message ShapeBoxAddRequest {
+  ShapeBox handle = 1;
+  Shape s = 2;
+}
+
+message ShapeBoxAddResponse {
+  string error = 15;
+}
+
+message ShapeBoxGetRequest {
+  ShapeBox handle = 1;
+  int32 i = 2;
+}
+
+message ShapeBoxGetResponse {
+  Shape result = 1;
+  string error = 15;
+}
+
+message ShapeBoxSizeRequest {
+  ShapeBox handle = 1;
+}
+
+message ShapeBoxSizeResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+service SquareService {
+  option (wasmify.wasm_service_id) = 17;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(SquareNewRequest) returns (Square) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc Area(SquareAreaRequest) returns (SquareAreaResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+  rpc Side(SquareSideRequest) returns (SquareSideResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc Free(Square) returns (Empty) {
+    option (wasmify.wasm_method_id) = 3;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message SquareNewRequest {
+  double s = 1;
+}
+
+message SquareAreaRequest {
+  Square handle = 1;
+}
+
+message SquareAreaResponse {
+  double result = 1;
+  string error = 15;
+}
+
+message SquareSideRequest {
+  Square handle = 1;
+}
+
+message SquareSideResponse {
+  double result = 1;
+  string error = 15;
+}
+
+service StatefulCounterService {
+  option (wasmify.wasm_service_id) = 18;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc New(StatefulCounterNewRequest) returns (StatefulCounter) {
+    option (wasmify.wasm_method_id) = 0;
+    option (wasmify.wasm_method_type) = "constructor";
+  }
+  rpc New2(StatefulCounterNew2Request) returns (StatefulCounter) {
+    option (wasmify.wasm_method_id) = 1;
+    option (wasmify.wasm_method_type) = "constructor";
+    option (wasmify.wasm_original_name) = "StatefulCounter2";
+  }
+  rpc Add(StatefulCounterAddRequest) returns (StatefulCounterAddResponse) {
+    option (wasmify.wasm_method_id) = 2;
+  }
+  rpc CallCount(StatefulCounterCallCountRequest) returns (StatefulCounterCallCountResponse) {
+    option (wasmify.wasm_method_id) = 3;
+  }
+  rpc Id(StatefulCounterIdRequest) returns (StatefulCounterIdResponse) {
+    option (wasmify.wasm_method_id) = 4;
+  }
+  rpc Reset(StatefulCounterResetRequest) returns (StatefulCounterResetResponse) {
+    option (wasmify.wasm_method_id) = 5;
+  }
+  rpc SetLabel(StatefulCounterSetLabelRequest) returns (StatefulCounterSetLabelResponse) {
+    option (wasmify.wasm_method_id) = 6;
+  }
+  rpc Total(StatefulCounterTotalRequest) returns (StatefulCounterTotalResponse) {
+    option (wasmify.wasm_method_id) = 7;
+  }
+  rpc GetLabel(StatefulCounter) returns (StatefulCounterGetLabelResponse) {
+    option (wasmify.wasm_method_id) = 8;
+    option (wasmify.wasm_method_type) = "getter";
+    option (wasmify.wasm_method_comment) = "public field: intentionally exposed";
+  }
+  rpc Free(StatefulCounter) returns (Empty) {
+    option (wasmify.wasm_method_id) = 9;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message StatefulCounterNewRequest {
+}
+
+message StatefulCounterNew2Request {
+  int32 initial_id = 1;
+}
+
+message StatefulCounterAddRequest {
+  StatefulCounter handle = 1;
+  int32 delta = 2;
+}
+
+message StatefulCounterAddResponse {
+  string error = 15;
+}
+
+message StatefulCounterCallCountRequest {
+  StatefulCounter handle = 1;
+}
+
+message StatefulCounterCallCountResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message StatefulCounterIdRequest {
+  StatefulCounter handle = 1;
+}
+
+message StatefulCounterIdResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message StatefulCounterResetRequest {
+  StatefulCounter handle = 1;
+}
+
+message StatefulCounterResetResponse {
+  string error = 15;
+}
+
+message StatefulCounterSetLabelRequest {
+  StatefulCounter handle = 1;
+  int32 new_label = 2;
+}
+
+message StatefulCounterSetLabelResponse {
+  string error = 15;
+}
+
+message StatefulCounterTotalRequest {
+  StatefulCounter handle = 1;
+}
+
+message StatefulCounterTotalResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message StatefulCounterGetLabelResponse {
+  int32 value = 1;
+}
+
+service TextNodeService {
+  option (wasmify.wasm_service_id) = 19;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Render(TextNodeRenderRequest) returns (TextNodeRenderResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc FromCallback(TextNodeFromCallbackRequest) returns (TextNode) {
+    option (wasmify.wasm_method_id) = 1;
+    option (wasmify.wasm_method_type) = "callback_factory";
+  }
+  rpc Free(TextNode) returns (Empty) {
+    option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_type) = "free";
+  }
+}
+
+message TextNodeFromCallbackRequest {
+  int32 callback_id = 1;
+}
+
+message TextNodeRenderRequest {
+  TextNode handle = 1;
+}
+
+message TextNodeRenderResponse {
+  string result = 1;
+  string error = 15;
+}
+
+service LoggerCallbackService {
+  option (wasmify.wasm_callback) = true;
+  option (wasmify.wasm_service_id) = 20;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Level(LoggerCallbackLevelRequest) returns (LoggerCallbackLevelResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+  rpc Log(LoggerCallbackLogRequest) returns (LoggerCallbackLogResponse) {
+    option (wasmify.wasm_method_id) = 1;
+  }
+}
+
+message LoggerCallbackLevelRequest {
+}
+
+message LoggerCallbackLevelResponse {
+  int32 result = 1;
+  string error = 15;
+}
+
+message LoggerCallbackLogRequest {
+  string message = 1;
+}
+
+message LoggerCallbackLogResponse {
+  string error = 15;
+}
+
+service ShapeCallbackService {
+  option (wasmify.wasm_callback) = true;
+  option (wasmify.wasm_service_id) = 21;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Area(ShapeCallbackAreaRequest) returns (ShapeCallbackAreaResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+}
+
+message ShapeCallbackAreaRequest {
+}
+
+message ShapeCallbackAreaResponse {
+  double result = 1;
+  string error = 15;
+}
+
+service TextNodeCallbackService {
+  option (wasmify.wasm_callback) = true;
+  option (wasmify.wasm_service_id) = 22;
+  option (wasmify.wasm_service_source_file) = "calculator.h";
+  rpc Render(TextNodeCallbackRenderRequest) returns (TextNodeCallbackRenderResponse) {
+    option (wasmify.wasm_method_id) = 0;
+  }
+}
+
+message TextNodeCallbackRenderRequest {
+}
+
+message TextNodeCallbackRenderResponse {
+  string result = 1;
+  string error = 15;
+}
+

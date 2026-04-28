@@ -1,0 +1,59 @@
+{
+  "version": "1",
+  "upstream": {
+    "path": ".",
+    "commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
+    "branch": "wasmify"
+  },
+  "project": {
+    "name": "simplelib",
+    "root_dir": "/Users/goccy/Development/goccy/wasmify/testdata/simplelib",
+    "language": "c++"
+  },
+  "build_system": {
+    "type": "make",
+    "files": [
+      "Makefile"
+    ]
+  },
+  "targets": [
+    {
+      "name": "libcalculator",
+      "type": "library",
+      "source_dirs": [
+        "/Users/goccy/Development/goccy/wasmify/testdata/simplelib"
+      ],
+      "public_headers": [
+        "calculator.h"
+      ]
+    }
+  ],
+  "build_commands": {
+    "configure": null,
+    "build": "make"
+  },
+  "user_selection": {
+    "target_name": "libcalculator",
+    "build_type": "library"
+  },
+  "phases": {
+    "gen-proto": {
+      "completed_at": "2026-04-25T14:48:49Z",
+      "upstream_commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
+      "output_files": [
+        "proto/simplelib_proto.proto",
+        "proto/wasmify/options.proto",
+        "bridge/api_bridge.cc",
+        "bridge/api_bridge.h"
+      ]
+    },
+    "parse-headers": {
+      "completed_at": "2026-04-25T13:36:36Z",
+      "upstream_commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
+      "output_files": [
+        "api-spec.json"
+      ]
+    }
+  },
+  "analyzed_at": "2026-03-09T05:33:48Z"
+}

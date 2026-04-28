@@ -30,3 +30,14 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Claude Code local state
+.claude/
+.tmp/
+
+# Built binaries at repo root (from `go build` without -o)
+/wasmify
+/protoc-gen-wasmify-go
+
+
+gen/
