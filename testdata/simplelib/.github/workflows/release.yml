@@ -1,0 +1,60 @@
+name: Build WASM
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Upstream source is expected to be a git submodule of this repo.
+          # If you vendor it differently, replace this with an explicit clone.
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Install wasmify
+        run: go install github.com/goccy/wasmify/cmd/wasmify@latest
+
+      # Cache wasmify state.
+      # - .wasmify/   per-project build cache (.o / .a / cache.json)
+      # - ~/.config/wasmify/bin/wasi-sdk   shared toolchain (~500MB tarball)
+      # The key is bumped whenever config files that affect the build change;
+      # the pinned wasi-sdk version (31.0) is in the key so bumping the SDK
+      # version busts old caches automatically.
+      - name: Cache wasmify state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .wasmify
+            ~/.config/wasmify/bin/wasi-sdk
+          key: wasmify-31.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('wasmify.json', 'bridge-config.json', 'arch.json', 'build.json', 'proto/**') }}
+          restore-keys: |
+            wasmify-31.0-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install build tools and wasi-sdk
+        # Reads arch.json and installs every tool listed under required_tools
+        # plus wasi-sdk. No Coding Agent needed in CI. Skipped work when the
+        # caches above restored a hit.
+        run: make tools
+      - name: Build WASM
+        run: make wasm
+      - name: Attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'wasm/*.wasm'
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: wasm/*.wasm
