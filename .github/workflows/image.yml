@@ -20,6 +20,8 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write          # for actions/attest-build-provenance OIDC token
+  attestations: write
 
 jobs:
   image:
@@ -27,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve image tags
+      - name: Resolve image name and tags
         id: tags
         run: |
           set -eu
@@ -48,6 +50,9 @@ jobs:
             echo
             echo EOF
           } >> "${GITHUB_OUTPUT}"
+          # Plain image name (no tag) — the attestation subject. Tags
+          # share one digest, so a single attestation covers all of them.
+          echo "image=${REPO}" >> "${GITHUB_OUTPUT}"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -58,6 +63,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -66,6 +72,22 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest build provenance
+        # SLSA build-provenance attestation, signed by the GitHub
+        # Actions OIDC issuer and pushed to the registry alongside the
+        # image manifest. Consumers verify with
+        # `gh attestation verify oci://ghcr.io/<owner>/wasmify@<digest>`
+        # or `cosign verify-attestation`. The attestations API rejects
+        # writes from user-owned private repos; gate on visibility so a
+        # private-repo run does not fail at the very last step. Flips
+        # back on automatically the moment the repo is made public.
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   smoke:
     needs: image
