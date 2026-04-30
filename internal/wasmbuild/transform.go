@@ -769,39 +769,84 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 }
 
 // rewriteOutputPath maps a native output path to the wasm build directory.
+//
+// The function is idempotent: if `originalPath` already lives directly
+// under `<buildDir>/<subdir>/` it is returned as-is. This matters for
+// archive steps, where the output path is set on `args[1]` and then the
+// whole arg list is fed through `rewriteInputPaths`. Without the
+// idempotency guard the second pass would re-disambiguate the already-
+// disambiguated archive name and append a spurious `__lib` suffix
+// (e.g. `libtype__public.a` -> `libtype__public__lib.a`).
 func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 	if originalPath == "" {
 		return ""
 	}
+	prefix := filepath.Join(buildDir, subdir) + string(filepath.Separator)
+	if strings.HasPrefix(originalPath, prefix) {
+		return originalPath
+	}
 	base := filepath.Base(originalPath)
+	ext := filepath.Ext(base)
 	// For .o files, derive a unique prefix from the parent directory to
 	// avoid collisions when multiple bazel targets produce the same
 	// basename (e.g., parser.o from project/parser vs protobuf/compiler).
 	// The prefix is the last meaningful directory segment of the original
 	// bazel output path (e.g., "parser" from "_objs/parser/parser.o",
 	// "importer" from "_objs/importer/parser.o").
-	ext := filepath.Ext(base)
 	if ext == ".o" && subdir == "obj" {
 		stem := strings.TrimSuffix(base, ext)
-		// Walk up the directory tree to find a disambiguating segment.
-		// Bazel outputs are like: bazel-out/.../project/parser/_objs/parser/parser.o
-		// The _objs/<target>/ directory is often the same as the filename,
-		// so we go one more level up to get the library name (e.g., "parser"
-		// from "project/parser").
+		// Bazel writes per-target object files at
+		//   bazel-out/.../<package>/_objs/<target>/<source>.o
+		// Two distinct cc_library targets can share the same target
+		// subdirectory name (e.g. `googlesql/public/_objs/type_proto/`
+		// and `external/protobuf~/src/google/protobuf/_objs/type_proto/`
+		// both contain a `type.pb.o`). Compose the suffix from the
+		// target subdir AND its containing package so siblings in
+		// different bazel packages survive side by side.
 		dir := filepath.Dir(originalPath)
-		parentDir := filepath.Base(dir)
-		if parentDir == stem || parentDir == "_objs" {
-			// Go one more level up
-			grandParent := filepath.Base(filepath.Dir(dir))
-			if grandParent == "_objs" {
-				grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))
-			}
+		parentDir := filepath.Base(dir)              // typically the cc_library target name
+		grandParent := filepath.Base(filepath.Dir(dir)) // either "_objs" or, when no _objs, the package
+		if grandParent == "_objs" {
+			grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))
+		}
+		// Build the suffix in increasing specificity. parentDir alone is
+		// the most common, but if it equals the stem (a redundant repeat
+		// like "_objs/parser/parser.o") we lean on the grandparent
+		// instead. When both are meaningful and distinct, join them so
+		// the suffix is unique even for two targets named alike under
+		// different packages.
+		var suffix string
+		switch {
+		case parentDir == stem || parentDir == "_objs":
 			if grandParent != "" && grandParent != "." && grandParent != stem {
-				parentDir = grandParent
+				suffix = grandParent
+			}
+		case grandParent != "" && grandParent != "." && grandParent != stem && grandParent != parentDir:
+			suffix = parentDir + "_" + grandParent
+		default:
+			if parentDir != "" && parentDir != "." && parentDir != stem {
+				suffix = parentDir
 			}
 		}
+		if suffix != "" {
+			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(suffix)+ext)
+		}
+	}
+	// For .a / .lo archives, bazel emits one archive per cc_library
+	// target named lib<target>.a in the package's output directory.
+	// Sibling cc_libraries in different packages can have the same
+	// target name (e.g. `googlesql/public/libtype.a` from cc_library
+	// "type" alongside `googlesql/public/types/libtype.a` from a
+	// different cc_library also named "type"). Collapsing to the
+	// basename here would silently overwrite one with the other in
+	// `<buildDir>/lib/`, dropping every .o the loser archived. Encode
+	// the package directory into the filename so co-located archives
+	// from distinct bazel packages survive side by side.
+	if (ext == ".a" || ext == ".lo") && subdir == "lib" {
+		stem := strings.TrimSuffix(base, ext)
+		parentDir := filepath.Base(filepath.Dir(originalPath))
 		if parentDir != "" && parentDir != "." && parentDir != stem {
-			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(parentDir)+ext)
+			return filepath.Join(buildDir, subdir, stem+"__"+sanitizeDirName(parentDir)+ext)
 		}
 	}
 	return filepath.Join(buildDir, subdir, base)
@@ -876,7 +921,10 @@ func rewriteInputPaths(args []string, buildDir string) []string {
 			// Use the same collision-safe naming as rewriteOutputPath
 			result[i] = rewriteOutputPath(arg, buildDir, "obj")
 		case ".a", ".lo":
-			result[i] = filepath.Join(buildDir, "lib", filepath.Base(arg))
+			// Same collision-safe naming as rewriteOutputPath so that
+			// archive references in link/archive command lines resolve
+			// to the disambiguated paths produced for archive outputs.
+			result[i] = rewriteOutputPath(arg, buildDir, "lib")
 		default:
 			result[i] = arg
 		}
