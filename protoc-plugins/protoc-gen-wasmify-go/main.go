@@ -469,6 +469,7 @@ const unifiedImports = `import (
 	"fmt"
 	"math"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -491,6 +492,7 @@ const unifiedImportAnchors = `var (
 	_ = fmt.Errorf
 	_ = math.Float32bits
 	_ = runtime.SetFinalizer
+	_ = sort.Search
 	_ = strings.TrimSpace
 	_ = strconv.Itoa
 	_ = sync.Once{}
@@ -589,7 +591,9 @@ func generateProtoHelpers(pkg string) string {
 const protoHelpersBody = `import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
+	"strconv"
 )
 
 // pbAppendVarint appends a varint-encoded uint64.
@@ -825,9 +829,139 @@ func readHandlePtr(data []byte) uint64 {
 	return 0
 }
 
+// invokeMethod fans the wasm call out into the runtime, then folds in
+// the (very common) pbExtractError check on the response. Every per-
+// method client wrapper used to repeat the same three lines; this
+// helper collapses them to one call.
+func invokeMethod(svc, mid int32, req []byte) ([]byte, error) {
+	resp, err := module().invoke(svc, mid, req)
+	if err != nil {
+		return nil, err
+	}
+	if e := pbExtractError(resp); e != nil {
+		return nil, e
+	}
+	return resp, nil
+}
+
+// readPtrAtField returns the handle pointer encoded at response field f.
+// f == 1 takes the fast path via readHandlePtr (which already handles
+// both the direct-varint constructor shape and the submessage write_handle
+// shape); other fields are walked once to find the correct submessage.
+// Returns 0 if the field is not present, which is the standard "absent
+// handle" sentinel — callers translate that to (nil, nil).
+func readPtrAtField(resp []byte, f uint32) uint64 {
+	if f == 1 {
+		return readHandlePtr(resp)
+	}
+	pr := &pbReader{data: resp}
+	for ff, w, ok := pr.next(); ok; ff, w, ok = pr.next() {
+		if ff == f {
+			if w == 2 {
+				sub := pr.readSubmessage()
+				return readHandlePtr(sub.data)
+			}
+			return 0
+		}
+		pr.skip(w)
+	}
+	return 0
+}
+
+// decodeChildHandle is the standard accessor-return shape. It reads
+// the handle pointer at field f, returns nil for missing/zero, and
+// otherwise constructs the child via ctor and pins the parent (owner)
+// onto it via setKeepAlive when owner is non-nil. Constructor-style
+// callers (free functions) pass owner=nil; accessors pass the
+// receiver. The child must already implement the unexported keepAlive
+// interface, which every generated handle struct does.
+func decodeChildHandle[T any](resp []byte, field uint32, owner any, ctor func(uint64) *T) *T {
+	ptr := readPtrAtField(resp, field)
+	if ptr == 0 {
+		return nil
+	}
+	child := ctor(ptr)
+	if owner != nil {
+		if ka, ok := any(child).(interface{ setKeepAlive(any) }); ok {
+			ka.setKeepAlive(owner)
+		}
+	}
+	return child
+}
+
+// decodeAbstractAs is the abstract-return counterpart of
+// decodeChildHandle: read field f, look up the runtime concrete type
+// via resolveAbstractHandle, type-assert to I, attach keepAlive when
+// owner is non-nil. ifaceName is only used in the error message when
+// the runtime type does not satisfy I (which is a real bug, not a
+// "missing field" condition).
+func decodeAbstractAs[I any](resp []byte, field uint32, owner any, ifaceName string) (I, error) {
+	var z I
+	ptr := readPtrAtField(resp, field)
+	if ptr == 0 {
+		return z, nil
+	}
+	resolved, err := resolveAbstractHandle(ptr)
+	if err != nil {
+		return z, err
+	}
+	if v, ok := resolved.(I); ok {
+		if owner != nil {
+			if ka, okKA := any(v).(interface{ setKeepAlive(any) }); okKA {
+				ka.setKeepAlive(owner)
+			}
+		}
+		return v, nil
+	}
+	return z, fmt.Errorf("resolved type %T does not implement %s", resolved, ifaceName)
+}
+
+// readScalarAtField walks resp once for field f and reads the value via
+// the read closure. Missing field returns the zero value. The closure is
+// always one of (*pbReader).readBool / readInt32 / readInt64 / readUint32
+// / readUint64 / readFloat / readDouble / readString / readBytes - small
+// values, but they fold the per-method scan-and-read loop into one call
+// site.
+func readScalarAtField[T any](resp []byte, f uint32, read func(*pbReader) T) T {
+	var z T
+	pr := &pbReader{data: resp}
+	for ff, w, ok := pr.next(); ok; ff, w, ok = pr.next() {
+		if ff == f {
+			return read(pr)
+		}
+		pr.skip(w)
+	}
+	return z
+}
+
+// factoryFor curries a typed constructor (newXNoFinalizer) into the
+// untyped factory shape stored in cppTypeFactories. Without it the
+// generated cppTypeToGoType map had to repeat
+//   "googlesql::Foo": func(ptr uint64) interface{} { return newFooNoFinalizer(ptr) }
+// per concrete type — ~1,400 structurally-identical closures.
+func factoryFor[T any](ctor func(uint64) *T) func(uint64) interface{} {
+	return func(ptr uint64) interface{} { return ctor(ptr) }
+}
+
+// enumString backs the per-enum String() methods. Generated code emits
+// parallel _vals_<E> []int32 and _names_<E> []string slices keyed in
+// canonical order; this helper does a linear scan and falls back to
+// the decimal form for values that aren't in the table (forward
+// compatibility when new values land before regeneration).
+func enumString(v int32, vals []int32, names []string) string {
+	for i, x := range vals {
+		if x == v {
+			return names[i]
+		}
+	}
+	return strconv.Itoa(int(v))
+}
+
 var _ = errors.New
 var _ = binary.LittleEndian
+var _ = fmt.Errorf
 var _ = math.Float32bits
+var _ = strconv.Itoa
 `
 
 func generateModule(pkg string) string {
@@ -1330,7 +1464,7 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 	var b strings.Builder
 	b.WriteString("// Code generated by protoc-gen-wasmify-go. DO NOT EDIT.\n\n")
 	fmt.Fprintf(&b, "package %s\n\n", pkg)
-	b.WriteString("import \"fmt\"\n\nvar _ = fmt.Errorf\n\n")
+	b.WriteString("import (\n\t\"fmt\"\n\t\"sort\"\n)\n\nvar _ = fmt.Errorf\nvar _ = sort.Search\n\n")
 
 	var abstractNames []string
 	for name, info := range messages {
@@ -1379,9 +1513,20 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 	// as `type <Class> interface { ... }` (with `Node` suffix
 	// elided when the class itself ends in `Node`).
 
-	b.WriteString("// cppTypeToGoType maps C++ demangled type names to Go type constructor functions.\n")
-	b.WriteString("var cppTypeToGoType = map[string]func(uint64) interface{}{\n")
-	// Stable iteration order for reproducible generation.
+	// cppType{Names,Factories}: parallel sorted slices that replace the
+	// old `map[string]func(uint64) interface{}` literal. The slices are
+	// keyed in the same order, so a binary search on cppTypeNames yields
+	// the matching factory index — produces a much smaller Go file than
+	// the per-class map-literal closure (~1,400 distinct closures, all
+	// structurally identical, collapsed to one curried `factoryFor`
+	// helper plus two slices).
+	//
+	// NoFinalizer: abstract handles resolved here are almost always
+	// views into a parent-owned tree (e.g. accessor returns). If Go GC
+	// ran a finalizer on them, the Free RPC would delete memory the
+	// parent's destructor will later delete again = UB. Freshly
+	// constructed instances take the NewX path which installs its own
+	// finalizer.
 	var concreteNames []string
 	for name, info := range messages {
 		if !info.isAbstract {
@@ -1389,19 +1534,30 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 		}
 	}
 	sort.Strings(concreteNames)
+	type cppEntry struct {
+		cpp string
+		fac string
+	}
+	entries := make([]cppEntry, 0, len(concreteNames))
 	for _, goName := range concreteNames {
-		cppName := goNameToCppName(goName, cppNamespace)
-		// Use the generated new<X>(ptr) helper so the factory walks
-		// the embedded parent chain correctly (the struct literal
-		// `&X{ptr: ptr}` no longer compiles once X embeds a parent
-		// pointer instead of storing ptr directly).
-		// NoFinalizer: abstract handles resolved here are almost always
-		// views into a parent-owned tree (e.g. accessor returns). If Go
-		// GC ran a finalizer on them, the Free RPC would delete memory
-		// that the parent's destructor will later delete again = UB.
-		// Fresh-constructed instances take the NewX path which installs
-		// its own finalizer.
-		fmt.Fprintf(&b, "\t%q: func(ptr uint64) interface{} { return new%sNoFinalizer(ptr) },\n", cppName, goName)
+		entries = append(entries, cppEntry{
+			cpp: goNameToCppName(goName, cppNamespace),
+			fac: "new" + goName + "NoFinalizer",
+		})
+	}
+	// Sort by cpp name so binary search works (concreteNames is already
+	// sorted by Go name; the C++ name order may differ — sort once here).
+	sort.Slice(entries, func(i, j int) bool { return entries[i].cpp < entries[j].cpp })
+	b.WriteString("// cppTypeNames / cppTypeFactories: parallel sorted slices replacing\n")
+	b.WriteString("// the old cppTypeToGoType map literal. Looked up via sort.Search.\n")
+	b.WriteString("var cppTypeNames = []string{\n")
+	for _, e := range entries {
+		fmt.Fprintf(&b, "\t%q,\n", e.cpp)
+	}
+	b.WriteString("}\n\n")
+	b.WriteString("var cppTypeFactories = []func(uint64) interface{}{\n")
+	for _, e := range entries {
+		fmt.Fprintf(&b, "\tfactoryFor(%s),\n", e.fac)
 	}
 	b.WriteString("}\n\n")
 
@@ -1412,8 +1568,9 @@ func resolveAbstractHandle(ptr uint64) (interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolveTypeName: %w", err)
 	}
-	if factory, ok := cppTypeToGoType[typeName]; ok {
-		return factory(ptr), nil
+	i := sort.SearchStrings(cppTypeNames, typeName)
+	if i < len(cppTypeNames) && cppTypeNames[i] == typeName {
+		return cppTypeFactories[i](ptr), nil
 	}
 	return nil, fmt.Errorf("unknown C++ type %q for ptr 0x%x", typeName, ptr)
 }
@@ -1492,17 +1649,30 @@ func generateEnums(pkg string, enums []enumInfo) string {
 
 		// Stringer: every go-zetasql enum-backed type implements
 		// fmt.Stringer; match that so code printing enum values with
-		// "%v" or %s sees a readable name instead of the raw int. Falls
-		// back to decimal for unknown values (forward compatibility when
-		// new values are introduced without regenerating).
-		fmt.Fprintf(&b, "func (e %s) String() string {\n", e.goName)
-		b.WriteString("\tswitch e {\n")
-		for _, en := range emitted {
-			fmt.Fprintf(&b, "\tcase %s:\n\t\treturn %q\n", en.name, en.name)
+		// "%v" or %s sees a readable name instead of the raw int. The
+		// per-enum table is parallel int32+string slices; the shared
+		// enumString helper does a linear scan and falls back to
+		// strconv.Itoa for unknown values (forward compatibility when
+		// new values are introduced without regenerating). This shape
+		// is ~5x smaller than the per-enum switch it replaced.
+		fmt.Fprintf(&b, "var _vals_%s = []int32{", e.goName)
+		for i, en := range emitted {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%d", en.val)
 		}
-		b.WriteString("\t}\n")
-		b.WriteString("\treturn strconv.Itoa(int(e))\n")
-		b.WriteString("}\n\n")
+		b.WriteString("}\n")
+		fmt.Fprintf(&b, "var _names_%s = []string{", e.goName)
+		for i, en := range emitted {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%q", en.name)
+		}
+		b.WriteString("}\n")
+		fmt.Fprintf(&b, "func (e %s) String() string { return enumString(int32(e), _vals_%s, _names_%s) }\n\n",
+			e.goName, e.goName, e.goName)
 	}
 	return b.String()
 }
@@ -2280,17 +2450,9 @@ func writeCallbackFactory(b *strings.Builder, svc svcInfo, m svcMethodInfo, hand
 	b.WriteString("\tid := RegisterCallback(adapter)\n")
 	b.WriteString("\tvar buf []byte\n")
 	b.WriteString("\tbuf = pbAppendInt32(buf, 1, id)\n")
-	fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
+	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 	b.WriteString("\tif err != nil { UnregisterCallback(id); return nil, err }\n")
-	b.WriteString("\tif e := pbExtractError(resp); e != nil { UnregisterCallback(id); return nil, e }\n")
-	b.WriteString("\tvar ptr uint64\n")
-	// Use a distinctive reader variable so it can't collide with a
-	// user-supplied parameter named `r` (e.g. `NewCircle(r float64)`).
-	b.WriteString("\t_pbr := &pbReader{data: resp}\n")
-	b.WriteString("\tfor f, w, ok := _pbr.next(); ok; f, w, ok = _pbr.next() {\n")
-	b.WriteString("\t\tif f == 1 { ptr = _pbr.readUint64() } else { _pbr.skip(w) }\n")
-	b.WriteString("\t}\n")
-	fmt.Fprintf(b, "\th := new%s(ptr)\n", structName)
+	fmt.Fprintf(b, "\th := new%s(readScalarAtField(resp, 1, (*pbReader).readUint64))\n", structName)
 	// new<X>(ptr) already installed a finalizer that just calls free.
 	// Replace it with one that also unregisters the Go callback on
 	// GC; runtime.SetFinalizer panics if the existing finalizer isn't
@@ -2323,17 +2485,9 @@ func writeConstructor(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleNa
 	for _, p := range params {
 		writeEncode(b, p, "buf")
 	}
-	fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
+	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 	b.WriteString("\tif err != nil { return nil, err }\n")
-	b.WriteString("\tif e := pbExtractError(resp); e != nil { return nil, e }\n")
-	b.WriteString("\tvar ptr uint64\n")
-	// Use a distinctive reader variable so it can't collide with a
-	// user-supplied parameter named `r` (e.g. `NewCircle(r float64)`).
-	b.WriteString("\t_pbr := &pbReader{data: resp}\n")
-	b.WriteString("\tfor f, w, ok := _pbr.next(); ok; f, w, ok = _pbr.next() {\n")
-	b.WriteString("\t\tif f == 1 { ptr = _pbr.readUint64() } else { _pbr.skip(w) }\n")
-	b.WriteString("\t}\n")
-	fmt.Fprintf(b, "\treturn new%s(ptr), nil\n", structName)
+	fmt.Fprintf(b, "\treturn new%s(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil\n", structName)
 	b.WriteString("}\n\n")
 }
 
@@ -2368,9 +2522,8 @@ func writeGetter(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName st
 	if len(m.outputFields) == 0 {
 		fmt.Fprintf(b, "func (h *%s) %s() error {\n", structName, methodName)
 		b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
-		fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
-		b.WriteString("\tif err != nil { return err }\n")
-		b.WriteString("\treturn pbExtractError(resp)\n")
+		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+		b.WriteString("\treturn err\n")
 		b.WriteString("}\n\n")
 		return
 	}
@@ -2385,17 +2538,15 @@ func writeGetter(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName st
 	if result.goType == "" {
 		fmt.Fprintf(b, "func (h *%s) %s() error {\n", structName, methodName)
 		b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
-		fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
-		b.WriteString("\tif err != nil { return err }\n")
-		b.WriteString("\treturn pbExtractError(resp)\n")
+		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+		b.WriteString("\treturn err\n")
 		b.WriteString("}\n\n")
 		return
 	}
 	fmt.Fprintf(b, "func (h *%s) %s() (%s, error) {\n", structName, methodName, result.goType)
 	b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
-	fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
+	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 	fmt.Fprintf(b, "\tif err != nil { return %s, err }\n", zeroValue(result))
-	b.WriteString("\tif e := pbExtractError(resp); e != nil { return " + zeroValue(result) + ", e }\n")
 	writeDecode(b, result, structName)
 	b.WriteString("}\n\n")
 }
@@ -2432,8 +2583,7 @@ func writeRegularMethod(b *strings.Builder, svc svcInfo, m svcMethodInfo, handle
 	} else {
 		fmt.Fprintf(b, "func (h *%s) %s(%s) error {\n", structName, methodName, paramStr)
 	}
-	b.WriteString("\tvar buf []byte\n")
-	b.WriteString("\tbuf = pbAppendHandle(buf, 1, h.ptr)\n")
+	b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
 	for _, p := range params {
 		writeEncode(b, p, "buf")
 	}
@@ -2457,14 +2607,13 @@ func writeRegularMethod(b *strings.Builder, svc svcInfo, m svcMethodInfo, handle
 			}
 		}
 	}
-	fmt.Fprintf(b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
 	if hasResult {
+		fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 		fmt.Fprintf(b, "\tif err != nil { return %s, err }\n", zeroValue(result))
-		b.WriteString("\tif e := pbExtractError(resp); e != nil { return " + zeroValue(result) + ", e }\n")
 		writeDecode(b, result, structName)
 	} else {
-		b.WriteString("\tif err != nil { return err }\n")
-		b.WriteString("\treturn pbExtractError(resp)\n")
+		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+		b.WriteString("\treturn err\n")
 	}
 	b.WriteString("}\n\n")
 }
@@ -2510,14 +2659,13 @@ func generateClient(pkg string, freeServices []svcInfo, messages map[string]msgI
 			for _, p := range params {
 				writeEncode(&b, p, "buf")
 			}
-			fmt.Fprintf(&b, "\tresp, err := module().invoke(%d, %d, buf)\n", svc.serviceID, m.methodID)
 			if hasResult {
+				fmt.Fprintf(&b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 				fmt.Fprintf(&b, "\tif err != nil { return %s, err }\n", zeroValue(result))
-				b.WriteString("\tif e := pbExtractError(resp); e != nil { return " + zeroValue(result) + ", e }\n")
 				writeDecodeForModule(&b, result, params)
 			} else {
-				b.WriteString("\tif err != nil { return err }\n")
-				b.WriteString("\treturn pbExtractError(resp)\n")
+				fmt.Fprintf(&b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+				b.WriteString("\treturn err\n")
 			}
 			b.WriteString("}\n\n")
 		}
@@ -2602,37 +2750,17 @@ func writeEncodeScalar(b *strings.Builder, kind protoreflect.Kind, fn uint32, v,
 
 func writeDecode(b *strings.Builder, result fieldInfo, ownerHandleName string) {
 	if result.isHandle && !result.isRepeated {
-		// Read the specific response field number. readHandlePtr
-		// (which scans only field 1) is fine when the return value
-		// is at field 1 but misreads when the handle was shifted by
-		// a preceding Status/return-value (e.g. for output-pointer
-		// params: "Status result = 1; ArrayType out_result = 2").
-		if result.fieldNum == 1 {
-			b.WriteString("\tptr := readHandlePtr(resp)\n")
-		} else {
-			b.WriteString("\tvar ptr uint64\n")
-			b.WriteString("\t{ pr := &pbReader{data: resp}\n")
-			b.WriteString("\t  for f, w, ok := pr.next(); ok; f, w, ok = pr.next() {\n")
-			fmt.Fprintf(b, "\t    if f == %d { sub := pr.readSubmessage(); ptr = readHandlePtr(sub.data) } else { pr.skip(w) }\n", result.fieldNum)
-			b.WriteString("\t  }\n\t}\n")
-		}
-		b.WriteString("\tif ptr == 0 { return nil, nil }\n")
+		// Single-handle return: delegate to the runtime helpers.
+		// decodeAbstractAs walks the type-id resolver and asserts to
+		// the requested interface; decodeChildHandle picks the
+		// NoFinalizer constructor (accessor returns are views into
+		// the parent's tree, not owned resources).
 		if result.isAbstract {
-			b.WriteString("\tresolved, err := resolveAbstractHandle(ptr)\n")
-			b.WriteString("\tif err != nil { return nil, err }\n")
-			fmt.Fprintf(b, "\tif v, ok := resolved.(%s); ok {\n", result.goType)
-			b.WriteString("\t\tif ka, okKA := v.(interface{ setKeepAlive(any) }); okKA { ka.setKeepAlive(h) }\n")
-			b.WriteString("\t\treturn v, nil\n")
-			b.WriteString("\t}\n")
-			fmt.Fprintf(b, "\treturn nil, fmt.Errorf(\"resolved type %%T does not implement %s\", resolved)\n", result.goType)
+			fmt.Fprintf(b, "\treturn decodeAbstractAs[%s](resp, %d, h, %q)\n",
+				result.goType, result.fieldNum, result.goType)
 		} else {
-			// Accessor methods on a handle return a view into the
-			// parent's tree, not an owned resource — use NoFinalizer
-			// so Go GC does not later Free this pointer after the
-			// parent's destructor has already reaped it.
-			fmt.Fprintf(b, "\tchild := new%sNoFinalizer(ptr)\n", result.handleName)
-			b.WriteString("\tchild.setKeepAlive(h)\n")
-			b.WriteString("\treturn child, nil\n")
+			fmt.Fprintf(b, "\treturn decodeChildHandle(resp, %d, h, new%sNoFinalizer), nil\n",
+				result.fieldNum, result.handleName)
 		}
 		return
 	}
@@ -2707,18 +2835,13 @@ func writeDecode(b *strings.Builder, result fieldInfo, ownerHandleName string) {
 		b.WriteString("\treturn items, nil\n")
 		return
 	}
-	fmt.Fprintf(b, "\tvar result %s\n", result.goType)
-	b.WriteString("\tpr := &pbReader{data: resp}\n")
-	b.WriteString("\tfor f, w, ok := pr.next(); ok; f, w, ok = pr.next() {\n")
 	if result.kind == protoreflect.EnumKind {
-		fmt.Fprintf(b, "\t\tif f == %d { result = %s(pr.readInt32()) } else { pr.skip(w) }\n",
-			result.fieldNum, result.goType)
+		fmt.Fprintf(b, "\treturn %s(readScalarAtField(resp, %d, (*pbReader).readInt32)), nil\n",
+			result.goType, result.fieldNum)
 	} else {
-		fmt.Fprintf(b, "\t\tif f == %d { result = pr.%s() } else { pr.skip(w) }\n",
+		fmt.Fprintf(b, "\treturn readScalarAtField(resp, %d, (*pbReader).%s), nil\n",
 			result.fieldNum, readMethodName(result))
 	}
-	b.WriteString("\t}\n")
-	b.WriteString("\treturn result, nil\n")
 }
 
 func writeDecodeForModule(b *strings.Builder, result fieldInfo, params []fieldInfo) {
@@ -2742,11 +2865,7 @@ func writeDecodeForModule(b *strings.Builder, result fieldInfo, params []fieldIn
 		}
 	}
 	if result.isHandle && !result.isRepeated {
-		b.WriteString("\tvar ptr uint64\n")
-		b.WriteString("\t{ pr := &pbReader{data: resp}\n")
-		b.WriteString("\t  for f, w, ok := pr.next(); ok; f, w, ok = pr.next() {\n")
-		fmt.Fprintf(b, "\t    if f == %d { sub := pr.readSubmessage(); ptr = readHandlePtr(sub.data) } else { pr.skip(w) }\n", result.fieldNum)
-		b.WriteString("\t  }\n\t}\n")
+		fmt.Fprintf(b, "\tptr := readPtrAtField(resp, %d)\n", result.fieldNum)
 		b.WriteString("\tif ptr == 0 { return nil, nil }\n")
 		if result.isAbstract {
 			b.WriteString("\tresolved, err := resolveAbstractHandle(ptr)\n")
@@ -2789,18 +2908,13 @@ func writeDecodeForModule(b *strings.Builder, result fieldInfo, params []fieldIn
 		writeDecodeRepeatedForModule(b, result, params)
 		return
 	}
-	fmt.Fprintf(b, "\tvar result %s\n", result.goType)
-	b.WriteString("\tpr := &pbReader{data: resp}\n")
-	b.WriteString("\tfor f, w, ok := pr.next(); ok; f, w, ok = pr.next() {\n")
 	if result.kind == protoreflect.EnumKind {
-		fmt.Fprintf(b, "\t\tif f == %d { result = %s(pr.readInt32()) } else { pr.skip(w) }\n",
-			result.fieldNum, result.goType)
+		fmt.Fprintf(b, "\treturn %s(readScalarAtField(resp, %d, (*pbReader).readInt32)), nil\n",
+			result.goType, result.fieldNum)
 	} else {
-		fmt.Fprintf(b, "\t\tif f == %d { result = pr.%s() } else { pr.skip(w) }\n",
+		fmt.Fprintf(b, "\treturn readScalarAtField(resp, %d, (*pbReader).%s), nil\n",
 			result.fieldNum, readMethodName(result))
 	}
-	b.WriteString("\t}\n")
-	b.WriteString("\treturn result, nil\n")
 }
 
 func writeDecodeRepeatedForModule(b *strings.Builder, result fieldInfo, params []fieldInfo) {
