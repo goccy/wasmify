@@ -769,9 +769,21 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 }
 
 // rewriteOutputPath maps a native output path to the wasm build directory.
+//
+// The function is idempotent: if `originalPath` already lives directly
+// under `<buildDir>/<subdir>/` it is returned as-is. This matters for
+// archive steps, where the output path is set on `args[1]` and then the
+// whole arg list is fed through `rewriteInputPaths`. Without the
+// idempotency guard the second pass would re-disambiguate the already-
+// disambiguated archive name and append a spurious `__lib` suffix
+// (e.g. `libtype__public.a` -> `libtype__public__lib.a`).
 func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 	if originalPath == "" {
 		return ""
+	}
+	prefix := filepath.Join(buildDir, subdir) + string(filepath.Separator)
+	if strings.HasPrefix(originalPath, prefix) {
+		return originalPath
 	}
 	base := filepath.Base(originalPath)
 	ext := filepath.Ext(base)
@@ -783,25 +795,41 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 	// "importer" from "_objs/importer/parser.o").
 	if ext == ".o" && subdir == "obj" {
 		stem := strings.TrimSuffix(base, ext)
-		// Walk up the directory tree to find a disambiguating segment.
-		// Bazel outputs are like: bazel-out/.../project/parser/_objs/parser/parser.o
-		// The _objs/<target>/ directory is often the same as the filename,
-		// so we go one more level up to get the library name (e.g., "parser"
-		// from "project/parser").
+		// Bazel writes per-target object files at
+		//   bazel-out/.../<package>/_objs/<target>/<source>.o
+		// Two distinct cc_library targets can share the same target
+		// subdirectory name (e.g. `googlesql/public/_objs/type_proto/`
+		// and `external/protobuf~/src/google/protobuf/_objs/type_proto/`
+		// both contain a `type.pb.o`). Compose the suffix from the
+		// target subdir AND its containing package so siblings in
+		// different bazel packages survive side by side.
 		dir := filepath.Dir(originalPath)
-		parentDir := filepath.Base(dir)
-		if parentDir == stem || parentDir == "_objs" {
-			// Go one more level up
-			grandParent := filepath.Base(filepath.Dir(dir))
-			if grandParent == "_objs" {
-				grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))
-			}
+		parentDir := filepath.Base(dir)              // typically the cc_library target name
+		grandParent := filepath.Base(filepath.Dir(dir)) // either "_objs" or, when no _objs, the package
+		if grandParent == "_objs" {
+			grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))
+		}
+		// Build the suffix in increasing specificity. parentDir alone is
+		// the most common, but if it equals the stem (a redundant repeat
+		// like "_objs/parser/parser.o") we lean on the grandparent
+		// instead. When both are meaningful and distinct, join them so
+		// the suffix is unique even for two targets named alike under
+		// different packages.
+		var suffix string
+		switch {
+		case parentDir == stem || parentDir == "_objs":
 			if grandParent != "" && grandParent != "." && grandParent != stem {
-				parentDir = grandParent
+				suffix = grandParent
+			}
+		case grandParent != "" && grandParent != "." && grandParent != stem && grandParent != parentDir:
+			suffix = parentDir + "_" + grandParent
+		default:
+			if parentDir != "" && parentDir != "." && parentDir != stem {
+				suffix = parentDir
 			}
 		}
-		if parentDir != "" && parentDir != "." && parentDir != stem {
-			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(parentDir)+ext)
+		if suffix != "" {
+			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(suffix)+ext)
 		}
 	}
 	// For .a / .lo archives, bazel emits one archive per cc_library

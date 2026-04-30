@@ -538,6 +538,44 @@ func TestRewriteOutputPath(t *testing.T) {
 	}
 }
 
+func TestRewriteOutputPath_Idempotent(t *testing.T) {
+	// Archive steps set args[1] to the rewritten output path and then
+	// pass the whole arg list through rewriteInputPaths, which calls
+	// rewriteOutputPath again on every .a/.lo arg. Running the second
+	// pass must be a no-op — otherwise we get spurious double suffixes
+	// like libtype__public__lib.a.
+	a := "/build/lib/libtype__public.a"
+	if got := rewriteOutputPath(a, "/build", "lib"); got != a {
+		t.Errorf("rewriteOutputPath should be idempotent for already-rewritten paths\n got %q\nwant %q", got, a)
+	}
+	o := "/build/obj/parser_parser.o"
+	if got := rewriteOutputPath(o, "/build", "obj"); got != o {
+		t.Errorf("rewriteOutputPath should be idempotent for .o paths\n got %q\nwant %q", got, o)
+	}
+}
+
+func TestRewriteOutputPath_ObjCollisionSafe(t *testing.T) {
+	// The .o disambiguator must encode both the cc_library target
+	// subdirectory AND its enclosing bazel package, otherwise two
+	// targets that share a subdir name collide. The actual googlesql
+	// case: `googlesql/public/_objs/type_proto/type.pb.o` from the
+	// public/type_proto cc_library, and the protobuf vendor's
+	// `external/protobuf~/src/google/protobuf/_objs/type_proto/type.pb.o`
+	// — both have parentDir "type_proto" but are entirely different .o
+	// files.
+	a := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/googlesql/public/_objs/type_proto/type.pb.o", "/build", "obj")
+	b := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/external/protobuf~/src/google/protobuf/_objs/type_proto/type.pb.o", "/build", "obj")
+	if a == b {
+		t.Fatalf("colliding .o paths: %q", a)
+	}
+	if a != "/build/obj/type.pb_type_proto_public.o" {
+		t.Errorf("googlesql .o got %q, want %q", a, "/build/obj/type.pb_type_proto_public.o")
+	}
+	if b != "/build/obj/type.pb_type_proto_protobuf.o" {
+		t.Errorf("protobuf .o got %q, want %q", b, "/build/obj/type.pb_type_proto_protobuf.o")
+	}
+}
+
 func TestRewriteOutputPath_ArchiveCollisionSafe(t *testing.T) {
 	// Two distinct bazel cc_library targets in different packages can
 	// produce the same archive basename (the actual googlesql collision
