@@ -522,7 +522,10 @@ func TestRewriteOutputPath(t *testing.T) {
 		want     string
 	}{
 		{"empty", "", "/build", "obj", ""},
-		{"plain .a", "bazel-out/k8-fastbuild/bin/mylib/libfoo.a", "/build", "lib", "/build/lib/libfoo.a"},
+		// .a archives are disambiguated by the bazel package directory:
+		// libfoo.a in package mylib lands at libfoo__mylib.a so a sibling
+		// libfoo.a from another package does not overwrite it.
+		{"package-disambiguated .a", "bazel-out/k8-fastbuild/bin/mylib/libfoo.a", "/build", "lib", "/build/lib/libfoo__mylib.a"},
 		{"plain output", "bazel-out/bin/main", "/build", "output", "/build/output/main"},
 	}
 	for _, tt := range tests {
@@ -532,6 +535,33 @@ func TestRewriteOutputPath(t *testing.T) {
 				t.Errorf("rewriteOutputPath(%q) = %q, want %q", tt.orig, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRewriteOutputPath_ArchiveCollisionSafe(t *testing.T) {
+	// Two distinct bazel cc_library targets in different packages can
+	// produce the same archive basename (the actual googlesql collision
+	// that motivated this disambiguation: `googlesql/public/libtype.a`
+	// from one cc_library and `googlesql/public/types/libtype.a` from
+	// another). Without per-package suffixing, copying both into
+	// <buildDir>/lib/ would overwrite one with the other and drop every
+	// .o the loser archived.
+	a := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libtype.a", "/build", "lib")
+	b := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/types/libtype.a", "/build", "lib")
+	if a == b {
+		t.Fatalf("colliding archives mapped to the same path: %q", a)
+	}
+	if a != "/build/lib/libtype__public.a" {
+		t.Errorf("first libtype.a got %q, want %q", a, "/build/lib/libtype__public.a")
+	}
+	if b != "/build/lib/libtype__types.a" {
+		t.Errorf("second libtype.a got %q, want %q", b, "/build/lib/libtype__types.a")
+	}
+
+	// .lo archives (libtool-style) follow the same rule.
+	c := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libfoo.lo", "/build", "lib")
+	if c != "/build/lib/libfoo__public.lo" {
+		t.Errorf("libfoo.lo got %q, want %q", c, "/build/lib/libfoo__public.lo")
 	}
 }
 
@@ -564,11 +594,16 @@ func TestRewriteInputPaths(t *testing.T) {
 	if result[4] != "-I/usr/include" {
 		t.Errorf("expected flag preserved, got %q", result[4])
 	}
-	// .a and .lo → lib/
-	if result[2] != filepath.Join(buildDir, "lib", "foo.a") {
+	// .a and .lo go through rewriteOutputPath with subdir "lib", which
+	// suffixes the archive with the bazel package directory so two
+	// archives with the same basename in different packages don't
+	// collide. For these inputs the parent dir is "lib" itself, so the
+	// suffix becomes "__lib".
+	if result[2] != filepath.Join(buildDir, "lib", "foo__lib.a") {
 		t.Errorf("got %q for .a", result[2])
 	}
 	if result[3] != filepath.Join(buildDir, "lib", "some.lo") {
+		// "some.lo" has no parent dir, so no suffix is applied.
 		t.Errorf("got %q for .lo", result[3])
 	}
 }

@@ -774,13 +774,13 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 		return ""
 	}
 	base := filepath.Base(originalPath)
+	ext := filepath.Ext(base)
 	// For .o files, derive a unique prefix from the parent directory to
 	// avoid collisions when multiple bazel targets produce the same
 	// basename (e.g., parser.o from project/parser vs protobuf/compiler).
 	// The prefix is the last meaningful directory segment of the original
 	// bazel output path (e.g., "parser" from "_objs/parser/parser.o",
 	// "importer" from "_objs/importer/parser.o").
-	ext := filepath.Ext(base)
 	if ext == ".o" && subdir == "obj" {
 		stem := strings.TrimSuffix(base, ext)
 		// Walk up the directory tree to find a disambiguating segment.
@@ -802,6 +802,23 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 		}
 		if parentDir != "" && parentDir != "." && parentDir != stem {
 			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(parentDir)+ext)
+		}
+	}
+	// For .a / .lo archives, bazel emits one archive per cc_library
+	// target named lib<target>.a in the package's output directory.
+	// Sibling cc_libraries in different packages can have the same
+	// target name (e.g. `googlesql/public/libtype.a` from cc_library
+	// "type" alongside `googlesql/public/types/libtype.a` from a
+	// different cc_library also named "type"). Collapsing to the
+	// basename here would silently overwrite one with the other in
+	// `<buildDir>/lib/`, dropping every .o the loser archived. Encode
+	// the package directory into the filename so co-located archives
+	// from distinct bazel packages survive side by side.
+	if (ext == ".a" || ext == ".lo") && subdir == "lib" {
+		stem := strings.TrimSuffix(base, ext)
+		parentDir := filepath.Base(filepath.Dir(originalPath))
+		if parentDir != "" && parentDir != "." && parentDir != stem {
+			return filepath.Join(buildDir, subdir, stem+"__"+sanitizeDirName(parentDir)+ext)
 		}
 	}
 	return filepath.Join(buildDir, subdir, base)
@@ -876,7 +893,10 @@ func rewriteInputPaths(args []string, buildDir string) []string {
 			// Use the same collision-safe naming as rewriteOutputPath
 			result[i] = rewriteOutputPath(arg, buildDir, "obj")
 		case ".a", ".lo":
-			result[i] = filepath.Join(buildDir, "lib", filepath.Base(arg))
+			// Same collision-safe naming as rewriteOutputPath so that
+			// archive references in link/archive command lines resolve
+			// to the disambiguated paths produced for archive outputs.
+			result[i] = rewriteOutputPath(arg, buildDir, "lib")
 		default:
 			result[i] = arg
 		}
