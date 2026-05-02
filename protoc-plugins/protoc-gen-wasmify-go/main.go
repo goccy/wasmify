@@ -937,10 +937,10 @@ func readScalarAtField[T any](resp []byte, f uint32, read func(*pbReader) T) T {
 // factoryFor curries a typed constructor (newXNoFinalizer) into the
 // untyped factory shape stored in cppTypeFactories. Without it the
 // generated cppTypeToGoType map had to repeat
-//   "googlesql::Foo": func(ptr uint64) interface{} { return newFooNoFinalizer(ptr) }
+//   "googlesql::Foo": func(ptr uint64) any { return newFooNoFinalizer(ptr) }
 // per concrete type — ~1,400 structurally-identical closures.
-func factoryFor[T any](ctor func(uint64) *T) func(uint64) interface{} {
-	return func(ptr uint64) interface{} { return ctor(ptr) }
+func factoryFor[T any](ctor func(uint64) *T) func(uint64) any {
+	return func(ptr uint64) any { return ctor(ptr) }
 }
 
 // enumString backs the per-enum String() methods. Generated code emits
@@ -1562,7 +1562,7 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 	// elided when the class itself ends in `Node`).
 
 	// cppType{Names,Factories}: parallel sorted slices that replace the
-	// old `map[string]func(uint64) interface{}` literal. The slices are
+	// old `map[string]func(uint64) any` literal. The slices are
 	// keyed in the same order, so a binary search on cppTypeNames yields
 	// the matching factory index — produces a much smaller Go file than
 	// the per-class map-literal closure (~1,400 distinct closures, all
@@ -1603,7 +1603,7 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 		fmt.Fprintf(&b, "\t%q,\n", e.cpp)
 	}
 	b.WriteString("}\n\n")
-	b.WriteString("var cppTypeFactories = []func(uint64) interface{}{\n")
+	b.WriteString("var cppTypeFactories = []func(uint64) any{\n")
 	for _, e := range entries {
 		fmt.Fprintf(&b, "\tfactoryFor(%s),\n", e.fac)
 	}
@@ -1611,7 +1611,7 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 
 	b.WriteString(`// resolveAbstractHandle queries the C++ runtime for the actual type of the
 // object at ptr and returns the appropriate concrete Go handle type.
-func resolveAbstractHandle(ptr uint64) (interface{}, error) {
+func resolveAbstractHandle(ptr uint64) (any, error) {
 	typeName, err := module().resolveTypeName(ptr)
 	if err != nil {
 		return nil, fmt.Errorf("resolveTypeName: %w", err)

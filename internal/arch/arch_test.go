@@ -163,7 +163,7 @@ func TestJSONSchema_IsValidJSON(t *testing.T) {
 	if schema == "" {
 		t.Fatal("JSONSchema() returned empty string")
 	}
-	var out map[string]interface{}
+	var out map[string]any
 	if err := json.Unmarshal([]byte(schema), &out); err != nil {
 		t.Fatalf("JSONSchema() is not valid JSON: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestJSONSchema_IsValidJSON(t *testing.T) {
 	if out["type"] != "object" {
 		t.Errorf("schema type = %v, want object", out["type"])
 	}
-	required, ok := out["required"].([]interface{})
+	required, ok := out["required"].([]any)
 	if !ok {
 		t.Fatal("required is not an array")
 	}
