@@ -972,6 +972,7 @@ func generateModule(pkg string) string {
 
 const moduleBody = `import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -998,15 +999,16 @@ var embeddedWasm []byte
 // ` + "`api.Function`" + ` keyed by serviceID<<32 | methodID so the per-call
 // overhead is one map read after the first invocation.
 type Module struct {
-	mu          sync.Mutex
-	runtime     wazero.Runtime
-	mod         api.Module
-	allocFn     api.Function
-	freeFn      api.Function
-	typeNameFn  api.Function
-	exportFns   map[uint64]api.Function
-	callbacks   map[int32]CallbackHandler
-	nextCBID    int32
+	mu               sync.Mutex
+	runtime          wazero.Runtime
+	mod              api.Module
+	allocFn          api.Function
+	freeFn           api.Function
+	typeNameFn       api.Function
+	exportFns        map[uint64]api.Function
+	callbacks        map[int32]CallbackHandler
+	nextCBID         int32
+	compilationCache wazero.CompilationCache // owned; closed in Close()
 }
 
 var (
@@ -1018,7 +1020,8 @@ var (
 // Option configures the wasm runtime.
 type Option func(*options)
 type options struct {
-	compilationMode CompilationMode
+	compilationMode     CompilationMode
+	compilationCacheDir string
 }
 
 // CompilationMode selects the wazero execution engine.
@@ -1034,6 +1037,26 @@ const (
 // WithCompilationMode sets the wazero compilation mode.
 func WithCompilationMode(mode CompilationMode) Option {
 	return func(o *options) { o.compilationMode = mode }
+}
+
+// WithCompilationCache enables the wazero on-disk compilation cache
+// rooted at dir. The first Init() call with a fresh dir pays the
+// compile-from-bytes cost; every subsequent process pointed at the
+// same dir starts up substantially faster because the precompiled
+// module bytes are served straight from disk.
+//
+// Only honored when CompilationMode is CompilationModeCompiler — the
+// interpreter does no AOT compile and so has nothing to cache; the
+// option is silently ignored in that case rather than panicking, so
+// callers can flip CompilationMode without rewriting their option
+// list. The directory is created (mkdir -p) on first use.
+//
+// The cache's lifecycle is owned internally: Init constructs it,
+// Close (or program exit) flushes and closes it. An empty dir is
+// treated as "no cache" — the cache directory must be a valid path
+// that the process can read and write.
+func WithCompilationCache(dir string) Option {
+	return func(o *options) { o.compilationCacheDir = dir }
 }
 
 // CallbackHandler is implemented by Go types that need to be called from C++.
@@ -1173,11 +1196,23 @@ func Init(opts ...Option) error {
 }
 
 // Close shuts down the global module. Optional — for clean shutdown.
+// Releases the wazero runtime and, if WithCompilationCache was used,
+// flushes and closes the underlying on-disk cache so any in-flight
+// writes land before the process exits. Both teardown steps always
+// run; if either fails, errors.Join surfaces both so the caller can
+// see (and react to) all the failures, not just the first.
 func Close() error {
-	if globalModule != nil {
-		return globalModule.runtime.Close(context.Background())
+	if globalModule == nil {
+		return nil
 	}
-	return nil
+	ctx := context.Background()
+	rtErr := globalModule.runtime.Close(ctx)
+	var cacheErr error
+	if globalModule.compilationCache != nil {
+		cacheErr = globalModule.compilationCache.Close(ctx)
+		globalModule.compilationCache = nil
+	}
+	return errors.Join(rtErr, cacheErr)
 }
 
 // module returns the initialized global module. Panics if Init was not called.
@@ -1197,9 +1232,22 @@ func initModule(wasmBytes []byte, o *options) error {
 	default:
 		cfg = wazero.NewRuntimeConfigInterpreter()
 	}
+	// CompilationCache is a Compiler-only feature; the interpreter
+	// never produces machine code and would not consult the cache,
+	// so silently dropping the option there avoids wazero panicking
+	// on a config it can't honor.
+	var compilationCache wazero.CompilationCache
+	if o.compilationCacheDir != "" && o.compilationMode == CompilationModeCompiler {
+		c, err := wazero.NewCompilationCacheWithDir(o.compilationCacheDir)
+		if err != nil {
+			return fmt.Errorf("compilation cache %q: %w", o.compilationCacheDir, err)
+		}
+		compilationCache = c
+		cfg = cfg.WithCompilationCache(c)
+	}
 	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-	m := &Module{runtime: r}
+	m := &Module{runtime: r, compilationCache: compilationCache}
 	// Register the "wasmify" host module with callback_invoke.
 	wasmifyMod := r.NewHostModuleBuilder("wasmify")
 	wasmifyMod.NewFunctionBuilder().
