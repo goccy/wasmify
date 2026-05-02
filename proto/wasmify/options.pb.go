@@ -95,6 +95,14 @@ var file_wasmify_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Filename:      "wasmify/options.proto",
 	},
 	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50019,
+		Name:          "wasmify.wasm_take_ownership",
+		Tag:           "varint,50019,opt,name=wasm_take_ownership",
+		Filename:      "wasmify/options.proto",
+	},
+	{
 		ExtendedType:  (*descriptorpb.ServiceOptions)(nil),
 		ExtensionType: (*bool)(nil),
 		Field:         50001,
@@ -213,30 +221,43 @@ var (
 	//
 	// optional string wasm_field_comment = 50015;
 	E_WasmFieldComment = &file_wasmify_options_proto_extTypes[8]
+	// Marks a method-input handle field whose C++ counterpart takes
+	// ownership of the wrapped pointer (e.g. `unique_ptr<T>` by value
+	// or by rvalue-ref). When true, the Go-side wrapper must clear
+	// the argument's `ptr` AFTER the invoke so the per-instance Go
+	// finalizer does not call free() on memory the C++ side has
+	// already deleted. Without this clear, the Go GC double-frees:
+	// the parent's destructor runs the unique_ptr deleter, then the
+	// child's still-attached finalizer issues a second Free RPC.
+	// Typical symptom is a panic on the next handle accessed through
+	// the parent (vtable read against freed memory).
+	//
+	// optional bool wasm_take_ownership = 50019;
+	E_WasmTakeOwnership = &file_wasmify_options_proto_extTypes[9]
 )
 
 // Extension fields to descriptorpb.ServiceOptions.
 var (
 	// optional bool wasm_callback = 50001;
-	E_WasmCallback = &file_wasmify_options_proto_extTypes[9]
+	E_WasmCallback = &file_wasmify_options_proto_extTypes[10]
 	// optional string wasm_service_source_file = 50008;
-	E_WasmServiceSourceFile = &file_wasmify_options_proto_extTypes[10]
+	E_WasmServiceSourceFile = &file_wasmify_options_proto_extTypes[11]
 	// optional int32 wasm_service_id = 50010;
-	E_WasmServiceId = &file_wasmify_options_proto_extTypes[11]
+	E_WasmServiceId = &file_wasmify_options_proto_extTypes[12]
 )
 
 // Extension fields to descriptorpb.MethodOptions.
 var (
 	// optional string wasm_method_type = 50003;
-	E_WasmMethodType = &file_wasmify_options_proto_extTypes[12]
+	E_WasmMethodType = &file_wasmify_options_proto_extTypes[13]
 	// optional string wasm_original_name = 50004;
-	E_WasmOriginalName = &file_wasmify_options_proto_extTypes[13]
+	E_WasmOriginalName = &file_wasmify_options_proto_extTypes[14]
 	// optional int32 wasm_method_id = 50011;
-	E_WasmMethodId = &file_wasmify_options_proto_extTypes[14]
+	E_WasmMethodId = &file_wasmify_options_proto_extTypes[15]
 	// Doc comment lifted from the C++ method declaration.
 	//
 	// optional string wasm_method_comment = 50016;
-	E_WasmMethodComment = &file_wasmify_options_proto_extTypes[15]
+	E_WasmMethodComment = &file_wasmify_options_proto_extTypes[16]
 )
 
 // Extension fields to descriptorpb.EnumOptions.
@@ -244,7 +265,7 @@ var (
 	// Doc comment lifted from the C++ enum declaration.
 	//
 	// optional string wasm_enum_comment = 50017;
-	E_WasmEnumComment = &file_wasmify_options_proto_extTypes[16]
+	E_WasmEnumComment = &file_wasmify_options_proto_extTypes[17]
 )
 
 // Extension fields to descriptorpb.EnumValueOptions.
@@ -252,7 +273,7 @@ var (
 	// Doc comment lifted from the C++ enumerator declaration.
 	//
 	// optional string wasm_enum_value_comment = 50018;
-	E_WasmEnumValueComment = &file_wasmify_options_proto_extTypes[17]
+	E_WasmEnumValueComment = &file_wasmify_options_proto_extTypes[18]
 )
 
 // Extension fields to descriptorpb.FileOptions.
@@ -263,7 +284,7 @@ var (
 	// to guess based on the proto package, which is arbitrary.
 	//
 	// optional string wasm_cpp_namespace = 50013;
-	E_WasmCppNamespace = &file_wasmify_options_proto_extTypes[18]
+	E_WasmCppNamespace = &file_wasmify_options_proto_extTypes[19]
 )
 
 var File_wasmify_options_proto protoreflect.FileDescriptor
@@ -281,7 +302,8 @@ const file_wasmify_options_proto_rawDesc = "" +
 	"\x10wasm_source_file\x12\x1f.google.protobuf.MessageOptions\x18׆\x03 \x01(\tR\x0ewasmSourceFile:F\n" +
 	"\rwasm_abstract\x12\x1f.google.protobuf.MessageOptions\x18ن\x03 \x01(\bR\fwasmAbstract:S\n" +
 	"\x14wasm_message_comment\x12\x1f.google.protobuf.MessageOptions\x18ކ\x03 \x01(\tR\x12wasmMessageComment:M\n" +
-	"\x12wasm_field_comment\x12\x1d.google.protobuf.FieldOptions\x18߆\x03 \x01(\tR\x10wasmFieldComment:F\n" +
+	"\x12wasm_field_comment\x12\x1d.google.protobuf.FieldOptions\x18߆\x03 \x01(\tR\x10wasmFieldComment:O\n" +
+	"\x13wasm_take_ownership\x12\x1d.google.protobuf.FieldOptions\x18\xe3\x86\x03 \x01(\bR\x11wasmTakeOwnership:F\n" +
 	"\rwasm_callback\x12\x1f.google.protobuf.ServiceOptions\x18ц\x03 \x01(\bR\fwasmCallback:Z\n" +
 	"\x18wasm_service_source_file\x12\x1f.google.protobuf.ServiceOptions\x18؆\x03 \x01(\tR\x15wasmServiceSourceFile:I\n" +
 	"\x0fwasm_service_id\x12\x1f.google.protobuf.ServiceOptions\x18چ\x03 \x01(\x05R\rwasmServiceId:J\n" +
@@ -312,20 +334,21 @@ var file_wasmify_options_proto_depIdxs = []int32{
 	0,  // 6: wasmify.wasm_abstract:extendee -> google.protobuf.MessageOptions
 	0,  // 7: wasmify.wasm_message_comment:extendee -> google.protobuf.MessageOptions
 	1,  // 8: wasmify.wasm_field_comment:extendee -> google.protobuf.FieldOptions
-	2,  // 9: wasmify.wasm_callback:extendee -> google.protobuf.ServiceOptions
-	2,  // 10: wasmify.wasm_service_source_file:extendee -> google.protobuf.ServiceOptions
-	2,  // 11: wasmify.wasm_service_id:extendee -> google.protobuf.ServiceOptions
-	3,  // 12: wasmify.wasm_method_type:extendee -> google.protobuf.MethodOptions
-	3,  // 13: wasmify.wasm_original_name:extendee -> google.protobuf.MethodOptions
-	3,  // 14: wasmify.wasm_method_id:extendee -> google.protobuf.MethodOptions
-	3,  // 15: wasmify.wasm_method_comment:extendee -> google.protobuf.MethodOptions
-	4,  // 16: wasmify.wasm_enum_comment:extendee -> google.protobuf.EnumOptions
-	5,  // 17: wasmify.wasm_enum_value_comment:extendee -> google.protobuf.EnumValueOptions
-	6,  // 18: wasmify.wasm_cpp_namespace:extendee -> google.protobuf.FileOptions
-	19, // [19:19] is the sub-list for method output_type
-	19, // [19:19] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	0,  // [0:19] is the sub-list for extension extendee
+	1,  // 9: wasmify.wasm_take_ownership:extendee -> google.protobuf.FieldOptions
+	2,  // 10: wasmify.wasm_callback:extendee -> google.protobuf.ServiceOptions
+	2,  // 11: wasmify.wasm_service_source_file:extendee -> google.protobuf.ServiceOptions
+	2,  // 12: wasmify.wasm_service_id:extendee -> google.protobuf.ServiceOptions
+	3,  // 13: wasmify.wasm_method_type:extendee -> google.protobuf.MethodOptions
+	3,  // 14: wasmify.wasm_original_name:extendee -> google.protobuf.MethodOptions
+	3,  // 15: wasmify.wasm_method_id:extendee -> google.protobuf.MethodOptions
+	3,  // 16: wasmify.wasm_method_comment:extendee -> google.protobuf.MethodOptions
+	4,  // 17: wasmify.wasm_enum_comment:extendee -> google.protobuf.EnumOptions
+	5,  // 18: wasmify.wasm_enum_value_comment:extendee -> google.protobuf.EnumValueOptions
+	6,  // 19: wasmify.wasm_cpp_namespace:extendee -> google.protobuf.FileOptions
+	20, // [20:20] is the sub-list for method output_type
+	20, // [20:20] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	0,  // [0:20] is the sub-list for extension extendee
 	0,  // [0:0] is the sub-list for field type_name
 }
 
@@ -341,7 +364,7 @@ func file_wasmify_options_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_wasmify_options_proto_rawDesc), len(file_wasmify_options_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   0,
-			NumExtensions: 19,
+			NumExtensions: 20,
 			NumServices:   0,
 		},
 		GoTypes:           file_wasmify_options_proto_goTypes,

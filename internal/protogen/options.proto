@@ -28,6 +28,17 @@ extend google.protobuf.MessageOptions {
 extend google.protobuf.FieldOptions {
   // Doc comment lifted from the C++ field declaration.
   string wasm_field_comment = 50015;
+  // Marks a method-input handle field whose C++ counterpart takes
+  // ownership of the wrapped pointer (e.g. `unique_ptr<T>` by value
+  // or by rvalue-ref). When true, the Go-side wrapper must clear
+  // the argument's `ptr` AFTER the invoke so the per-instance Go
+  // finalizer does not call free() on memory the C++ side has
+  // already deleted. Without this clear, the Go GC double-frees:
+  // the parent's destructor runs the unique_ptr deleter, then the
+  // child's still-attached finalizer issues a second Free RPC.
+  // Typical symptom is a panic on the next handle accessed through
+  // the parent (vtable read against freed memory).
+  bool wasm_take_ownership = 50019;
 }
 
 extend google.protobuf.ServiceOptions {

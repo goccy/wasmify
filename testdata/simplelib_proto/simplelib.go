@@ -1148,6 +1148,12 @@ func (h *Animal) setKeepAlive(v any) {
 	}
 }
 
+func (h *Animal) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newAnimal(ptr uint64) *Animal {
 	h := &Animal{ptr: ptr}
 	runtime.SetFinalizer(h, (*Animal).free)
@@ -1194,6 +1200,12 @@ func (h *Calculator) rawPtr() uint64 { return h.ptr }
 func (h *Calculator) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Calculator) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1528,6 +1540,12 @@ func (h *Logger) setKeepAlive(v any) {
 	}
 }
 
+func (h *Logger) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func (*Logger) isLogger() {}
 
 func newLogger(ptr uint64) *Logger {
@@ -1643,6 +1661,12 @@ func (h *ManagedFactory) setKeepAlive(v any) {
 	}
 }
 
+func (h *ManagedFactory) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newManagedFactory(ptr uint64) *ManagedFactory {
 	h := &ManagedFactory{ptr: ptr}
 	runtime.SetFinalizer(h, (*ManagedFactory).free)
@@ -1696,6 +1720,12 @@ func (h *ManagedValue) setKeepAlive(v any) {
 	}
 }
 
+func (h *ManagedValue) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newManagedValue(ptr uint64) *ManagedValue {
 	h := &ManagedValue{ptr: ptr}
 	return h
@@ -1738,6 +1768,12 @@ func (h *Named) rawPtr() uint64 { return h.ptr }
 func (h *Named) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Named) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1789,6 +1825,12 @@ func (h *Priced) setKeepAlive(v any) {
 	}
 }
 
+func (h *Priced) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newPriced(ptr uint64) *Priced {
 	h := &Priced{ptr: ptr}
 	runtime.SetFinalizer(h, (*Priced).free)
@@ -1836,6 +1878,12 @@ func (h *Product) rawPtr() uint64 { return h.ptr }
 func (h *Product) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Product) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1954,6 +2002,12 @@ func (h *Shape) setKeepAlive(v any) {
 	}
 }
 
+func (h *Shape) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func (*Shape) isShape() {}
 
 func newShape(ptr uint64) *Shape {
@@ -2010,6 +2064,12 @@ func (h *ShapeBox) rawPtr() uint64 { return h.ptr }
 func (h *ShapeBox) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *ShapeBox) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -2152,6 +2212,12 @@ func (h *StatefulCounter) setKeepAlive(v any) {
 	}
 }
 
+func (h *StatefulCounter) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newStatefulCounter(ptr uint64) *StatefulCounter {
 	h := &StatefulCounter{ptr: ptr}
 	runtime.SetFinalizer(h, (*StatefulCounter).free)
@@ -2263,6 +2329,12 @@ func (h *TextNodeBase) rawPtr() uint64 { return h.ptr }
 func (h *TextNodeBase) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *TextNodeBase) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
