@@ -972,6 +972,7 @@ func generateModule(pkg string) string {
 
 const moduleBody = `import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -1197,8 +1198,9 @@ func Init(opts ...Option) error {
 // Close shuts down the global module. Optional — for clean shutdown.
 // Releases the wazero runtime and, if WithCompilationCache was used,
 // flushes and closes the underlying on-disk cache so any in-flight
-// writes land before the process exits. The first error encountered
-// is returned; both teardown steps run regardless.
+// writes land before the process exits. Both teardown steps always
+// run; if either fails, errors.Join surfaces both so the caller can
+// see (and react to) all the failures, not just the first.
 func Close() error {
 	if globalModule == nil {
 		return nil
@@ -1210,10 +1212,7 @@ func Close() error {
 		cacheErr = globalModule.compilationCache.Close(ctx)
 		globalModule.compilationCache = nil
 	}
-	if rtErr != nil {
-		return rtErr
-	}
-	return cacheErr
+	return errors.Join(rtErr, cacheErr)
 }
 
 // module returns the initialized global module. Panics if Init was not called.
