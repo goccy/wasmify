@@ -1148,6 +1148,12 @@ func (h *Animal) setKeepAlive(v any) {
 	}
 }
 
+func (h *Animal) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newAnimal(ptr uint64) *Animal {
 	h := &Animal{ptr: ptr}
 	runtime.SetFinalizer(h, (*Animal).free)
@@ -1194,6 +1200,12 @@ func (h *Calculator) rawPtr() uint64 { return h.ptr }
 func (h *Calculator) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Calculator) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1528,6 +1540,12 @@ func (h *Logger) setKeepAlive(v any) {
 	}
 }
 
+func (h *Logger) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func (*Logger) isLogger() {}
 
 func newLogger(ptr uint64) *Logger {
@@ -1643,6 +1661,12 @@ func (h *ManagedFactory) setKeepAlive(v any) {
 	}
 }
 
+func (h *ManagedFactory) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newManagedFactory(ptr uint64) *ManagedFactory {
 	h := &ManagedFactory{ptr: ptr}
 	runtime.SetFinalizer(h, (*ManagedFactory).free)
@@ -1696,6 +1720,12 @@ func (h *ManagedValue) setKeepAlive(v any) {
 	}
 }
 
+func (h *ManagedValue) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newManagedValue(ptr uint64) *ManagedValue {
 	h := &ManagedValue{ptr: ptr}
 	return h
@@ -1738,6 +1768,12 @@ func (h *Named) rawPtr() uint64 { return h.ptr }
 func (h *Named) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Named) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1789,6 +1825,12 @@ func (h *Priced) setKeepAlive(v any) {
 	}
 }
 
+func (h *Priced) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newPriced(ptr uint64) *Priced {
 	h := &Priced{ptr: ptr}
 	runtime.SetFinalizer(h, (*Priced).free)
@@ -1836,6 +1878,12 @@ func (h *Product) rawPtr() uint64 { return h.ptr }
 func (h *Product) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *Product) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -1954,6 +2002,12 @@ func (h *Shape) setKeepAlive(v any) {
 	}
 }
 
+func (h *Shape) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func (*Shape) isShape() {}
 
 func newShape(ptr uint64) *Shape {
@@ -2013,6 +2067,12 @@ func (h *ShapeBox) setKeepAlive(v any) {
 	}
 }
 
+func (h *ShapeBox) clearPtr() {
+	if h != nil {
+		h.ptr = 0
+	}
+}
+
 func newShapeBox(ptr uint64) *ShapeBox {
 	h := &ShapeBox{ptr: ptr}
 	runtime.SetFinalizer(h, (*ShapeBox).free)
@@ -2043,10 +2103,34 @@ func (h *ShapeBox) Add(s ShapeNode) error {
 	return err
 }
 
+// add_unique exercises the unique_ptr take-ownership path that
+// motivated the double-free fix: the bridge constructs a fresh
+// std::unique_ptr
+// <Shape
+// > from the raw handle pointer at the call
+// site, so the C++ side becomes the sole owner the moment the call
+// runs. The Go-side wrapper must clear its handle pointer post-
+// invoke so the per-instance finalizer cannot issue a second Free
+// RPC against memory ShapeBox now owns through `owned_`.
+func (h *ShapeBox) AddUnique(s ShapeNode) error {
+	buf := pbAppendHandle(nil, 1, h.ptr)
+	if s != nil {
+		buf = pbAppendHandle(buf, 2, s.rawPtr())
+	}
+	h.setKeepAlive(s)
+	_, err := invokeMethod(16, 2, buf)
+	if s != nil {
+		if _c, _ok := s.(interface{ clearPtr() }); _ok {
+			_c.clearPtr()
+		}
+	}
+	return err
+}
+
 func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
 	buf := pbAppendHandle(nil, 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, i)
-	resp, err := invokeMethod(16, 2, buf)
+	resp, err := invokeMethod(16, 3, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -2055,7 +2139,7 @@ func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
 
 func (h *ShapeBox) Size() (int32, error) {
 	buf := pbAppendHandle(nil, 1, h.ptr)
-	resp, err := invokeMethod(16, 3, buf)
+	resp, err := invokeMethod(16, 4, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -2065,7 +2149,7 @@ func (h *ShapeBox) Size() (int32, error) {
 func (h *ShapeBox) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(16, 4, buf)
+		module().invoke(16, 5, buf)
 		h.ptr = 0
 	}
 }
@@ -2149,6 +2233,12 @@ func (h *StatefulCounter) rawPtr() uint64 { return h.ptr }
 func (h *StatefulCounter) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *StatefulCounter) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 
@@ -2263,6 +2353,12 @@ func (h *TextNodeBase) rawPtr() uint64 { return h.ptr }
 func (h *TextNodeBase) setKeepAlive(v any) {
 	if h != nil && v != nil {
 		h.keepAlive = append(h.keepAlive, v)
+	}
+}
+
+func (h *TextNodeBase) clearPtr() {
+	if h != nil {
+		h.ptr = 0
 	}
 }
 

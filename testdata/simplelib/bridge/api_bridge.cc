@@ -457,9 +457,10 @@ static const int32_t METHOD_SHAPE_RELEASE_HANDLE = 2;
 static const int32_t SERVICE_SHAPE_BOX = 16;
 static const int32_t METHOD_SHAPE_BOX_NEW = 0;
 static const int32_t METHOD_SHAPE_BOX_ADD = 1;
-static const int32_t METHOD_SHAPE_BOX_GET = 2;
-static const int32_t METHOD_SHAPE_BOX_SIZE = 3;
-static const int32_t METHOD_SHAPE_BOX_RELEASE_HANDLE = 4;
+static const int32_t METHOD_SHAPE_BOX_ADD_UNIQUE = 2;
+static const int32_t METHOD_SHAPE_BOX_GET = 3;
+static const int32_t METHOD_SHAPE_BOX_SIZE = 4;
+static const int32_t METHOD_SHAPE_BOX_RELEASE_HANDLE = 5;
 
 static const int32_t SERVICE_SQUARE = 17;
 static const int32_t METHOD_SQUARE_NEW = 0;
@@ -577,250 +578,261 @@ private:
 // Forward declarations of value-type submessage parsers.
 static void parse_calc__Result(ProtoReader reader, calc::Result& out);
 
-// Dispatch: simplelib_proto service (free functions)
-static int64_t dispatch_simplelib_proto(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // add
-        double a{};
-        double b{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: a = reader.read_double(); break;
-            case 2: b = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+// Service 0: simplelib_proto (free functions)
+WASM_EXPORT(w_0_0)
+int64_t w_0_0(void* req, int32_t req_len) { // add
+    double a{};
+    double b{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: a = reader.read_double(); break;
+        case 2: b = reader.read_double(); break;
+        default: reader.skip(); break;
         }
-        double _result = calc::add(a, b);
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
     }
-    case 1: { // aggregate_results
-        std::vector<double> values{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: values.push_back(reader.read_double()); break;
-            default: reader.skip(); break;
-            }
+    double _result = calc::add(a, b);
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_0_1)
+int64_t w_0_1(void* req, int32_t req_len) { // aggregate_results
+    std::vector<double> values{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: values.push_back(reader.read_double()); break;
+        default: reader.skip(); break;
         }
-        auto _result = calc::aggregate_results(values);
-        ProtoWriter _pw;
-        for (const auto& _elem : _result) {
+    }
+    auto _result = calc::aggregate_results(values);
+    ProtoWriter _pw;
+    for (const auto& _elem : _result) {
     ProtoWriter _subw;
     _subw.write_string(1, std::string(_elem.error_message)); _subw.write_bool(2, _elem.ok); _subw.write_double(3, _elem.value); 
     _pw.write_submessage(1, _subw);
     free(_subw.data_);
 }
-        return _pw.finish();
-    }
-    case 2: { // format_result
-        calc::Result r{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: { ProtoReader _sub = reader.read_submessage(); parse_calc__Result(_sub, r); } break;
-            default: reader.skip(); break;
-            }
-        }
-        auto _result = calc::format_result(r);
-        ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
-        return _pw.finish();
-    }
-    case 3: { // run_with_logger
-        uint64_t logger{};
-        std::string message{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: logger = read_handle_ptr(reader); break;
-            case 2: message = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        int32_t _result = calc::run_with_logger(reinterpret_cast<calc::Logger*>(logger), message);
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 4: { // version
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
-        }
-        int32_t _result = calc::version();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    default: return -1;
-    }
+    return _pw.finish();
 }
 
-// Dispatch: AnimalService
-static int64_t dispatch_animal(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // set_species
-        uint64_t _handle_ptr = 0;
-        std::string s{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: s = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_0_2)
+int64_t w_0_2(void* req, int32_t req_len) { // format_result
+    calc::Result r{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: { ProtoReader _sub = reader.read_submessage(); parse_calc__Result(_sub, r); } break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Animal*>(_handle_ptr);
-        _self->set_species(s);
-        ProtoWriter _pw;
-        return _pw.finish();
     }
-    case 1: { // species
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Animal*>(_handle_ptr);
-        const auto& _result = _self->species();
-        ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Animal*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto _result = calc::format_result(r);
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
 }
 
-// Dispatch: CalculatorService
-static int64_t dispatch_calculator(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (Calculator)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_0_3)
+int64_t w_0_3(void* req, int32_t req_len) { // run_with_logger
+    uint64_t logger{};
+    std::string message{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: logger = read_handle_ptr(reader); break;
+        case 2: message = reader.read_string(); break;
+        default: reader.skip(); break;
         }
-        auto* _obj = new calc::Calculator();
+    }
+    int32_t _result = calc::run_with_logger(reinterpret_cast<calc::Logger*>(logger), message);
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_0_4)
+int64_t w_0_4(void* req, int32_t req_len) { // version
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
+        }
+    }
+    int32_t _result = calc::version();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+// Service 1: AnimalService
+WASM_EXPORT(w_1_0)
+int64_t w_1_0(void* req, int32_t req_len) { // set_species
+    uint64_t _handle_ptr = 0;
+    std::string s{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: s = reader.read_string(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // add_to_history
-        uint64_t _handle_ptr = 0;
-        double value{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: value = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+    auto* _self = reinterpret_cast<calc::Animal*>(_handle_ptr);
+    _self->set_species(s);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_1_1)
+int64_t w_1_1(void* req, int32_t req_len) { // species
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
-        _self->add_to_history(value);
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 2: { // clear_history
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+    auto* _self = reinterpret_cast<const calc::Animal*>(_handle_ptr);
+    const auto& _result = _self->species();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_1_2)
+int64_t w_1_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Animal*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 2: CalculatorService
+WASM_EXPORT(w_2_0)
+int64_t w_2_0(void* req, int32_t req_len) { // New (Calculator)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
+    }
+    auto* _obj = new calc::Calculator();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_2_1)
+int64_t w_2_1(void* req, int32_t req_len) { // add_to_history
+    uint64_t _handle_ptr = 0;
+    double value{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: value = reader.read_double(); break;
+        default: reader.skip(); break;
         }
-        auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
-        _self->clear_history();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 3: { // compute
-        uint64_t _handle_ptr = 0;
-        calc::Operation op{};
-        double a{};
-        double b{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: /* value type Operation: submessage parser missing */ reader.skip(); break;
-            case 3: a = reader.read_double(); break;
-            case 4: b = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+    auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
+    _self->add_to_history(value);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_2_2)
+int64_t w_2_2(void* req, int32_t req_len) { // clear_history
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
-        double _result = _self->compute(op, a, b);
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_double(1, _result);
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 4: { // compute_safe
-        uint64_t _handle_ptr = 0;
-        calc::Operation op{};
-        double a{};
-        double b{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: /* value type Operation: submessage parser missing */ reader.skip(); break;
-            case 3: a = reader.read_double(); break;
-            case 4: b = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+    auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
+    _self->clear_history();
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_2_3)
+int64_t w_2_3(void* req, int32_t req_len) { // compute
+    uint64_t _handle_ptr = 0;
+    calc::Operation op{};
+    double a{};
+    double b{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: /* value type Operation: submessage parser missing */ reader.skip(); break;
+        case 3: a = reader.read_double(); break;
+        case 4: b = reader.read_double(); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
-        auto _result = _self->compute_safe(op, a, b);
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        {
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
+    double _result = _self->compute(op, a, b);
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_2_4)
+int64_t w_2_4(void* req, int32_t req_len) { // compute_safe
+    uint64_t _handle_ptr = 0;
+    calc::Operation op{};
+    double a{};
+    double b{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: /* value type Operation: submessage parser missing */ reader.skip(); break;
+        case 3: a = reader.read_double(); break;
+        case 4: b = reader.read_double(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
+    auto _result = _self->compute_safe(op, a, b);
+    ProtoWriter _pw;
+    {
     ProtoWriter _subw;
     _subw.write_string(1, std::string(_result.error_message));
     _subw.write_bool(2, _result.ok);
@@ -828,1197 +840,1251 @@ static int64_t dispatch_calculator(int32_t method_id, void* req, int32_t req_len
     _pw.write_submessage(1, _subw);
     free(_subw.data_);
 }
-        return _pw.finish();
-    }
-    case 5: { // get_history
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
-        auto _result = _self->get_history();
-        ProtoWriter _pw;
-        _pw.write_repeated_double(1, _result);
-        return _pw.finish();
-    }
-    case 6: { // name
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
-        const auto& _result = _self->name();
-        ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
-        return _pw.finish();
-    }
-    case 7: { // set_name
-        uint64_t _handle_ptr = 0;
-        std::string name{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: name = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
-        _self->set_name(name);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 8: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Calculator*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    return _pw.finish();
 }
 
-// Dispatch: CanineService
-static int64_t dispatch_canine(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // breed
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_2_5)
+int64_t w_2_5(void* req, int32_t req_len) { // get_history
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Canine*>(_handle_ptr);
-        const auto& _result = _self->breed();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // set_breed
-        uint64_t _handle_ptr = 0;
-        std::string b{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: b = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Canine*>(_handle_ptr);
-        _self->set_breed(b);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Canine*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
+    auto _result = _self->get_history();
+    ProtoWriter _pw;
+    _pw.write_repeated_double(1, _result);
+    return _pw.finish();
 }
 
-// Dispatch: CircleService
-static int64_t dispatch_circle(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (Circle)
-        double r{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: r = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_2_6)
+int64_t w_2_6(void* req, int32_t req_len) { // name
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        auto* _obj = new calc::Circle(r);
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // area
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Circle*>(_handle_ptr);
-        double _result = _self->area();
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
-    }
-    case 2: { // radius
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Circle*>(_handle_ptr);
-        double _result = _self->radius();
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
-    }
-    case 3: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Circle*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Calculator*>(_handle_ptr);
+    const auto& _result = _self->name();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
 }
 
-// Dispatch: DogService
-static int64_t dispatch_dog(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (Dog)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_2_7)
+int64_t w_2_7(void* req, int32_t req_len) { // set_name
+    uint64_t _handle_ptr = 0;
+    std::string name{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: name = reader.read_string(); break;
+        default: reader.skip(); break;
         }
-        auto* _obj = new calc::Dog();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // bark_volume
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Dog*>(_handle_ptr);
-        int32_t _result = _self->bark_volume();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 2: { // set_bark_volume
-        uint64_t _handle_ptr = 0;
-        int32_t v{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: v = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Dog*>(_handle_ptr);
-        _self->set_bark_volume(v);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 3: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Dog*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<calc::Calculator*>(_handle_ptr);
+    _self->set_name(name);
+    ProtoWriter _pw;
+    return _pw.finish();
 }
 
-// Dispatch: HeadingNodeService
-static int64_t dispatch_heading_node(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (HeadingNode)
-        int32_t level{};
-        std::string text{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: level = reader.read_int32(); break;
-            case 2: text = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        auto* _obj = new calc::HeadingNode(level, text);
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
+WASM_EXPORT(w_2_8)
+int64_t w_2_8(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Calculator*>(_handle_ptr);
     }
-    case 1: { // render
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::HeadingNode*>(_handle_ptr);
-        auto _result = _self->render();
-        ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::HeadingNode*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    return encode_result(nullptr, 0);
 }
 
-// Dispatch: LoggerService
-static int64_t dispatch_logger(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // level
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+// Service 3: CanineService
+WASM_EXPORT(w_3_0)
+int64_t w_3_0(void* req, int32_t req_len) { // breed
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Logger*>(_handle_ptr);
-        int32_t _result = _self->level();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_int32(1, _result);
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // log
-        uint64_t _handle_ptr = 0;
-        std::string message{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: message = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Logger*>(_handle_ptr);
-        _self->log(message);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // FromCallback
-        ProtoReader _pr(req, req_len);
-        int32_t _callback_id = 0;
-        while (_pr.next()) {
-            if (_pr.field() == 1) _callback_id = _pr.read_int32();
-            else _pr.skip();
-        }
-        auto* _t = new LoggerTrampoline(_callback_id);
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
-        return _pw.finish();
-    }
-    case 3: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Logger*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Canine*>(_handle_ptr);
+    const auto& _result = _self->breed();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
 }
 
-// Dispatch: MammalService
-static int64_t dispatch_mammal(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // legs
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_3_1)
+int64_t w_3_1(void* req, int32_t req_len) { // set_breed
+    uint64_t _handle_ptr = 0;
+    std::string b{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: b = reader.read_string(); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Mammal*>(_handle_ptr);
-        int32_t _result = _self->legs();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_int32(1, _result);
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // set_legs
-        uint64_t _handle_ptr = 0;
-        int32_t n{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: n = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Mammal*>(_handle_ptr);
-        _self->set_legs(n);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Mammal*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<calc::Canine*>(_handle_ptr);
+    _self->set_breed(b);
+    ProtoWriter _pw;
+    return _pw.finish();
 }
 
-// Dispatch: ManagedFactoryService
-static int64_t dispatch_managed_factory(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (ManagedFactory)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
-        }
-        auto* _obj = new calc::ManagedFactory();
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
+WASM_EXPORT(w_3_2)
+int64_t w_3_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Canine*>(_handle_ptr);
     }
-    case 1: { // make
-        uint64_t _handle_ptr = 0;
-        int32_t kind{};
-        std::string tag{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: kind = reader.read_int32(); break;
-            case 3: tag = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::ManagedFactory*>(_handle_ptr);
-        auto _result = _self->make(kind, tag);
-        ProtoWriter _pw;
-        _pw.write_handle(1, reinterpret_cast<uint64_t>(_result));
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::ManagedFactory*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    return encode_result(nullptr, 0);
 }
 
-// Dispatch: ManagedValueService
-static int64_t dispatch_managed_value(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // kind
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+// Service 4: CircleService
+WASM_EXPORT(w_4_0)
+int64_t w_4_0(void* req, int32_t req_len) { // New (Circle)
+    double r{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: r = reader.read_double(); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ManagedValue*>(_handle_ptr);
-        int32_t _result = _self->kind();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
     }
-    case 1: { // tag
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ManagedValue*>(_handle_ptr);
-        const auto& _result = _self->tag();
-        ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
-        return _pw.finish();
-    }
-    default: return -1;
-    }
+    auto* _obj = new calc::Circle(r);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
 }
 
-// Dispatch: NamedService
-static int64_t dispatch_named(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // named_name
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_4_1)
+int64_t w_4_1(void* req, int32_t req_len) { // area
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Named*>(_handle_ptr);
-        const auto& _result = _self->named_name();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // set_named_name
-        uint64_t _handle_ptr = 0;
-        std::string n{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: n = reader.read_string(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Named*>(_handle_ptr);
-        _self->set_named_name(n);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Named*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Circle*>(_handle_ptr);
+    double _result = _self->area();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
 }
 
-// Dispatch: PricedService
-static int64_t dispatch_priced(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // priced_price
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_4_2)
+int64_t w_4_2(void* req, int32_t req_len) { // radius
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Priced*>(_handle_ptr);
-        double _result = _self->priced_price();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_double(1, _result);
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // set_priced_price
-        uint64_t _handle_ptr = 0;
-        double p{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: p = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Priced*>(_handle_ptr);
-        _self->set_priced_price(p);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Priced*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Circle*>(_handle_ptr);
+    double _result = _self->radius();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
 }
 
-// Dispatch: ProductService
-static int64_t dispatch_product(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (Product)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
-        }
-        auto* _obj = new calc::Product();
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
+WASM_EXPORT(w_4_3)
+int64_t w_4_3(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Circle*>(_handle_ptr);
     }
-    case 1: { // set_stock
-        uint64_t _handle_ptr = 0;
-        int32_t s{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: s = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::Product*>(_handle_ptr);
-        _self->set_stock(s);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // stock
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Product*>(_handle_ptr);
-        int32_t _result = _self->stock();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 3: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Product*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    return encode_result(nullptr, 0);
 }
 
-// Dispatch: ScientificCalculatorService
-static int64_t dispatch_scientific_calculator(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // power
-        uint64_t _handle_ptr = 0;
-        double base{};
-        double exp{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: base = reader.read_double(); break;
-            case 3: exp = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
+// Service 5: DogService
+WASM_EXPORT(w_5_0)
+int64_t w_5_0(void* req, int32_t req_len) { // New (Dog)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
-        double _result = _self->power(base, exp);
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
     }
-    case 1: { // sqrt
-        uint64_t _handle_ptr = 0;
-        double value{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: value = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
-        double _result = _self->sqrt(value);
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _obj = new calc::Dog();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
 }
 
-// Dispatch: ShapeService
-static int64_t dispatch_shape(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // area
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_5_1)
+int64_t w_5_1(void* req, int32_t req_len) { // bark_volume
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Shape*>(_handle_ptr);
-        double _result = _self->area();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_double(1, _result);
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // FromCallback
-        ProtoReader _pr(req, req_len);
-        int32_t _callback_id = 0;
-        while (_pr.next()) {
-            if (_pr.field() == 1) _callback_id = _pr.read_int32();
-            else _pr.skip();
-        }
-        auto* _t = new ShapeTrampoline(_callback_id);
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
-        return _pw.finish();
-    }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Shape*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<const calc::Dog*>(_handle_ptr);
+    int32_t _result = _self->bark_volume();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
 }
 
-// Dispatch: ShapeBoxService
-static int64_t dispatch_shape_box(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (ShapeBox)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_5_2)
+int64_t w_5_2(void* req, int32_t req_len) { // set_bark_volume
+    uint64_t _handle_ptr = 0;
+    int32_t v{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: v = reader.read_int32(); break;
+        default: reader.skip(); break;
         }
-        auto* _obj = new calc::ShapeBox();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // add
-        uint64_t _handle_ptr = 0;
-        uint64_t s{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: s = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::ShapeBox*>(_handle_ptr);
-        _self->add(reinterpret_cast<calc::Shape*>(s));
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 2: { // get
-        uint64_t _handle_ptr = 0;
-        int32_t i{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: i = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
-        auto _result = _self->get(i);
-        ProtoWriter _pw;
-        _pw.write_handle(1, reinterpret_cast<uint64_t>(_result));
-        return _pw.finish();
-    }
-    case 3: { // size
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
-        int32_t _result = _self->size();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 4: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _self = reinterpret_cast<calc::Dog*>(_handle_ptr);
+    _self->set_bark_volume(v);
+    ProtoWriter _pw;
+    return _pw.finish();
 }
 
-// Dispatch: SquareService
-static int64_t dispatch_square(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (Square)
-        double s{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: s = reader.read_double(); break;
-            default: reader.skip(); break;
-            }
-        }
-        auto* _obj = new calc::Square(s);
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
+WASM_EXPORT(w_5_3)
+int64_t w_5_3(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Dog*>(_handle_ptr);
     }
-    case 1: { // area
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Square*>(_handle_ptr);
-        double _result = _self->area();
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
-    }
-    case 2: { // side
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::Square*>(_handle_ptr);
-        double _result = _self->side();
-        ProtoWriter _pw;
-        _pw.write_double(1, _result);
-        return _pw.finish();
-    }
-    case 3: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::Square*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    return encode_result(nullptr, 0);
 }
 
-// Dispatch: StatefulCounterService
-static int64_t dispatch_stateful_counter(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // New (StatefulCounter)
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            default: reader.skip(); break;
-            }
+// Service 6: HeadingNodeService
+WASM_EXPORT(w_6_0)
+int64_t w_6_0(void* req, int32_t req_len) { // New (HeadingNode)
+    int32_t level{};
+    std::string text{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: level = reader.read_int32(); break;
+        case 2: text = reader.read_string(); break;
+        default: reader.skip(); break;
         }
-        auto* _obj = new calc::StatefulCounter();
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
     }
-    case 1: { // New2 (StatefulCounter2)
-        int32_t initial_id{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: initial_id = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        auto* _obj = new calc::StatefulCounter(initial_id);
-        ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
-        return _pw.finish();
-    }
-    case 2: { // add
-        uint64_t _handle_ptr = 0;
-        int32_t delta{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: delta = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
-        _self->add(delta);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 3: { // call_count
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
-        int32_t _result = _self->call_count();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 4: { // id
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
-        int32_t _result = _self->id();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 5: { // reset
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
-        _self->reset();
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 6: { // set_label
-        uint64_t _handle_ptr = 0;
-        int32_t new_label{};
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            case 2: new_label = reader.read_int32(); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
-        _self->set_label(new_label);
-        ProtoWriter _pw;
-        return _pw.finish();
-    }
-    case 7: { // total
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
-        }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
-        int32_t _result = _self->total();
-        ProtoWriter _pw;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 8: { // GetLabel
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
-        ProtoWriter _pw;
-        auto _result = _self->label;
-        _pw.write_int32(1, _result);
-        return _pw.finish();
-    }
-    case 9: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
-        }
-        return encode_result(nullptr, 0);
-    }
-    default: return -1;
-    }
+    auto* _obj = new calc::HeadingNode(level, text);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
 }
 
-// Dispatch: TextNodeService
-static int64_t dispatch_text_node(int32_t method_id, void* req, int32_t req_len) {
-    switch (method_id) {
-    case 0: { // render
-        uint64_t _handle_ptr = 0;
-        ProtoReader reader(req, req_len);
-        while (reader.has_data() && reader.next()) {
-            switch (reader.field()) {
-            case 1: _handle_ptr = read_handle_ptr(reader); break;
-            default: reader.skip(); break;
-            }
+WASM_EXPORT(w_6_1)
+int64_t w_6_1(void* req, int32_t req_len) { // render
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        if (_handle_ptr == 0) {
-            ProtoWriter _pw;
-            _pw.write_error("null handle");
-            return _pw.finish();
-        }
-        auto* _self = reinterpret_cast<const calc::TextNode*>(_handle_ptr);
-        auto _result = _self->render();
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_string(1, std::string(_result));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 1: { // FromCallback
-        ProtoReader _pr(req, req_len);
-        int32_t _callback_id = 0;
-        while (_pr.next()) {
-            if (_pr.field() == 1) _callback_id = _pr.read_int32();
-            else _pr.skip();
+    auto* _self = reinterpret_cast<const calc::HeadingNode*>(_handle_ptr);
+    auto _result = _self->render();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_6_2)
+int64_t w_6_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::HeadingNode*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 7: LoggerService
+WASM_EXPORT(w_7_0)
+int64_t w_7_0(void* req, int32_t req_len) { // level
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
         }
-        auto* _t = new TextNodeTrampoline(_callback_id);
+    }
+    if (_handle_ptr == 0) {
         ProtoWriter _pw;
-        _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
+        _pw.write_error("null handle");
         return _pw.finish();
     }
-    case 2: { // Free
-        uint64_t _handle_ptr = read_handle_direct(req, req_len);
-        if (_handle_ptr != 0) {
-            delete reinterpret_cast<const calc::TextNode*>(_handle_ptr);
+    auto* _self = reinterpret_cast<const calc::Logger*>(_handle_ptr);
+    int32_t _result = _self->level();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_7_1)
+int64_t w_7_1(void* req, int32_t req_len) { // log
+    uint64_t _handle_ptr = 0;
+    std::string message{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: message = reader.read_string(); break;
+        default: reader.skip(); break;
         }
-        return encode_result(nullptr, 0);
     }
-    default: return -1;
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
     }
+    auto* _self = reinterpret_cast<calc::Logger*>(_handle_ptr);
+    _self->log(message);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_7_2)
+int64_t w_7_2(void* req, int32_t req_len) { // FromCallback
+    ProtoReader _pr(req, req_len);
+    int32_t _callback_id = 0;
+    while (_pr.next()) {
+        if (_pr.field() == 1) _callback_id = _pr.read_int32();
+        else _pr.skip();
+    }
+    auto* _t = new LoggerTrampoline(_callback_id);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_7_3)
+int64_t w_7_3(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Logger*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 8: MammalService
+WASM_EXPORT(w_8_0)
+int64_t w_8_0(void* req, int32_t req_len) { // legs
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Mammal*>(_handle_ptr);
+    int32_t _result = _self->legs();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_8_1)
+int64_t w_8_1(void* req, int32_t req_len) { // set_legs
+    uint64_t _handle_ptr = 0;
+    int32_t n{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: n = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::Mammal*>(_handle_ptr);
+    _self->set_legs(n);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_8_2)
+int64_t w_8_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Mammal*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 9: ManagedFactoryService
+WASM_EXPORT(w_9_0)
+int64_t w_9_0(void* req, int32_t req_len) { // New (ManagedFactory)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::ManagedFactory();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_9_1)
+int64_t w_9_1(void* req, int32_t req_len) { // make
+    uint64_t _handle_ptr = 0;
+    int32_t kind{};
+    std::string tag{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: kind = reader.read_int32(); break;
+        case 3: tag = reader.read_string(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::ManagedFactory*>(_handle_ptr);
+    auto _result = _self->make(kind, tag);
+    ProtoWriter _pw;
+    _pw.write_handle(1, reinterpret_cast<uint64_t>(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_9_2)
+int64_t w_9_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::ManagedFactory*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 10: ManagedValueService
+WASM_EXPORT(w_10_0)
+int64_t w_10_0(void* req, int32_t req_len) { // kind
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ManagedValue*>(_handle_ptr);
+    int32_t _result = _self->kind();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_10_1)
+int64_t w_10_1(void* req, int32_t req_len) { // tag
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ManagedValue*>(_handle_ptr);
+    const auto& _result = _self->tag();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
+}
+
+// Service 11: NamedService
+WASM_EXPORT(w_11_0)
+int64_t w_11_0(void* req, int32_t req_len) { // named_name
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Named*>(_handle_ptr);
+    const auto& _result = _self->named_name();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_11_1)
+int64_t w_11_1(void* req, int32_t req_len) { // set_named_name
+    uint64_t _handle_ptr = 0;
+    std::string n{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: n = reader.read_string(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::Named*>(_handle_ptr);
+    _self->set_named_name(n);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_11_2)
+int64_t w_11_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Named*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 12: PricedService
+WASM_EXPORT(w_12_0)
+int64_t w_12_0(void* req, int32_t req_len) { // priced_price
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Priced*>(_handle_ptr);
+    double _result = _self->priced_price();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_12_1)
+int64_t w_12_1(void* req, int32_t req_len) { // set_priced_price
+    uint64_t _handle_ptr = 0;
+    double p{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: p = reader.read_double(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::Priced*>(_handle_ptr);
+    _self->set_priced_price(p);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_12_2)
+int64_t w_12_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Priced*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 13: ProductService
+WASM_EXPORT(w_13_0)
+int64_t w_13_0(void* req, int32_t req_len) { // New (Product)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::Product();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_13_1)
+int64_t w_13_1(void* req, int32_t req_len) { // set_stock
+    uint64_t _handle_ptr = 0;
+    int32_t s{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: s = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::Product*>(_handle_ptr);
+    _self->set_stock(s);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_13_2)
+int64_t w_13_2(void* req, int32_t req_len) { // stock
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Product*>(_handle_ptr);
+    int32_t _result = _self->stock();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_13_3)
+int64_t w_13_3(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Product*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 14: ScientificCalculatorService
+WASM_EXPORT(w_14_0)
+int64_t w_14_0(void* req, int32_t req_len) { // power
+    uint64_t _handle_ptr = 0;
+    double base{};
+    double exp{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: base = reader.read_double(); break;
+        case 3: exp = reader.read_double(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
+    double _result = _self->power(base, exp);
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_14_1)
+int64_t w_14_1(void* req, int32_t req_len) { // sqrt
+    uint64_t _handle_ptr = 0;
+    double value{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: value = reader.read_double(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
+    double _result = _self->sqrt(value);
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_14_2)
+int64_t w_14_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::ScientificCalculator*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 15: ShapeService
+WASM_EXPORT(w_15_0)
+int64_t w_15_0(void* req, int32_t req_len) { // area
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Shape*>(_handle_ptr);
+    double _result = _self->area();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_15_1)
+int64_t w_15_1(void* req, int32_t req_len) { // FromCallback
+    ProtoReader _pr(req, req_len);
+    int32_t _callback_id = 0;
+    while (_pr.next()) {
+        if (_pr.field() == 1) _callback_id = _pr.read_int32();
+        else _pr.skip();
+    }
+    auto* _t = new ShapeTrampoline(_callback_id);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_15_2)
+int64_t w_15_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Shape*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 16: ShapeBoxService
+WASM_EXPORT(w_16_0)
+int64_t w_16_0(void* req, int32_t req_len) { // New (ShapeBox)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::ShapeBox();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_16_1)
+int64_t w_16_1(void* req, int32_t req_len) { // add
+    uint64_t _handle_ptr = 0;
+    uint64_t s{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: s = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::ShapeBox*>(_handle_ptr);
+    _self->add(reinterpret_cast<calc::Shape*>(s));
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_16_2)
+int64_t w_16_2(void* req, int32_t req_len) { // add_unique
+    uint64_t _handle_ptr = 0;
+    uint64_t s{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: s = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::ShapeBox*>(_handle_ptr);
+    _self->add_unique(std::unique_ptr<calc::Shape>(reinterpret_cast<calc::Shape*>(s)));
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_16_3)
+int64_t w_16_3(void* req, int32_t req_len) { // get
+    uint64_t _handle_ptr = 0;
+    int32_t i{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: i = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
+    auto _result = _self->get(i);
+    ProtoWriter _pw;
+    _pw.write_handle(1, reinterpret_cast<uint64_t>(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_16_4)
+int64_t w_16_4(void* req, int32_t req_len) { // size
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
+    int32_t _result = _self->size();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_16_5)
+int64_t w_16_5(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::ShapeBox*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 17: SquareService
+WASM_EXPORT(w_17_0)
+int64_t w_17_0(void* req, int32_t req_len) { // New (Square)
+    double s{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: s = reader.read_double(); break;
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::Square(s);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_17_1)
+int64_t w_17_1(void* req, int32_t req_len) { // area
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Square*>(_handle_ptr);
+    double _result = _self->area();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_17_2)
+int64_t w_17_2(void* req, int32_t req_len) { // side
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::Square*>(_handle_ptr);
+    double _result = _self->side();
+    ProtoWriter _pw;
+    _pw.write_double(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_17_3)
+int64_t w_17_3(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::Square*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 18: StatefulCounterService
+WASM_EXPORT(w_18_0)
+int64_t w_18_0(void* req, int32_t req_len) { // New (StatefulCounter)
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::StatefulCounter();
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_1)
+int64_t w_18_1(void* req, int32_t req_len) { // New2 (StatefulCounter2)
+    int32_t initial_id{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: initial_id = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    auto* _obj = new calc::StatefulCounter(initial_id);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_obj));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_2)
+int64_t w_18_2(void* req, int32_t req_len) { // add
+    uint64_t _handle_ptr = 0;
+    int32_t delta{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: delta = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
+    _self->add(delta);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_3)
+int64_t w_18_3(void* req, int32_t req_len) { // call_count
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
+    int32_t _result = _self->call_count();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_4)
+int64_t w_18_4(void* req, int32_t req_len) { // id
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
+    int32_t _result = _self->id();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_5)
+int64_t w_18_5(void* req, int32_t req_len) { // reset
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
+    _self->reset();
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_6)
+int64_t w_18_6(void* req, int32_t req_len) { // set_label
+    uint64_t _handle_ptr = 0;
+    int32_t new_label{};
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        case 2: new_label = reader.read_int32(); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<calc::StatefulCounter*>(_handle_ptr);
+    _self->set_label(new_label);
+    ProtoWriter _pw;
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_7)
+int64_t w_18_7(void* req, int32_t req_len) { // total
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
+    int32_t _result = _self->total();
+    ProtoWriter _pw;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_8)
+int64_t w_18_8(void* req, int32_t req_len) { // GetLabel
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
+    ProtoWriter _pw;
+    auto _result = _self->label;
+    _pw.write_int32(1, _result);
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_18_9)
+int64_t w_18_9(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::StatefulCounter*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
+}
+
+// Service 19: TextNodeService
+WASM_EXPORT(w_19_0)
+int64_t w_19_0(void* req, int32_t req_len) { // render
+    uint64_t _handle_ptr = 0;
+    ProtoReader reader(req, req_len);
+    while (reader.has_data() && reader.next()) {
+        switch (reader.field()) {
+        case 1: _handle_ptr = read_handle_ptr(reader); break;
+        default: reader.skip(); break;
+        }
+    }
+    if (_handle_ptr == 0) {
+        ProtoWriter _pw;
+        _pw.write_error("null handle");
+        return _pw.finish();
+    }
+    auto* _self = reinterpret_cast<const calc::TextNode*>(_handle_ptr);
+    auto _result = _self->render();
+    ProtoWriter _pw;
+    _pw.write_string(1, std::string(_result));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_19_1)
+int64_t w_19_1(void* req, int32_t req_len) { // FromCallback
+    ProtoReader _pr(req, req_len);
+    int32_t _callback_id = 0;
+    while (_pr.next()) {
+        if (_pr.field() == 1) _callback_id = _pr.read_int32();
+        else _pr.skip();
+    }
+    auto* _t = new TextNodeTrampoline(_callback_id);
+    ProtoWriter _pw;
+    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));
+    return _pw.finish();
+}
+
+WASM_EXPORT(w_19_2)
+int64_t w_19_2(void* req, int32_t req_len) { // Free
+    uint64_t _handle_ptr = read_handle_direct(req, req_len);
+    if (_handle_ptr != 0) {
+        delete reinterpret_cast<const calc::TextNode*>(_handle_ptr);
+    }
+    return encode_result(nullptr, 0);
 }
 
 // ======================================
@@ -2046,13 +2112,14 @@ static void parse_calc__Result(ProtoReader reader, calc::Result& out) {
 }
 
 // ======================================
-// Main dispatcher
+// Runtime helpers
 // ======================================
 
 #include <typeinfo>
 #include <cxxabi.h>
 
-static int64_t _wasmify_get_type_name(void* req, int32_t req_len) {
+WASM_EXPORT(wasmify_get_type_name)
+int64_t wasmify_get_type_name(void* req, int32_t req_len) {
     ProtoReader reader(req, req_len);
     uint64_t ptr = 0;
     while (reader.has_data() && reader.next()) {
@@ -2060,8 +2127,6 @@ static int64_t _wasmify_get_type_name(void* req, int32_t req_len) {
         else reader.skip();
     }
     if (ptr == 0) { ProtoWriter pw; pw.write_error("null handle"); return pw.finish(); }
-    // Use the first abstract base pointer to get runtime type info.
-    // We cast to void* and use a helper that tries known base classes.
     if (auto* p = reinterpret_cast<calc::Logger*>(ptr)) {
         int status = 0;
         const char* mangled = typeid(*p).name();
@@ -2102,39 +2167,6 @@ static int64_t _wasmify_get_type_name(void* req, int32_t req_len) {
     ProtoWriter pw;
     pw.write_error("unknown type");
     return pw.finish();
-}
-
-typedef int64_t (*dispatch_fn_t)(int32_t method_id, void* req, int32_t req_len);
-
-static const dispatch_fn_t _wasmify_dispatch_fns[20] = {
-    /* 0 */ dispatch_simplelib_proto,
-    /* 1 */ dispatch_animal,
-    /* 2 */ dispatch_calculator,
-    /* 3 */ dispatch_canine,
-    /* 4 */ dispatch_circle,
-    /* 5 */ dispatch_dog,
-    /* 6 */ dispatch_heading_node,
-    /* 7 */ dispatch_logger,
-    /* 8 */ dispatch_mammal,
-    /* 9 */ dispatch_managed_factory,
-    /* 10 */ dispatch_managed_value,
-    /* 11 */ dispatch_named,
-    /* 12 */ dispatch_priced,
-    /* 13 */ dispatch_product,
-    /* 14 */ dispatch_scientific_calculator,
-    /* 15 */ dispatch_shape,
-    /* 16 */ dispatch_shape_box,
-    /* 17 */ dispatch_square,
-    /* 18 */ dispatch_stateful_counter,
-    /* 19 */ dispatch_text_node,
-};
-
-WASM_EXPORT(wasm_invoke)
-int64_t wasm_invoke(int32_t service_id, int32_t method_id, void* req, int32_t req_len) {
-    // service_id == -1: get runtime type name for abstract dispatch
-    if (service_id == -1) return _wasmify_get_type_name(req, req_len);
-    if (service_id < 0 || service_id >= 20) return -1;
-    return _wasmify_dispatch_fns[service_id](method_id, req, req_len);
 }
 
 WASM_EXPORT(wasm_init)

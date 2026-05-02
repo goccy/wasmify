@@ -8,9 +8,13 @@ extern "C" {
 
 void* wasm_alloc(int32_t size);
 void wasm_free(void* ptr);
-int64_t wasm_invoke(int32_t service_id, int32_t method_id, void* req, int32_t req_len);
 int32_t wasm_init();
 void wasm_shutdown();
+
+// Per-method entry points are exported as `w_<svc>_<mid>` and
+// `wasmify_get_type_name`; callers look them up by name via
+// `mod.ExportedFunction(...)` rather than going through a
+// single dispatch wrapper.
 
 } // extern "C"
 

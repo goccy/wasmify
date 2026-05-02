@@ -90,6 +90,12 @@ type fieldInfo struct {
 	isValueMsg    bool
 	valueTypeName string
 	kind          protoreflect.Kind
+	// takesOwnership is true when the corresponding proto field carries
+	// `[(wasmify.wasm_take_ownership) = true]` — the C++ counterpart
+	// absorbs the pointer (unique_ptr by value or rvalue-ref). The
+	// Go-side method wrapper must clear the arg's ptr after the invoke
+	// so the per-instance finalizer does not double-free.
+	takesOwnership bool
 }
 
 type msgInfo struct {
@@ -575,6 +581,14 @@ func analyzeField(f *protogen.Field, handles map[string]msgInfo) fieldInfo {
 	}
 	if fi.isRepeated {
 		fi.goType = "[]" + fi.goType
+	}
+	// Lift the wasm_take_ownership extension off the field options so
+	// the method emitter can clear the arg's ptr after the C++ side
+	// absorbs the unique_ptr.
+	if opts, ok := f.Desc.Options().(*descriptorpb.FieldOptions); ok && opts != nil {
+		if v, _ := proto.GetExtension(opts, wasmifyopts.E_WasmTakeOwnership).(bool); v {
+			fi.takesOwnership = true
+		}
 	}
 	return fi
 }
@@ -1756,6 +1770,12 @@ func generateOrphanHandles(pkg string, names []string, messages map[string]msgIn
 			fmt.Fprintf(&b, "type %s struct {\n\tptr uint64\n\tkeepAlive []any\n}\n\n", structName)
 			fmt.Fprintf(&b, "func (h *%s) rawPtr() uint64 { return h.ptr }\n\n", structName)
 			fmt.Fprintf(&b, "func (h *%s) setKeepAlive(v any) { if h != nil && v != nil { h.keepAlive = append(h.keepAlive, v) } }\n\n", structName)
+			// clearPtr is called by method wrappers after the C++ side
+			// absorbed the wrapped pointer (unique_ptr by value /
+			// rvalue-ref). Zeroing ptr makes the per-instance free()
+			// finalizer a no-op so the Go GC does not double-free
+			// memory the C++ destructor will (or already has) reclaimed.
+			fmt.Fprintf(&b, "func (h *%s) clearPtr() { if h != nil { h.ptr = 0 } }\n\n", structName)
 		} else {
 			// Embed primary + secondary parents. Method promotion
 			// lifts rawPtr and every inherited accessor through the
@@ -2369,6 +2389,12 @@ func generateHandleBatch(pkg string, batch []svcInfo, messages map[string]msgInf
 			fmt.Fprintf(&b, "type %s struct {\n\tptr uint64\n\tkeepAlive []any\n}\n\n", structName)
 			fmt.Fprintf(&b, "func (h *%s) rawPtr() uint64 { return h.ptr }\n\n", structName)
 			fmt.Fprintf(&b, "func (h *%s) setKeepAlive(v any) { if h != nil && v != nil { h.keepAlive = append(h.keepAlive, v) } }\n\n", structName)
+			// clearPtr is called by method wrappers after the C++ side
+			// absorbed the wrapped pointer (unique_ptr by value /
+			// rvalue-ref). Zeroing ptr makes the per-instance free()
+			// finalizer a no-op so the Go GC does not double-free
+			// memory the C++ destructor will (or already has) reclaimed.
+			fmt.Fprintf(&b, "func (h *%s) clearPtr() { if h != nil { h.ptr = 0 } }\n\n", structName)
 		} else if len(secondary) == 0 {
 			// Single inheritance: embed the primary parent. Method
 			// promotion unambiguously lifts rawPtr and every
@@ -2391,6 +2417,12 @@ func generateHandleBatch(pkg string, batch []svcInfo, messages map[string]msgInf
 			b.WriteString("}\n\n")
 			fmt.Fprintf(&b, "func (h *%s) rawPtr() uint64 { return h.ptr }\n\n", structName)
 			fmt.Fprintf(&b, "func (h *%s) setKeepAlive(v any) { if h != nil && v != nil { h.keepAlive = append(h.keepAlive, v) } }\n\n", structName)
+			// clearPtr is called by method wrappers after the C++ side
+			// absorbed the wrapped pointer (unique_ptr by value /
+			// rvalue-ref). Zeroing ptr makes the per-instance free()
+			// finalizer a no-op so the Go GC does not double-free
+			// memory the C++ destructor will (or already has) reclaimed.
+			fmt.Fprintf(&b, "func (h *%s) clearPtr() { if h != nil { h.ptr = 0 } }\n\n", structName)
 		}
 
 		// Self marker: abstract classes provide the "is<Name>()" tag
@@ -2534,6 +2566,7 @@ func writeConstructor(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleNa
 		writeEncode(b, p, "buf")
 	}
 	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+	emitOwnershipTransfer(b, params)
 	b.WriteString("\tif err != nil { return nil, err }\n")
 	fmt.Fprintf(b, "\treturn new%s(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil\n", structName)
 	b.WriteString("}\n\n")
@@ -2657,10 +2690,12 @@ func writeRegularMethod(b *strings.Builder, svc svcInfo, m svcMethodInfo, handle
 	}
 	if hasResult {
 		fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+		emitOwnershipTransfer(b, params)
 		fmt.Fprintf(b, "\tif err != nil { return %s, err }\n", zeroValue(result))
 		writeDecode(b, result, structName)
 	} else {
 		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+		emitOwnershipTransfer(b, params)
 		b.WriteString("\treturn err\n")
 	}
 	b.WriteString("}\n\n")
@@ -2709,10 +2744,12 @@ func generateClient(pkg string, freeServices []svcInfo, messages map[string]msgI
 			}
 			if hasResult {
 				fmt.Fprintf(&b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+				emitOwnershipTransfer(&b, params)
 				fmt.Fprintf(&b, "\tif err != nil { return %s, err }\n", zeroValue(result))
 				writeDecodeForModule(&b, result, params)
 			} else {
 				fmt.Fprintf(&b, "\t_, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+				emitOwnershipTransfer(&b, params)
 				b.WriteString("\treturn err\n")
 			}
 			b.WriteString("}\n\n")
@@ -3282,6 +3319,39 @@ func getWasmParents(msg *protogen.Message) []string {
 	}
 	out, _ := proto.GetExtension(opts, wasmifyopts.E_WasmParents).([]string)
 	return out
+}
+
+// emitOwnershipTransfer writes the post-invoke clearPtr() lines for any
+// param tagged `[(wasmify.wasm_take_ownership) = true]`. Must be called
+// AFTER `invokeMethod` returns (success or failure): the C++ bridge
+// constructs a fresh `std::unique_ptr<T>(reinterpret_cast<T*>(arg))` as
+// part of the call expression, so the deleter will run regardless of
+// whether the callee threw — ownership is transferred unconditionally
+// at invoke time. Without clearPtr the per-instance Go finalizer would
+// later issue a second Free RPC against memory the C++ destructor has
+// already reclaimed (typical symptom: vtable garbage on the next
+// handle reached through the parent).
+//
+// Concrete handles dispatch directly through their generated
+// clearPtr() method. Abstract interface params take the runtime
+// type-assert path via the unexported `clearPtr()` interface, which
+// every concrete handle implements.
+func emitOwnershipTransfer(b *strings.Builder, params []fieldInfo) {
+	for _, p := range params {
+		if !p.takesOwnership || !p.isHandle {
+			continue
+		}
+		switch {
+		case p.isRepeated && p.isAbstract:
+			fmt.Fprintf(b, "\tfor _, _co := range %s { if _co != nil { if _c, _ok := _co.(interface{ clearPtr() }); _ok { _c.clearPtr() } } }\n", p.goName)
+		case p.isRepeated:
+			fmt.Fprintf(b, "\tfor _, _co := range %s { if _co != nil { _co.clearPtr() } }\n", p.goName)
+		case p.isAbstract:
+			fmt.Fprintf(b, "\tif %s != nil { if _c, _ok := %s.(interface{ clearPtr() }); _ok { _c.clearPtr() } }\n", p.goName, p.goName)
+		default:
+			fmt.Fprintf(b, "\tif %s != nil { %s.clearPtr() }\n", p.goName, p.goName)
+		}
+	}
 }
 
 // methodRetainsHandleArgs reports whether a C++ method name suggests the

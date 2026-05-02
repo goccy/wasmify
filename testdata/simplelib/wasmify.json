@@ -2,8 +2,8 @@
   "version": "1",
   "upstream": {
     "path": ".",
-    "commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
-    "branch": "wasmify"
+    "commit": "5d6573f4991157790b46c13e1d7425178ddefe4b",
+    "branch": "fix/double-free-unique-ptr"
   },
   "project": {
     "name": "simplelib",
@@ -38,8 +38,8 @@
   },
   "phases": {
     "gen-proto": {
-      "completed_at": "2026-04-25T14:48:49Z",
-      "upstream_commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
+      "completed_at": "2026-05-02T07:55:36Z",
+      "upstream_commit": "5d6573f4991157790b46c13e1d7425178ddefe4b",
       "output_files": [
         "proto/simplelib_proto.proto",
         "proto/wasmify/options.proto",
@@ -48,8 +48,8 @@
       ]
     },
     "parse-headers": {
-      "completed_at": "2026-04-25T13:36:36Z",
-      "upstream_commit": "4d1741dbde8d00563616d36dc8bd9506ea2e06aa",
+      "completed_at": "2026-05-02T07:55:21Z",
+      "upstream_commit": "5d6573f4991157790b46c13e1d7425178ddefe4b",
       "output_files": [
         "api-spec.json"
       ]

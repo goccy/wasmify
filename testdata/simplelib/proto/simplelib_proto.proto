@@ -858,14 +858,18 @@ service ShapeBoxService {
   rpc Add(ShapeBoxAddRequest) returns (ShapeBoxAddResponse) {
     option (wasmify.wasm_method_id) = 1;
   }
-  rpc Get(ShapeBoxGetRequest) returns (ShapeBoxGetResponse) {
+  rpc AddUnique(ShapeBoxAddUniqueRequest) returns (ShapeBoxAddUniqueResponse) {
     option (wasmify.wasm_method_id) = 2;
+    option (wasmify.wasm_method_comment) = "add_unique exercises the unique_ptr take-ownership path that\n motivated the double-free fix: the bridge constructs a fresh\n std::unique_ptr\n<Shape\n> from the raw handle pointer at the call\n site, so the C++ side becomes the sole owner the moment the call\n runs. The Go-side wrapper must clear its handle pointer post-\n invoke so the per-instance finalizer cannot issue a second Free\n RPC against memory ShapeBox now owns through `owned_`.";
   }
-  rpc Size(ShapeBoxSizeRequest) returns (ShapeBoxSizeResponse) {
+  rpc Get(ShapeBoxGetRequest) returns (ShapeBoxGetResponse) {
     option (wasmify.wasm_method_id) = 3;
   }
-  rpc Free(ShapeBox) returns (Empty) {
+  rpc Size(ShapeBoxSizeRequest) returns (ShapeBoxSizeResponse) {
     option (wasmify.wasm_method_id) = 4;
+  }
+  rpc Free(ShapeBox) returns (Empty) {
+    option (wasmify.wasm_method_id) = 5;
     option (wasmify.wasm_method_type) = "free";
   }
 }
@@ -879,6 +883,15 @@ message ShapeBoxAddRequest {
 }
 
 message ShapeBoxAddResponse {
+  string error = 15;
+}
+
+message ShapeBoxAddUniqueRequest {
+  ShapeBox handle = 1;
+  Shape s = 2 [(wasmify.wasm_take_ownership) = true];
+}
+
+message ShapeBoxAddUniqueResponse {
   string error = 15;
 }
 

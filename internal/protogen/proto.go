@@ -825,6 +825,42 @@ func writeClassMessage(b *strings.Builder, c *apispec.Class, spec *apispec.APISp
 	b.WriteString("}\n")
 }
 
+// writeRequestField emits one proto-field line on the request side of an
+// RPC, optionally annotated with [(wasmify.wasm_take_ownership) = true]
+// when the C++ counterpart will absorb the wrapped pointer (unique_ptr
+// passed by value or rvalue-ref). The Go-side wrapper reads that option
+// to clear the argument's ptr after the invoke so the per-instance Go
+// finalizer does not double-free memory the C++ side has already
+// deleted.
+func writeRequestField(b *strings.Builder, protoType, fieldName string, fieldNum int, takeOwnership bool) {
+	if takeOwnership {
+		fmt.Fprintf(b, "  %s %s = %d [(wasmify.wasm_take_ownership) = true];\n", protoType, fieldName, fieldNum)
+		return
+	}
+	fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, fieldNum)
+}
+
+// paramTakesOwnership reports whether the C++ counterpart of p takes
+// ownership of the wrapped pointer. Today that means a `unique_ptr<T>`
+// parameter passed by value or rvalue-ref — the bridge constructs a
+// fresh `std::unique_ptr<T>` from the raw handle pointer (see
+// handleArgExpr in bridge.go), and the destructor of that unique_ptr
+// runs whether or not the callee threw, so ownership transfers
+// unconditionally at invoke time. `shared_ptr<T>` is reference-counted
+// and is NOT marked: the Go side keeps its copy of the heap-allocated
+// shared_ptr alive across the call, so neither side's release alone
+// frees the underlying object.
+func paramTakesOwnership(p apispec.Param) bool {
+	qt := strings.TrimSpace(p.Type.QualType)
+	if smartPointerInner(qt) == "" {
+		return false
+	}
+	if isSharedPointerType(qt) {
+		return false
+	}
+	return true
+}
+
 // protoStringLiteral renders s as a proto3 string literal: wraps in
 // double quotes and escapes embedded backslashes, double quotes, and
 // newlines. Comments lifted from C++ headers can span multiple lines,
@@ -974,7 +1010,7 @@ func writeRequestResponseWithName(b *strings.Builder, fn *apispec.Function, rpcN
 			if fieldName == "" {
 				fieldName = fmt.Sprintf("arg%d", i)
 			}
-			fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, i+1)
+			writeRequestField(b, protoType, fieldName, i+1, paramTakesOwnership(p))
 		}
 		b.WriteString("}\n\n")
 	}
@@ -1381,7 +1417,7 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 				if fieldName == "" {
 					fieldName = fmt.Sprintf("arg%d", i)
 				}
-				fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, i+fieldOffset)
+				writeRequestField(b, protoType, fieldName, i+fieldOffset, paramTakesOwnership(p))
 			}
 			b.WriteString("}\n\n")
 		}

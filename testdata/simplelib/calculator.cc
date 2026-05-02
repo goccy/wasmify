@@ -108,8 +108,13 @@ ShapeBox::~ShapeBox() {
     for (auto* s : shapes_) delete s;
 }
 void ShapeBox::add(Shape* s) { shapes_.push_back(s); }
+void ShapeBox::add_unique(std::unique_ptr<Shape> s) {
+    owned_.push_back(std::move(s));
+}
 Shape* ShapeBox::get(int i) const { return shapes_.at(i); }
-int ShapeBox::size() const { return static_cast<int>(shapes_.size()); }
+int ShapeBox::size() const {
+    return static_cast<int>(shapes_.size() + owned_.size());
+}
 
 // ---- (B) Animal → Mammal → Canine → Dog ------------------------------
 

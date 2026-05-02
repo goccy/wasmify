@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -218,11 +219,22 @@ public:
     ShapeBox();
     ~ShapeBox();
     void add(Shape* s);
+
+    // add_unique exercises the unique_ptr take-ownership path that
+    // motivated the double-free fix: the bridge constructs a fresh
+    // std::unique_ptr<Shape> from the raw handle pointer at the call
+    // site, so the C++ side becomes the sole owner the moment the call
+    // runs. The Go-side wrapper must clear its handle pointer post-
+    // invoke so the per-instance finalizer cannot issue a second Free
+    // RPC against memory ShapeBox now owns through `owned_`.
+    void add_unique(std::unique_ptr<Shape> s);
+
     Shape* get(int i) const;  // abstract return → exercises downcast flow
     int size() const;
 
 private:
     std::vector<Shape*> shapes_;
+    std::vector<std::unique_ptr<Shape>> owned_;
 };
 
 // (B) Multi-level chain. Every accessor defined at each level must be
