@@ -2103,10 +2103,34 @@ func (h *ShapeBox) Add(s ShapeNode) error {
 	return err
 }
 
+// add_unique exercises the unique_ptr take-ownership path that
+// motivated the double-free fix: the bridge constructs a fresh
+// std::unique_ptr
+// <Shape
+// > from the raw handle pointer at the call
+// site, so the C++ side becomes the sole owner the moment the call
+// runs. The Go-side wrapper must clear its handle pointer post-
+// invoke so the per-instance finalizer cannot issue a second Free
+// RPC against memory ShapeBox now owns through `owned_`.
+func (h *ShapeBox) AddUnique(s ShapeNode) error {
+	buf := pbAppendHandle(nil, 1, h.ptr)
+	if s != nil {
+		buf = pbAppendHandle(buf, 2, s.rawPtr())
+	}
+	h.setKeepAlive(s)
+	_, err := invokeMethod(16, 2, buf)
+	if s != nil {
+		if _c, _ok := s.(interface{ clearPtr() }); _ok {
+			_c.clearPtr()
+		}
+	}
+	return err
+}
+
 func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
 	buf := pbAppendHandle(nil, 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, i)
-	resp, err := invokeMethod(16, 2, buf)
+	resp, err := invokeMethod(16, 3, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -2115,7 +2139,7 @@ func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
 
 func (h *ShapeBox) Size() (int32, error) {
 	buf := pbAppendHandle(nil, 1, h.ptr)
-	resp, err := invokeMethod(16, 3, buf)
+	resp, err := invokeMethod(16, 4, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -2125,7 +2149,7 @@ func (h *ShapeBox) Size() (int32, error) {
 func (h *ShapeBox) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(16, 4, buf)
+		module().invoke(16, 5, buf)
 		h.ptr = 0
 	}
 }
