@@ -1018,7 +1018,8 @@ var (
 // Option configures the wasm runtime.
 type Option func(*options)
 type options struct {
-	compilationMode CompilationMode
+	compilationMode  CompilationMode
+	compilationCache wazero.CompilationCache
 }
 
 // CompilationMode selects the wazero execution engine.
@@ -1034,6 +1035,22 @@ const (
 // WithCompilationMode sets the wazero compilation mode.
 func WithCompilationMode(mode CompilationMode) Option {
 	return func(o *options) { o.compilationMode = mode }
+}
+
+// WithCompilationCache plumbs a wazero CompilationCache into the runtime
+// config. The first Init() call with a fresh cache pays the
+// compile-from-bytes cost; every subsequent process that reuses the
+// same cache directory (via wazero.NewCompilationCacheWithDir) starts
+// up substantially faster because wazero serves precompiled module
+// bytes straight from disk.
+//
+// Only honored when CompilationMode is CompilationModeCompiler — the
+// interpreter does no AOT compile and so has nothing to cache. The
+// caller is responsible for the cache's lifetime; close it via
+// CompilationCache.Close after Module.Close (or after the last Module
+// using it has shut down) so wazero flushes any in-flight writes.
+func WithCompilationCache(cache wazero.CompilationCache) Option {
+	return func(o *options) { o.compilationCache = cache }
 }
 
 // CallbackHandler is implemented by Go types that need to be called from C++.
@@ -1196,6 +1213,13 @@ func initModule(wasmBytes []byte, o *options) error {
 		cfg = wazero.NewRuntimeConfigCompiler()
 	default:
 		cfg = wazero.NewRuntimeConfigInterpreter()
+	}
+	// CompilationCache is a Compiler-only feature; the interpreter
+	// never produces machine code and would not consult the cache,
+	// so silently dropping the option there avoids wazero panicking
+	// on a config it can't honor.
+	if o.compilationCache != nil && o.compilationMode == CompilationModeCompiler {
+		cfg = cfg.WithCompilationCache(o.compilationCache)
 	}
 	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
