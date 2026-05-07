@@ -212,6 +212,24 @@ type BridgeConfig struct {
 	// includes.
 	SkipHeaders []string `json:"SkipHeaders,omitempty"`
 
+	// IncludeExternalHeaders lists header files outside the project
+	// root that the parser should still walk. Used when the project
+	// exposes types from an external library (typically declared
+	// also in `ExternalTypes`) and the user wants those classes'
+	// methods bridged too — e.g. `google::protobuf::DescriptorPool`
+	// from protobuf's own header so a Go consumer can construct
+	// proto-driven schemas. Each entry is matched as a path
+	// substring against the include-directory-resolved absolute
+	// header path that landed in the build's .d files.
+	IncludeExternalHeaders []string `json:"IncludeExternalHeaders,omitempty"`
+
+	// IncludeExternalClasses lists fully-qualified class names that
+	// the bridge generator must accept even when the class's source
+	// file is outside the project root. Pair with
+	// `IncludeExternalHeaders` to surface the parsed methods of
+	// those classes.
+	IncludeExternalClasses []string `json:"IncludeExternalClasses,omitempty"`
+
 	// GoPackage overrides the `option go_package = "..."` line written to
 	// the generated .proto. Defaults to
 	// "github.com/goccy/wasmify/gen/<pkg>" when unset.
@@ -266,6 +284,91 @@ type BridgeConfig struct {
 
 	// SetLikeTypePrefixes is the same, for set-like types.
 	SetLikeTypePrefixes []string `json:"SetLikeTypePrefixes,omitempty"`
+
+	// CallbackClasses lists fully-qualified class names that the user
+	// wants to subclass from Go even though the class is concrete in
+	// the C++ sense (no unimplemented pure virtuals — `T t;`
+	// compiles). Abstract classes are picked up automatically, so
+	// they do NOT need to appear here; listing one is harmless but
+	// redundant.
+	//
+	// Concrete classes need an explicit signal because C++ has no
+	// language-level distinction between "concrete + virtuals as
+	// customisation hooks" (e.g. TableValuedFunction.Resolve has a
+	// default implementation that subclasses are expected to
+	// override) and "concrete + virtuals as visitor dispatch" (every
+	// AST/Resolved node has Accept inherited from an abstract base).
+	// Auto-picking every concrete class with virtuals would balloon
+	// the generated surface; the user names the small set that
+	// genuinely needs subclassing instead. See
+	// docs/callback-services.md for the full rationale.
+	CallbackClasses []string `json:"CallbackClasses,omitempty"`
+
+	// OwnershipTransferMethods lists C++ methods whose raw `T*`
+	// parameter is consumed (ownership transferred to the receiver)
+	// despite the C++ type signature being a borrowed pointer. This
+	// is the explicit-opt-in escape hatch for APIs whose
+	// implementation captures the raw pointer into a smart pointer
+	// (e.g. `absl::WrapUnique`, `std::unique_ptr<T>(p)`,
+	// `std::move`) inside the .cc body — information that is not
+	// visible from the header-only api-spec the rest of the
+	// generator works from.
+	//
+	// The generator does NOT attempt to detect this idiom from
+	// method names or any other naming pattern: name-based logic
+	// is indistinguishable from hardcoding library-specific
+	// conventions, and detecting it from the .cc body would
+	// require full C++ implementation parsing (out of scope).
+	// Listing the methods explicitly is the price of honouring a
+	// poorly-typed C++ API.
+	//
+	// Each entry is identified by the fully-qualified C++ method
+	// name plus an optional Signature (list of parameter
+	// qual_types) that picks a specific overload. When Signature
+	// is empty, every overload of Method matches.
+	//
+	// Two C++ patterns are covered:
+	//
+	//  1. Unconditional ownership transfer. The matched overload
+	//     has only handle parameters (and possibly value-typed
+	//     params). Every handle param gets the
+	//     `wasm_take_ownership` proto field option, which drives
+	//     the Go-side `clearPtr()` emit so the wrapper's
+	//     per-instance finalizer does not double-free memory the
+	//     C++ destructor will also reclaim.
+	//
+	//  2. Runtime-conditional ownership transfer. The matched
+	//     overload includes a `bool` parameter that the receiver
+	//     consults at runtime to decide whether to adopt
+	//     ownership (e.g. `AddColumn(const Column*, bool
+	//     is_owned)`). The proto field for the handle gets the
+	//     `wasm_take_ownership_when` extension carrying the
+	//     bool's proto field name; the plugin emits a runtime
+	//     guard `if <bool> { handle.clearPtr() }` after the
+	//     invoke. The bool is identified by type, not by the
+	//     parameter name.
+	//
+	// Pattern (2) requires a Signature to be specified — it is
+	// the user's commitment that the bool in the matched overload
+	// IS the ownership selector. Without a signature, a bool
+	// param in the matched overload is treated as a regular value
+	// param (no runtime gate emitted).
+	OwnershipTransferMethods []OwnershipTransferEntry `json:"OwnershipTransferMethods,omitempty"`
+}
+
+// OwnershipTransferEntry identifies a C++ method whose raw `T*`
+// parameter transfers ownership in violation of the C++ type
+// system. See BridgeConfig.OwnershipTransferMethods.
+type OwnershipTransferEntry struct {
+	// Method is the fully-qualified C++ method name (e.g.
+	// "googlesql::SimpleCatalog::AddOwnedTable").
+	Method string `json:"method"`
+	// Signature is the optional list of parameter qual_types
+	// (e.g. ["const googlesql::Column *", "bool"]) used to
+	// disambiguate overloads. Match is exact, position by
+	// position. When Signature is empty, every overload of
+	// Method matches.
+	Signature []string `json:"signature,omitempty"`
 }
 
 // ErrorReturnSpec describes how to reconstruct an error-typed return

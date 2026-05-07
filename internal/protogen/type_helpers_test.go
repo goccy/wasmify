@@ -51,11 +51,21 @@ func TestCppPrimitiveType(t *testing.T) {
 }
 
 func TestCppLocalType(t *testing.T) {
-	// Save and restore global state. cppLocalType calls cppTypeName which
-	// consults classQualNames.
+	// Save and restore global state. cppLocalType calls cppTypeName
+	// which consults classQualNames; set-like recognition consults
+	// bridgeConfig.SetLikeTypePrefixes via setLikeContainerInfo.
+	// classQualNames stays empty for parity with the original
+	// expectations (vec<Foo*> resolves to itself); set-like recognition
+	// still works because parseMapType keys on the ref.Name spelling.
 	prev := classQualNames
+	prevCfg := bridgeConfig
 	classQualNames = map[string]string{}
-	defer func() { classQualNames = prev }()
+	bridgeConfig = DefaultBridgeConfig()
+	bridgeConfig.SetLikeTypePrefixes = []string{"absl::flat_hash_set"}
+	defer func() {
+		classQualNames = prev
+		bridgeConfig = prevCfg
+	}()
 
 	tests := []struct {
 		name string
@@ -82,6 +92,21 @@ func TestCppLocalType(t *testing.T) {
 		}, "std::vector<const Foo*>"},
 		{"vec_no_inner", apispec.TypeRef{Kind: apispec.TypeVector}, "std::vector<uint8_t>"},
 		{"unknown", apispec.TypeRef{Kind: apispec.TypeUnknown}, "/* unknown */"},
+		// Set-like containers configured via BridgeConfig.SetLikeTypePrefixes
+		// must declare the actual container type as the local. Treating
+		// them as opaque uint64 handles (the prior behaviour) is wrong:
+		// the proto schema emits `repeated <Handle>` for the same
+		// parameter, so the bridge body has to materialise the
+		// container element-by-element from the wire.
+		{
+			"set_like_handle_pointer_inner",
+			apispec.TypeRef{
+				Kind:     apispec.TypeHandle,
+				Name:     "absl::flat_hash_set<const Foo *>",
+				QualType: "const absl::flat_hash_set<const Foo *> &",
+			},
+			"absl::flat_hash_set<const Foo*>",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -109,6 +134,28 @@ func TestCppTypeName(t *testing.T) {
 		{"handle with qualtype", apispec.TypeRef{Kind: apispec.TypeHandle, Name: "Foo", QualType: "const Foo*"}, "ns::Foo"},
 		{"handle short", apispec.TypeRef{Kind: apispec.TypeHandle, Name: "Foo"}, "ns::Foo"},
 		{"empty", apispec.TypeRef{Kind: apispec.TypeHandle}, "/* unknown type */"},
+		// Elaborated-type-specifiers (`class T` / `struct T` / `enum T`)
+		// surface in clang's qual_type spelling for declarations that
+		// repeat the keyword. The bridge generator must strip them
+		// before resolving the bare name; otherwise resolveTypeName
+		// fails to match `class Foo` against the `Foo` → `ns::Foo`
+		// entry and the type leaks downstream as an unqualified
+		// `class Foo`, breaking compilation.
+		{
+			"class elaborated qualtype",
+			apispec.TypeRef{Kind: apispec.TypeHandle, Name: "class Foo", QualType: "const class Foo *"},
+			"ns::Foo",
+		},
+		{
+			"struct elaborated qualtype",
+			apispec.TypeRef{Kind: apispec.TypeHandle, Name: "struct Foo", QualType: "const struct Foo &"},
+			"ns::Foo",
+		},
+		{
+			"class elaborated short name only",
+			apispec.TypeRef{Kind: apispec.TypeHandle, Name: "class Foo"},
+			"ns::Foo",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -513,6 +560,117 @@ func TestIsStaticFactory(t *testing.T) {
 	}
 }
 
+// TestIsStaticFactory_StatusOutParam guards Bug #4: a static method that
+// follows the conventional C++ "Status f(in_args..., OutType* out)" idiom
+// must be recognised as a factory for the containing class.
+//
+// The pattern looks like:
+//
+//	class Widget {
+//	 public:
+//	   static absl::Status Create(absl::string_view name,
+//	                              std::unique_ptr<Widget>* out);
+//	   // …
+//	};
+//
+// The call returns the constructed object via the out-parameter and
+// reports failure through the Status. The Go-facing equivalent should
+// expose this as `NewWidget(...) (*Widget, error)`. Before the fix the
+// predicate rejected such methods because (a) `absl::Status` matched
+// `bridgeConfig.ErrorTypes` and (b) the original "factory must return
+// the class by value" rule had no carve-out for the out-param idiom.
+func TestIsStaticFactory_StatusOutParam(t *testing.T) {
+	prev := classQualNames
+	prevSrcFiles := classSourceFiles
+	prevAbstract := classAbstract
+	prevNoNew := classNoNew
+	prevBridgeCfg := bridgeConfig
+	classQualNames = map[string]string{"Widget": "mylib::Widget"}
+	classSourceFiles = map[string]string{"mylib::Widget": "mylib/widget.h"}
+	classAbstract = map[string]bool{}
+	classNoNew = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	bridgeConfig.ErrorTypes = map[string]string{
+		"absl::Status":   "if (!{result}.ok()) { ... }",
+		"absl::StatusOr": "if (!{result}.ok()) { ... }",
+	}
+	defer func() {
+		classQualNames = prev
+		classSourceFiles = prevSrcFiles
+		classAbstract = prevAbstract
+		classNoNew = prevNoNew
+		bridgeConfig = prevBridgeCfg
+	}()
+
+	// `static absl::Status Widget::Create(absl::string_view name,
+	//                                     std::unique_ptr<Widget>* out)`.
+	//
+	// `result` is the conventional name in many libraries; the out-param
+	// is `unique_ptr<Widget>*` — the canonical way to transfer ownership
+	// of a freshly-constructed object back to the caller.
+	m := apispec.Function{
+		IsStatic: true,
+		Name:     "Create",
+		QualName: "mylib::Widget::Create",
+		ReturnType: apispec.TypeRef{
+			Name:     "absl::Status",
+			Kind:     apispec.TypeValue,
+			QualType: "absl::Status",
+		},
+		Params: []apispec.Param{
+			{
+				Name: "name",
+				Type: apispec.TypeRef{
+					Name:     "absl::string_view",
+					Kind:     apispec.TypeString,
+					QualType: "absl::string_view",
+				},
+			},
+			{
+				Name: "out",
+				Type: apispec.TypeRef{
+					Name:      "Widget",
+					Kind:      apispec.TypeHandle,
+					IsPointer: true,
+					QualType:  "std::unique_ptr<Widget> *",
+				},
+			},
+		},
+	}
+	if !isStaticFactory(m) {
+		t.Error("Status f(in_args..., unique_ptr<T>*) on T must be recognised as a factory")
+	}
+
+	// And the same shape with a `T**` (raw pointer-to-pointer) out-param.
+	m2 := m
+	m2.Params = []apispec.Param{
+		m.Params[0],
+		{
+			Name: "out",
+			Type: apispec.TypeRef{
+				Name:      "Widget",
+				Kind:      apispec.TypeHandle,
+				IsConst:   true,
+				IsPointer: true,
+				QualType:  "const Widget **",
+			},
+		},
+	}
+	if !isStaticFactory(m2) {
+		t.Error("Status f(in_args..., T**) on T must be recognised as a factory")
+	}
+
+	// Negative: no out-param of own class type — still rejected. A static
+	// method that just returns Status with no factory shape is not a
+	// factory; treating it as one would generate a New<T> constructor
+	// that yields nothing.
+	m3 := m
+	m3.Params = []apispec.Param{m.Params[0]}
+	if isStaticFactory(m3) {
+		t.Error("Status f(in_args...) with no own-class out-param must not be classified as a factory")
+	}
+}
+
 func TestLookupValueClass(t *testing.T) {
 	prev := valueClasses
 	prevQualNames := classQualNames
@@ -581,6 +739,47 @@ func TestReadExpr(t *testing.T) {
 				t.Errorf("expected var name %q in %q", tt.varName, got)
 			}
 		})
+	}
+}
+
+// TestReadExpr_SetLikeContainer guards Bug #5B: when a parameter is
+// classified by parseMapType as a set-like container (configured via
+// BridgeConfig.SetLikeTypePrefixes), the bridge body must read each
+// wire element as a handle and `insert(...)` it into the local
+// container, mirroring how the proto schema side already emits
+// `repeated <Handle>`.
+//
+// The earlier behaviour treated the whole parameter as an opaque
+// `read_handle_ptr` (single uint64), which is incompatible with the
+// repeated-handle wire format the proto schema declares. The two
+// halves of the generator have to agree, and the bridge body is the
+// half that was lagging.
+func TestReadExpr_SetLikeContainer(t *testing.T) {
+	prevCfg := bridgeConfig
+	prevQual := classQualNames
+	bridgeConfig = DefaultBridgeConfig()
+	bridgeConfig.SetLikeTypePrefixes = []string{"absl::flat_hash_set"}
+	classQualNames = map[string]string{"Foo": "ns::Foo"}
+	defer func() {
+		bridgeConfig = prevCfg
+		classQualNames = prevQual
+	}()
+
+	ref := apispec.TypeRef{
+		Kind:     apispec.TypeHandle, // clang misclassifies the set as handle
+		Name:     "absl::flat_hash_set<const Foo *>",
+		QualType: "const absl::flat_hash_set<const Foo *> &",
+	}
+	got := readExpr(ref, "labels")
+
+	if !strings.Contains(got, "labels.insert(") {
+		t.Errorf("expected set-like read to call .insert on the local container; got %q", got)
+	}
+	if !strings.Contains(got, "read_handle_ptr") {
+		t.Errorf("expected each element to be read as a handle pointer; got %q", got)
+	}
+	if strings.Contains(got, "labels = read_handle_ptr") {
+		t.Errorf("set-like read must not assign a single handle to the container variable; got %q", got)
 	}
 }
 
@@ -774,14 +973,29 @@ func TestIsInstantiableType(t *testing.T) {
 		t.Error("vector<Foo> value + no-default-ctor + no fields should not be instantiable")
 	}
 
-	// vector<unique_ptr<Foo>> → false
+	// vector<unique_ptr<Foo>> → instantiable. unique_ptr's move-only
+	// semantics make vector's copy-ctor instantiation a non-issue,
+	// and the bridge transports each element as a uint64 handle that
+	// the C++ side wraps via `unique_ptr<T>(reinterpret_cast<T*>(_h))`.
+	// (See TestIsInstantiableType_VectorOfUniquePointer for a richer
+	// fixture with classQualNames populated.)
 	classNoDefaultCtor = map[string]bool{}
 	vecUnique := apispec.TypeRef{
 		Kind:  apispec.TypeVector,
 		Inner: &apispec.TypeRef{Kind: apispec.TypeHandle, Name: "std::unique_ptr<Foo>"},
 	}
-	if isInstantiableType(vecUnique) {
-		t.Error("vector<unique_ptr> should not be instantiable")
+	if !isInstantiableType(vecUnique) {
+		t.Error("vector<unique_ptr<T>> must be instantiable")
+	}
+
+	// vector<shared_ptr<Foo>> → still rejected: shared_ptr has no
+	// transport across the wasm boundary today.
+	vecShared := apispec.TypeRef{
+		Kind:  apispec.TypeVector,
+		Inner: &apispec.TypeRef{Kind: apispec.TypeHandle, Name: "std::shared_ptr<Foo>"},
+	}
+	if isInstantiableType(vecShared) {
+		t.Error("vector<shared_ptr> must remain rejected")
 	}
 }
 
@@ -820,6 +1034,238 @@ func TestIsUsableType_PrimitiveAndPointer(t *testing.T) {
 	// unknown → not usable
 	if isUsableType(apispec.TypeRef{Kind: apispec.TypeUnknown}) {
 		t.Error("unknown should not be usable")
+	}
+}
+
+// TestIsUsableType_ExternalHandlesViaConfig demonstrates the existing
+// opt-in path for accepting handle types whose declaring header lives
+// outside the project's own sources: the consumer adds the type's
+// fully-qualified name (or a prefix that the type's spelling matches)
+// to `BridgeConfig.ExternalTypes` in `wasmify.json`. This is the
+// generic mechanism wasmify already provides for exposing
+// dependency-owned types (e.g. `absl::Status`, `absl::Span`) through
+// the bridge.
+//
+// Protobuf reflection types (`google::protobuf::Descriptor` etc.) are
+// a real-world example: any C++ library that integrates protobuf uses
+// them in its public API to register message or enum types. With the
+// types listed in `ExternalTypes`, the bridge filter accepts them as
+// opaque handles end-to-end.
+//
+// This test guards the existing behaviour and serves as a regression
+// fixture for any future filter logic change: project-default rejects
+// unregistered external handles; explicit registration in
+// `ExternalTypes` flips them through.
+func TestIsUsableType_ExternalHandlesViaConfig(t *testing.T) {
+	prevSrcFiles := classSourceFiles
+	prevEnums := enumQualNames
+	prevCfg := bridgeConfig
+	classSourceFiles = map[string]string{}
+	enumQualNames = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	bridgeConfig.ExternalTypes = []string{
+		"google::protobuf::Descriptor",
+		"google::protobuf::DescriptorPool",
+		"google::protobuf::EnumDescriptor",
+		"google::protobuf::FieldDescriptor",
+		"google::protobuf::FileDescriptor",
+		"google::protobuf::FileDescriptorProto",
+		"google::protobuf::FileDescriptorSet",
+		"google::protobuf::OneofDescriptor",
+		"google::protobuf::EnumValueDescriptor",
+	}
+	defer func() {
+		classSourceFiles = prevSrcFiles
+		enumQualNames = prevEnums
+		bridgeConfig = prevCfg
+	}()
+
+	cases := []apispec.TypeRef{
+		{
+			Name:      "google::protobuf::Descriptor",
+			Kind:      apispec.TypeHandle,
+			IsConst:   true,
+			IsPointer: true,
+			QualType:  "const google::protobuf::Descriptor *",
+		},
+		{
+			Name:      "google::protobuf::EnumDescriptor",
+			Kind:      apispec.TypeHandle,
+			IsConst:   true,
+			IsPointer: true,
+			QualType:  "const google::protobuf::EnumDescriptor *",
+		},
+		{
+			Name:      "google::protobuf::DescriptorPool",
+			Kind:      apispec.TypeHandle,
+			IsPointer: true,
+			QualType:  "google::protobuf::DescriptorPool *",
+		},
+		{
+			Name:      "google::protobuf::FileDescriptorSet",
+			Kind:      apispec.TypeHandle,
+			IsPointer: true,
+			QualType:  "google::protobuf::FileDescriptorSet *",
+		},
+	}
+	for _, ref := range cases {
+		t.Run(ref.Name, func(t *testing.T) {
+			if !isUsableType(ref) {
+				t.Errorf("isUsableType(%q) = false; an external handle listed in ExternalTypes must pass through the filter", ref.QualType)
+			}
+		})
+	}
+
+	// Negative: a handle type that isn't in the project's sources AND
+	// isn't registered in ExternalTypes is rejected. The user must
+	// list it explicitly to expose it through the bridge.
+	t.Run("unregistered_external_handle_rejected", func(t *testing.T) {
+		ref := apispec.TypeRef{
+			Name:      "vendor::lib::SomeClass",
+			Kind:      apispec.TypeHandle,
+			IsPointer: true,
+			QualType:  "vendor::lib::SomeClass *",
+		}
+		if isUsableType(ref) {
+			t.Error("unregistered external handle must remain rejected — explicit ExternalTypes registration is the intended opt-in")
+		}
+	})
+}
+
+// TestIsInstantiableType_VectorOfUniquePointer guards Bug #5C: a
+// `std::vector<std::unique_ptr<T>>` parameter is the canonical
+// shape any C++ library uses to hand a list of freshly-owned
+// objects to a constructor (factories that produce sole-owned
+// instances which the receiver then takes ownership of).
+//
+// The bridge filter previously rejected every vector with a
+// smart-pointer inner because the deleted-copy-ctor concern that
+// motivates the filter (vector's internal copy-ctor instantiation
+// breaks at compile time when T's copy ctor is deleted) does NOT
+// apply to `unique_ptr<T>`: unique_ptr is move-only, vector's copy
+// is never instantiated unless the user tries to copy the vector,
+// and the bridge never copies the vector itself.
+//
+// The proto-schema side already emits `repeated <Handle>` for the
+// same parameter (smart_pointer wrappers route through
+// `repeated <Inner>` because the wire only carries the inner
+// pointee handle). The bridge filter has to agree.
+func TestIsInstantiableType_VectorOfUniquePointer(t *testing.T) {
+	prevAbstract := classAbstract
+	prevDeletedCopy := classDeletedCopy
+	prevNoDefault := classNoDefaultCtor
+	prevQual := classQualNames
+	classQualNames = map[string]string{"Foo": "ns::Foo"}
+	classAbstract = map[string]bool{}
+	classDeletedCopy = map[string]bool{}
+	classNoDefaultCtor = map[string]bool{}
+	defer func() {
+		classAbstract = prevAbstract
+		classDeletedCopy = prevDeletedCopy
+		classNoDefaultCtor = prevNoDefault
+		classQualNames = prevQual
+	}()
+
+	ref := apispec.TypeRef{
+		Name:     "std::vector<std::unique_ptr<const Foo>>",
+		Kind:     apispec.TypeVector,
+		QualType: "std::vector<std::unique_ptr<const Foo>>",
+		Inner: &apispec.TypeRef{
+			Name:     "std::unique_ptr<const Foo>",
+			Kind:     apispec.TypeHandle,
+			QualType: "std::unique_ptr<const Foo>",
+		},
+	}
+	if !isInstantiableType(ref) {
+		t.Error("vector<unique_ptr<T>> must be instantiable — unique_ptr's move-only semantics mean the deleted-copy concern does not apply")
+	}
+}
+
+// TestIsInstantiableType_VectorOfSharedPointerStillRejected confirms
+// that `vector<shared_ptr<T>>` remains rejected. shared_ptr has a
+// copy constructor (it bumps a refcount), so the deleted-copy concern
+// does not apply, but the bridge has no transport-level handling for
+// shared ownership across the wasm boundary today: the unique-ptr
+// path can release() into a raw pointer, but shared_ptr requires
+// keeping a heap-allocated control block alive on both sides. Until
+// that's wired up, vectors of shared_ptr stay out.
+func TestIsInstantiableType_VectorOfSharedPointerStillRejected(t *testing.T) {
+	prevQual := classQualNames
+	classQualNames = map[string]string{"Foo": "ns::Foo"}
+	defer func() { classQualNames = prevQual }()
+
+	ref := apispec.TypeRef{
+		Name:     "std::vector<std::shared_ptr<const Foo>>",
+		Kind:     apispec.TypeVector,
+		QualType: "std::vector<std::shared_ptr<const Foo>>",
+		Inner: &apispec.TypeRef{
+			Name:     "std::shared_ptr<const Foo>",
+			Kind:     apispec.TypeHandle,
+			QualType: "std::shared_ptr<const Foo>",
+		},
+	}
+	if isInstantiableType(ref) {
+		t.Error("vector<shared_ptr<T>> must remain rejected for now — the bridge has no shared-ownership transport")
+	}
+}
+
+// TestIsInstantiableType_VectorOfAbstractPointer guards a regression
+// in the vector-element instantiability check. A `vector<T*>` stores
+// *pointers* to T — the vector never default-constructs, copies, or
+// destroys T values, only pointer slots. So properties of T like
+// `is_abstract`, `has_deleted_copy_ctor`, or `has_public_default_ctor`
+// are irrelevant for the pointer-wrapped form.
+//
+// The check originally rejected any `vector<T>` whose T was abstract,
+// uncopyable, or non-default-constructible, without distinguishing
+// the pointer-element case. That over-rejection hid every method
+// taking `vector<AbstractBase*>` from the bridge — a common idiom
+// for caller-supplied lists of polymorphic objects.
+func TestIsInstantiableType_VectorOfAbstractPointer(t *testing.T) {
+	prevAbstract := classAbstract
+	prevDeletedCopy := classDeletedCopy
+	prevNoDefault := classNoDefaultCtor
+	prevQual := classQualNames
+	classQualNames = map[string]string{"AbstractBase": "ns::AbstractBase"}
+	classAbstract = map[string]bool{"ns::AbstractBase": true}
+	classDeletedCopy = map[string]bool{"ns::AbstractBase": true}
+	classNoDefaultCtor = map[string]bool{"ns::AbstractBase": true}
+	defer func() {
+		classAbstract = prevAbstract
+		classDeletedCopy = prevDeletedCopy
+		classNoDefaultCtor = prevNoDefault
+		classQualNames = prevQual
+	}()
+
+	vectorOfAbstractPtr := apispec.TypeRef{
+		Name:     "std::vector<AbstractBase *>",
+		Kind:     apispec.TypeVector,
+		QualType: "const std::vector<AbstractBase *> &",
+		Inner: &apispec.TypeRef{
+			Name:      "AbstractBase",
+			Kind:      apispec.TypeHandle,
+			IsPointer: true,
+			QualType:  "AbstractBase *",
+		},
+	}
+	if !isInstantiableType(vectorOfAbstractPtr) {
+		t.Error("vector<T*> must be instantiable even when T itself is abstract / non-copyable / non-default-constructible — the vector stores pointer slots, not T values")
+	}
+
+	// Sanity check: vector of T-by-value where T is abstract is still
+	// rejected (you can't store an abstract instance by value).
+	vectorOfAbstractValue := apispec.TypeRef{
+		Name:     "std::vector<AbstractBase>",
+		Kind:     apispec.TypeVector,
+		QualType: "const std::vector<AbstractBase> &",
+		Inner: &apispec.TypeRef{
+			Name:     "AbstractBase",
+			Kind:     apispec.TypeValue,
+			QualType: "AbstractBase",
+		},
+	}
+	if isInstantiableType(vectorOfAbstractValue) {
+		t.Error("vector<T> by-value of an abstract T must remain rejected — only the pointer form is safe")
 	}
 }
 
@@ -1538,3 +1984,38 @@ func TestQualifySingleArgInContext(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// TestStripCppTypeQualifiers_LeadingDoubleColon pins the strip
+// rule for the C++ global-namespace anchor. clang occasionally
+// records qual_types in the absolute form  ::ns::Foo  -- which
+// names the exact same C++ type as  ns::Foo  but does not match
+// classSourceFiles / classQualNames lookups that key on the
+// no-anchor spelling. Without stripping the anchor, every method
+// that used clang's absolute-form spelling silently disappeared
+// at isUsableType filter time. The most visible casualty was
+// SQLTableValuedFunction::Create, which takes
+//   const ::googlesql::ResolvedCreateTableFunctionStmt *
+// as its first parameter; with the anchor unstripped the static
+// factory was filtered out and SQLTableValuedFunction was
+// reachable but uninstantiable. The strip also unblocked dozens
+// of other classes / methods across the binding (the regen
+// counted +58 classes / +9 enums after this fix landed).
+func TestStripCppTypeQualifiers_LeadingDoubleColon(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"const ::googlesql::ResolvedCreateTableFunctionStmt *", "googlesql::ResolvedCreateTableFunctionStmt"},
+		{"::ns::Foo", "ns::Foo"},
+		{"const ::ns::Foo &", "ns::Foo"},
+		// Mid-name :: is a regular nested-name-specifier and must
+		// stay -- only the leading anchor strips.
+		{"ns::Foo", "ns::Foo"},
+		{"const class ::ns::Foo *", "ns::Foo"},
+	}
+	for _, c := range cases {
+		if got := stripCppTypeQualifiers(c.in); got != c.want {
+			t.Errorf("stripCppTypeQualifiers(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+

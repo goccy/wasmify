@@ -259,12 +259,12 @@ func collectTypeDeps(ref apispec.TypeRef, classByQual, classByShort map[string]*
 	name := ref.Name
 	qt := ref.QualType
 
-	// Strip qualifiers
-	clean := strings.TrimSpace(name)
-	clean = strings.TrimPrefix(clean, "const ")
-	clean = strings.TrimSuffix(clean, "*")
-	clean = strings.TrimSuffix(clean, "&")
-	clean = strings.TrimSpace(clean)
+	// Strip qualifiers (cv-qualifiers, pointer/reference markers, and
+	// elaborated-type-specifier keywords like `class` / `struct` /
+	// `enum`). Sharing the helper with cppTypeName ensures that if
+	// clang spells a parameter type as `const class Foo *` the bare
+	// `Foo` reaches the dependency-collection lookup tables.
+	clean := stripCppTypeQualifiers(name)
 
 	addClass := func(n string) {
 		if c, ok := classByQual[n]; ok {
@@ -293,11 +293,7 @@ func collectTypeDeps(ref apispec.TypeRef, classByQual, classByShort map[string]*
 		// (protobuf-generated enums are sometimes reported as kind=value)
 		addEnum(clean)
 		// Try qualified name from QualType
-		qtClean := strings.TrimSpace(qt)
-		qtClean = strings.TrimPrefix(qtClean, "const ")
-		qtClean = strings.TrimSuffix(qtClean, "*")
-		qtClean = strings.TrimSuffix(qtClean, "&")
-		qtClean = strings.TrimSpace(qtClean)
+		qtClean := stripCppTypeQualifiers(qt)
 		addClass(qtClean)
 		addEnum(qtClean)
 		// Smart pointer inner type

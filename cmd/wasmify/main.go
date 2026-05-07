@@ -1541,6 +1541,21 @@ func cmdParseHeaders(args []string) error {
 			return fmt.Errorf("no --header specified and build.json not found. Run 'wasmify generate-build' first or specify --header")
 		}
 		projectHeaders := scanProjectHeaders(absPath)
+		// Layer in external headers the user explicitly listed in
+		// `bridge.IncludeExternalHeaders` so classes from external
+		// libraries (e.g. google::protobuf::DescriptorPool) get
+		// their methods parsed alongside the project headers. Each
+		// config entry is matched as a path substring against the
+		// .d file dependency lines.
+		if s, err := state.Load(outDir); err == nil &&
+			s != nil && s.Bridge != nil &&
+			len(s.Bridge.IncludeExternalHeaders) > 0 {
+			extras := externalHeadersFromBuild(b, s.Bridge.IncludeExternalHeaders)
+			for h := range extras {
+				projectHeaders[h] = true
+			}
+			fmt.Fprintf(os.Stderr, "[parse-headers] External headers (from IncludeExternalHeaders): %d files\n", len(extras))
+		}
 		headerFiles, headerGroups = discoverProjectHeadersFromBuild(absPath, b, projectHeaders)
 		if len(headerFiles) == 0 {
 			return fmt.Errorf("no project headers found in build dependency files. Run 'wasmify validate-build' to ensure build artifacts exist")
@@ -1844,6 +1859,50 @@ func scanProjectHeaders(projectRoot string) map[string]bool {
 
 	walkDir(projectRoot, false)
 	return headers
+}
+
+// externalHeadersFromBuild walks every .d file emitted by the
+// build and returns the absolute paths of headers whose path
+// matches any of the given substring patterns. Used to augment
+// the parser's project-header set with explicitly-allow-listed
+// external library headers (see
+// `bridge.IncludeExternalHeaders` in wasmify.json).
+func externalHeadersFromBuild(b *buildjson.BuildJSON, patterns []string) map[string]bool {
+	out := make(map[string]bool)
+	if b == nil || len(patterns) == 0 {
+		return out
+	}
+	for _, step := range b.Steps {
+		if step.Type != buildjson.StepCompile {
+			continue
+		}
+		depFile := findDepFile(&step)
+		if depFile == "" {
+			continue
+		}
+		if !filepath.IsAbs(depFile) {
+			depFile = filepath.Join(step.WorkDir, depFile)
+		}
+		for _, dep := range parseDependencyFile(depFile) {
+			if !isHeaderFile(dep) {
+				continue
+			}
+			absDep := dep
+			if !filepath.IsAbs(absDep) {
+				absDep = filepath.Join(step.WorkDir, absDep)
+			}
+			if real, err := filepath.EvalSymlinks(absDep); err == nil {
+				absDep = real
+			}
+			for _, pat := range patterns {
+				if strings.Contains(absDep, pat) {
+					out[absDep] = true
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 // discoverProjectHeadersFromBuild extracts project header files from build.json

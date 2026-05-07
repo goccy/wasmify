@@ -12,6 +12,7 @@ import (
 	"github.com/bufbuild/protocompile"
 	"github.com/bufbuild/protocompile/reporter"
 	"github.com/goccy/wasmify/internal/apispec"
+	"github.com/goccy/wasmify/internal/state"
 )
 
 // optionsProtoContent is the canonical wasmify/options.proto, embedded
@@ -87,11 +88,16 @@ func buildMessageNameMap(spec *apispec.APISpec) map[string]string {
 // baseProtoName extracts the simple proto name from a C++ qualified name.
 func baseProtoName(qualName string) string {
 	name := stripTemplateWrappers(qualName)
-	name = strings.TrimPrefix(name, "const ")
+	// Strip cv-qualifiers, pointer/reference markers, and elaborated-
+	// type-specifier keywords. Without the elaborated-type strip,
+	// clang spellings like `class Foo` reach the parts-split below
+	// with the keyword still attached and the resulting "class Foo"
+	// fails isValidProtoIdent (the space makes it non-identifier),
+	// silently degrading the proto field type to `bytes`.
+	name = stripCppTypeQualifiers(name)
 	name = strings.TrimSuffix(name, " const")
 	parts := strings.Split(name, "::")
 	name = parts[len(parts)-1]
-	name = strings.TrimRight(name, "* &")
 	name = strings.TrimSpace(name)
 	name = strings.ReplaceAll(name, "<", "")
 	name = strings.ReplaceAll(name, ">", "")
@@ -280,11 +286,35 @@ func GenerateProtoWithConfig(spec *apispec.APISpec, packageName string, cfg Brid
 	if cppNS == "" {
 		// apispec's top-level Namespace is only populated by some
 		// producers; others carry the namespace on each class.
-		// Pick the first non-empty namespace we see.
+		// Pick the most common namespace across project-source
+		// classes (skip external libraries pulled in via
+		// IncludeExternalHeaders so a few protobuf/abseil headers
+		// don't outvote the actual project's namespace).
+		counts := make(map[string]int)
 		for _, c := range spec.Classes {
-			if c.Namespace != "" {
-				cppNS = c.Namespace
-				break
+			if c.Namespace == "" {
+				continue
+			}
+			if !isProjectSource(c.SourceFile) {
+				continue
+			}
+			counts[c.Namespace]++
+		}
+		bestN := 0
+		for ns, n := range counts {
+			if n > bestN {
+				bestN = n
+				cppNS = ns
+			}
+		}
+		if cppNS == "" {
+			// No project classes had a namespace — fall back to
+			// any namespace at all.
+			for _, c := range spec.Classes {
+				if c.Namespace != "" {
+					cppNS = c.Namespace
+					break
+				}
 			}
 		}
 		if cppNS == "" {
@@ -840,6 +870,19 @@ func writeRequestField(b *strings.Builder, protoType, fieldName string, fieldNum
 	fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, fieldNum)
 }
 
+// writeRequestFieldOwnershipWhen emits a proto-field line annotated
+// with [(wasmify.wasm_take_ownership_when) = "<selector>"]. The
+// plugin reads this extension and emits a runtime guard
+// `if <selector> { handle.clearPtr() }` after the invoke. Used for
+// the C++ idiom where a method takes both a raw `T*` and a `bool`
+// selector parameter (e.g. `AddColumn(const Column*, bool
+// is_owned)`); the proto schema cannot mark the handle field as
+// unconditionally ownership-transferring because passing the
+// selector as false is a legitimate borrowed-pass-through.
+func writeRequestFieldOwnershipWhen(b *strings.Builder, protoType, fieldName string, fieldNum int, selector string) {
+	fmt.Fprintf(b, "  %s %s = %d [(wasmify.wasm_take_ownership_when) = %q];\n", protoType, fieldName, fieldNum, selector)
+}
+
 // paramTakesOwnership reports whether the C++ counterpart of p takes
 // ownership of the wrapped pointer. Today that means a `unique_ptr<T>`
 // parameter passed by value or rvalue-ref — the bridge constructs a
@@ -852,14 +895,164 @@ func writeRequestField(b *strings.Builder, protoType, fieldName string, fieldNum
 // frees the underlying object.
 func paramTakesOwnership(p apispec.Param) bool {
 	qt := strings.TrimSpace(p.Type.QualType)
-	if smartPointerInner(qt) == "" {
+	if smartPointerInner(qt) != "" && !isSharedPointerType(qt) {
+		return true
+	}
+	// `std::vector<std::unique_ptr<T>>` parameters: the bridge body
+	// wraps each wire-decoded raw pointer in a fresh unique_ptr at
+	// emplace_back time (see readVectorElementExpr in bridge.go), so
+	// the C++ side takes ownership of every element on call. The Go
+	// wrapper for each element must therefore drop its `ptr` after
+	// the invoke, which the plugin emits when the proto field carries
+	// `wasm_take_ownership`. Without this branch the annotation never
+	// reaches the wire schema, the plugin emits no clearPtr loop, and
+	// each element double-frees once its Go finaliser runs against
+	// memory the C++ destructor has already reclaimed.
+	if p.Type.Kind == apispec.TypeVector && p.Type.Inner != nil {
+		innerQt := strings.TrimSpace(p.Type.Inner.QualType)
+		if isUniquePointerType(innerQt) {
+			return true
+		}
+	}
+	return false
+}
+
+// methodParamTakesOwnership extends paramTakesOwnership with the
+// project's config-driven escape hatch for C++ APIs whose
+// implementation captures a raw `T*` parameter into a smart
+// pointer (typically via `absl::WrapUnique` or
+// `std::unique_ptr<T>(p)` inside the .cc body) — ownership-
+// transfer semantics that the C++ type system cannot express and
+// that the generator does NOT attempt to detect by name.
+//
+// The user lists such methods in
+// `bridge.OwnershipTransferMethods`. Each entry is matched by
+// fully-qualified method name; an optional Signature
+// (parameter qual_types) picks a specific overload. When the
+// matched method is invoked, handle parameters that are NOT
+// already ownership-transferring through the C++ type system
+// are treated as if they carried `wasm_take_ownership` —
+// PROVIDED the matched overload does not also include a `bool`
+// parameter (which marks the runtime-conditional shape; see
+// conditionalOwnershipSelector).
+func methodParamTakesOwnership(m apispec.Function, p apispec.Param) bool {
+	if paramTakesOwnership(p) {
+		return true
+	}
+	if p.Type.Kind != apispec.TypeHandle {
 		return false
 	}
-	if isSharedPointerType(qt) {
+	entry := matchOwnershipTransferEntry(m)
+	if entry == nil {
+		return false
+	}
+	if hasBoolParam(m) {
+		// Runtime-conditional ownership transfer; emitted via
+		// wasm_take_ownership_when by conditionalOwnershipSelector.
 		return false
 	}
 	return true
 }
+
+// conditionalOwnershipSelector returns the snake_case proto
+// field name of the bool parameter that gates the runtime
+// ownership transfer for the matched overload, or "" when no
+// matched overload requires runtime gating.
+//
+// The bool is identified by TYPE: the matched overload (per
+// OwnershipTransferMethods) must include exactly one bool
+// parameter, which the generator treats as the selector. Listing
+// a method with multiple bool parameters is an error -- the user
+// must provide a Signature that pins down which overload they
+// mean and that overload must have a single bool.
+func conditionalOwnershipSelector(m apispec.Function) string {
+	entry := matchOwnershipTransferEntry(m)
+	if entry == nil {
+		return ""
+	}
+	if !hasBoolParam(m) {
+		return ""
+	}
+	for _, p := range m.Params {
+		if isBoolPrimitive(p.Type) {
+			return toSnakeCase(p.Name)
+		}
+	}
+	return ""
+}
+
+// matchOwnershipTransferEntry walks
+// `bridge.OwnershipTransferMethods` and returns the entry whose
+// Method matches m.QualName AND whose Signature (when present)
+// matches m's parameter qual_types in order. Returns nil when no
+// entry matches.
+func matchOwnershipTransferEntry(m apispec.Function) *state.OwnershipTransferEntry {
+	if m.QualName == "" {
+		return nil
+	}
+	for i := range bridgeConfig.OwnershipTransferMethods {
+		e := &bridgeConfig.OwnershipTransferMethods[i]
+		if e.Method != m.QualName {
+			continue
+		}
+		if len(e.Signature) == 0 {
+			return e
+		}
+		if signatureMatches(e.Signature, m.Params) {
+			return e
+		}
+	}
+	return nil
+}
+
+// signatureMatches reports whether the configured signature
+// matches the actual parameter qual_types in order. Whitespace
+// is collapsed on both sides so user-written and clang-emitted
+// spellings line up.
+func signatureMatches(sig []string, params []apispec.Param) bool {
+	if len(sig) != len(params) {
+		return false
+	}
+	for i, want := range sig {
+		got := params[i].Type.QualType
+		if normaliseQualType(want) != normaliseQualType(got) {
+			return false
+		}
+	}
+	return true
+}
+
+// normaliseQualType collapses internal whitespace runs so
+// "const Foo *" and "const Foo*" compare equal.
+func normaliseQualType(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// hasBoolParam reports whether m has at least one parameter of
+// primitive bool type. Used as the type-level signal for the
+// runtime-conditional ownership transfer pattern.
+func hasBoolParam(m apispec.Function) bool {
+	for _, p := range m.Params {
+		if isBoolPrimitive(p.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBoolPrimitive reports whether t is the primitive bool type
+// (not a reference / pointer / smart-pointer of bool).
+func isBoolPrimitive(t apispec.TypeRef) bool {
+	if t.Kind != apispec.TypePrimitive {
+		return false
+	}
+	if t.IsPointer || t.IsRef {
+		return false
+	}
+	qt := strings.TrimSpace(t.QualType)
+	return qt == "bool" || t.Name == "bool"
+}
+
 
 // protoStringLiteral renders s as a proto3 string literal: wraps in
 // double quotes and escapes embedded backslashes, double quotes, and
@@ -917,6 +1110,19 @@ func sanitizeFieldName(name string, fieldNum int) string {
 // - Non-const pointers to primitive types used for "out" values (bool*)
 func isOutputParam(p apispec.Param) bool {
 	t := p.Type
+	// Reference-to-pointer (`T*&`): handle output via reference. The
+	// clang AST parser reports IsRef=true, IsPointer=false because
+	// the outermost type is the reference; the qualified type still
+	// contains the trailing `*&`. Treat exactly like `T**` for
+	// callback / dispatch purposes — the bridge declares a local
+	// `T*` and binds it to the reference, and the callee writes
+	// through.
+	if t.IsRef && t.Kind == apispec.TypeHandle {
+		qt := strings.TrimSpace(t.QualType)
+		if strings.Contains(qt, "*&") || strings.Contains(qt, "* &") {
+			return true
+		}
+	}
 	// Must be a pointer
 	if !t.IsPointer {
 		return false
@@ -1298,23 +1504,40 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 	// round-trip for what the Go runtime already tracks. See the
 	// "do not emit Downcast APIs" rule in CLAUDE.md.
 
-	// Callback factory. For abstract classes with pure-virtual methods
-	// users may supply a Go impl; FromCallback registers that impl and
-	// returns a handle backed by a C++ trampoline that forwards each
-	// virtual through wasmify_callback_invoke.
+	// Callback factory. One RPC per base ctor variant — for an
+	// abstract class with no explicit ctor (typical: implicit
+	// default ctor only) the variant list is empty and a single
+	// `FromCallback` RPC carrying just `callback_id` is emitted.
+	// For a concrete class listed in `bridge.CallbackClasses`, one
+	// `FromCallback`, `FromCallback2`, ... is emitted, each
+	// mirroring one base ctor's parameter list. The trampoline
+	// (see bridge.go) constructs an instance by forwarding those
+	// args through to the base ctor, then attaches the callback id
+	// for downstream virtual dispatch.
 	emitFromCallback := isCallbackCandidate(c)
+	var fromCallbackVariants []apispec.Function
 	if emitFromCallback {
-		rpcName := "FromCallback"
-		if usedRPCNames[rpcName] {
-			rpcName = "NewFromCallback"
+		fromCallbackVariants = collectTrampolineCtors(c)
+		variantCount := len(fromCallbackVariants)
+		if variantCount == 0 {
+			variantCount = 1
 		}
-		usedRPCNames[rpcName] = true
-		reqMsg := fmt.Sprintf("%s%sRequest", msgName, rpcName)
-		fmt.Fprintf(b, "  rpc %s(%s) returns (%s) {\n", rpcName, reqMsg, msgName)
-		fmt.Fprintf(b, "    option (wasmify.wasm_method_id) = %d;\n", methodID)
-		b.WriteString("    option (wasmify.wasm_method_type) = \"callback_factory\";\n")
-		b.WriteString("  }\n")
-		methodID++
+		for i := 0; i < variantCount; i++ {
+			rpcName := "FromCallback"
+			if i > 0 {
+				rpcName = fmt.Sprintf("FromCallback%d", i+1)
+			}
+			if usedRPCNames[rpcName] {
+				rpcName = "New" + rpcName
+			}
+			usedRPCNames[rpcName] = true
+			reqMsg := fmt.Sprintf("%s%sRequest", msgName, rpcName)
+			fmt.Fprintf(b, "  rpc %s(%s) returns (%s) {\n", rpcName, reqMsg, msgName)
+			fmt.Fprintf(b, "    option (wasmify.wasm_method_id) = %d;\n", methodID)
+			b.WriteString("    option (wasmify.wasm_method_type) = \"callback_factory\";\n")
+			b.WriteString("  }\n")
+			methodID++
+		}
 	}
 
 	// Free — only emitted when the class has a public destructor.
@@ -1343,18 +1566,64 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 	b.WriteString("}\n\n")
 
 	if emitFromCallback {
-		reqMsg := fmt.Sprintf("%sFromCallbackRequest", msgName)
-		if !emitted[reqMsg] {
-			emitted[reqMsg] = true
-			fmt.Fprintf(b, "message %s {\n", reqMsg)
-			b.WriteString("  int32 callback_id = 1;\n")
-			b.WriteString("}\n\n")
+		variantCount := len(fromCallbackVariants)
+		if variantCount == 0 {
+			// No explicit base ctors → one default-shaped variant
+			// carrying just the callback_id.
+			reqMsg := fmt.Sprintf("%sFromCallbackRequest", msgName)
+			if !emitted[reqMsg] {
+				emitted[reqMsg] = true
+				fmt.Fprintf(b, "message %s {\n", reqMsg)
+				b.WriteString("  int32 callback_id = 1;\n")
+				b.WriteString("}\n\n")
+			}
+		} else {
+			// One Request message per ctor variant. callback_id
+			// always lands at field 1; the ctor's args follow
+			// at field 2..N. The bridge body reads them at the
+			// matching field numbers (see writeHandleDispatch's
+			// FromCallback emit loop).
+			for i, ctor := range fromCallbackVariants {
+				rpcName := "FromCallback"
+				if i > 0 {
+					rpcName = fmt.Sprintf("FromCallback%d", i+1)
+				}
+				reqMsg := fmt.Sprintf("%s%sRequest", msgName, rpcName)
+				if emitted[reqMsg] {
+					continue
+				}
+				emitted[reqMsg] = true
+				fmt.Fprintf(b, "message %s {\n", reqMsg)
+				b.WriteString("  int32 callback_id = 1;\n")
+				for j, p := range ctor.Params {
+					protoType := typeRefToProto(p.Type)
+					fieldName := toSnakeCase(p.Name)
+					if fieldName == "" {
+						fieldName = fmt.Sprintf("arg%d", j)
+					}
+					fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, j+2)
+				}
+				b.WriteString("}\n\n")
+			}
 		}
 	}
 
 	// Generate constructor request messages. Constructor requests have no
 	// handle field; parameters start at field 1. The response is the handle
 	// message itself, which is already declared elsewhere.
+	//
+	// Each `unique_ptr<T>` (by value) ctor parameter must carry
+	// `wasm_take_ownership`: the C++ side wraps the wire-decoded raw
+	// pointer in a fresh smart pointer at the call site, and that
+	// smart pointer's destructor will eventually delete the
+	// underlying object. Without the annotation the plugin does not
+	// emit clearPtr on the Go-side wrapper, the wrapper's finalizer
+	// later issues a Free RPC against the same address, and the
+	// wasm allocator's freelist double-frees — surfacing as a
+	// delayed `out of bounds memory access` from a completely
+	// unrelated call path several iterations later. The free-
+	// function and method paths already route through
+	// writeRequestField; the ctor path used to bypass it.
 	for _, entry := range ctorEntries {
 		rpcName := entry.rpcName
 		m := entry.method
@@ -1368,7 +1637,7 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 				if fieldName == "" {
 					fieldName = fmt.Sprintf("arg%d", i)
 				}
-				fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, i+1)
+				writeRequestField(b, protoType, fieldName, i+1, paramTakesOwnership(p))
 			}
 			b.WriteString("}\n\n")
 		}
@@ -1417,7 +1686,12 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 				if fieldName == "" {
 					fieldName = fmt.Sprintf("arg%d", i)
 				}
-				writeRequestField(b, protoType, fieldName, i+fieldOffset, paramTakesOwnership(p))
+				selector := conditionalOwnershipSelector(m)
+				if selector != "" && p.Type.Kind == apispec.TypeHandle && !methodParamTakesOwnership(m, p) {
+					writeRequestFieldOwnershipWhen(b, protoType, fieldName, i+fieldOffset, selector)
+				} else {
+					writeRequestField(b, protoType, fieldName, i+fieldOffset, methodParamTakesOwnership(m, p))
+				}
 			}
 			b.WriteString("}\n\n")
 		}
@@ -1565,12 +1839,46 @@ func typeRefToProto(ref apispec.TypeRef) string {
 		}
 		return "bytes"
 	case apispec.TypeHandle:
+		// Set-like containers (configured via SetLikeTypePrefixes) are
+		// reported as kind=handle by clang because the set is itself a
+		// class template instance — but the wire format is a `repeated
+		// <Elem>` matching what the bridge body builds element-by-
+		// element via setLikeContainerInfo + readSetElementExpr. Catch
+		// the shape here and emit the matching proto schema; without
+		// this check the field falls through to `bytes` and the wire
+		// encoding disagrees with the bridge body's per-element reads.
+		if keyType, valType, ok := parseMapType(ref.Name); ok {
+			return handleMapType(ref.Name, keyType, valType)
+		}
 		name := protoMessageName(ref.Name)
 		if !isValidProtoIdent(name) {
 			return "bytes"
 		}
 		return name
 	case apispec.TypeValue:
+		// Status-or-value wrappers (e.g. `absl::StatusOr<T>`)
+		// surface here because the parser classifies them as
+		// value types. The proto schema represents them as the
+		// inner T's message — the Status half is carried by the
+		// standard `string error = 15` field on every callback
+		// response, so on the wire there's nothing to add.
+		if inner, ok := statusOrInnerType(ref); ok {
+			resolved := resolveTypeName(strings.TrimSpace(inner))
+			if resolved == "" {
+				resolved = inner
+			}
+			if messageNameMap != nil {
+				if name, exists := messageNameMap[resolved]; exists {
+					if isValidProtoIdent(name) {
+						return name
+					}
+				}
+			}
+			if name := protoMessageName(resolved); isValidProtoIdent(name) {
+				return name
+			}
+			return "bytes"
+		}
 		// Library-specific string aliases (ExtraStringTypes, e.g.
 		// absl::string_view, absl::Cord) that the parser doesn't
 		// recognise as TypeString land here. Map them to proto
@@ -1584,9 +1892,17 @@ func typeRefToProto(ref apispec.TypeRef) string {
 		// over a contiguous sequence of T; on the wire it's
 		// indistinguishable from repeated T. Emit `repeated <Elem>`
 		// so the plugin generates a slice-based Go signature and the
-		// bridge can deserialise element-by-element. Only do this
-		// when the element resolves to a class that the proto layer
-		// actually declares — nested/private classes aren't bridged.
+		// bridge can deserialise element-by-element.
+		//
+		// The inner type can be:
+		//   1. A primitive or string type — `repeated <proto-scalar>`.
+		//   2. A project-defined class that the proto layer declares
+		//      (i.e. has an entry in messageNameMap) — `repeated
+		//      <message>`. Unbridgeable classes (no entry in
+		//      messageNameMap), nested classes the proto generator
+		//      skipped (`Class::Nested`), etc., are intentionally
+		//      not handled here and fall through to the regular
+		//      message-or-bytes path below.
 		if matchesValueViewType(ref.QualType) {
 			if elem := extractTemplateArgFromQualType(ref.QualType); elem != "" {
 				raw := strings.TrimSpace(elem)
@@ -1594,11 +1910,15 @@ func typeRefToProto(ref apispec.TypeRef) string {
 				raw = strings.TrimSpace(raw)
 				raw = strings.TrimPrefix(raw, "const ")
 				raw = strings.TrimSpace(raw)
+				// Primitive / string element: route through the
+				// generic C++→proto scalar mapping. This covers
+				// `absl::Span<const std::string>` as `repeated
+				// string`, which is the canonical multi-segment
+				// path / name idiom in any C++ codebase.
+				if scalar := cppTypeNameToProto(raw); scalar != "" && scalar != "bytes" && isKnownProtoType(scalar) {
+					return "repeated " + scalar
+				}
 				resolved := resolveTypeName(raw)
-				// Reject inner types whose message isn't declared:
-				// unbridgeable classes (no entry in
-				// messageNameMap), nested classes clang saw but the
-				// proto generator skipped (`Class::Nested`), etc.
 				if messageNameMap != nil {
 					if _, ok := messageNameMap[resolved]; ok {
 						name := protoMessageName(resolved)
@@ -1890,10 +2210,15 @@ func splitTemplateArgs(s string) (string, string, bool) {
 
 // cppTypeNameToProto converts a raw C++ type name to a proto type.
 func cppTypeNameToProto(name string) string {
-	// Strip const, pointers, references
-	cleaned := strings.TrimPrefix(name, "const ")
+	// Strip cv-qualifiers, pointer/reference markers, and elaborated-
+	// type-specifier keywords (`class`, `struct`, `enum`, `union`).
+	// Sharing stripCppTypeQualifiers with the bridge side keeps the
+	// proto schema and the C++ bridge agreed on the bare type name.
+	cleaned := stripCppTypeQualifiers(name)
+	// Some clang spellings put `const` after the type ("Foo const")
+	// rather than before; strip that suffix too because
+	// stripCppTypeQualifiers only handles the prefix form.
 	cleaned = strings.TrimSuffix(cleaned, " const")
-	cleaned = strings.TrimRight(cleaned, "* &")
 	cleaned = strings.TrimSpace(cleaned)
 
 	// Check primitives
@@ -2322,9 +2647,11 @@ func writeCallbackService(b *strings.Builder, c *apispec.Class, emitted map[stri
 			emitted[reqMsg] = true
 			fmt.Fprintf(b, "message %s {\n", reqMsg)
 			for i, p := range e.method.Params {
-				// Output-pointer handle params (`T**`) move to the
-				// response — skip them from the request.
-				if isOutputPointerHandle(p.Type) {
+				// Output-shaped handle params (`T**` and
+				// `unique_ptr<T>* / shared_ptr<T>*`) move to the
+				// response — skip them from the request. See
+				// isCallbackOutputParam for the recognition rule.
+				if isCallbackOutputParam(p.Type) {
 					continue
 				}
 				protoType := typeRefToProto(p.Type)
@@ -2352,22 +2679,43 @@ func writeCallbackService(b *strings.Builder, c *apispec.Class, emitted map[stri
 				protoType := typeRefToProto(e.method.ReturnType)
 				fmt.Fprintf(b, "  %s result = 1;\n", protoType)
 			}
-			// Output pointer params surface as additional response
+			// Output handle params surface as additional response
 			// fields — the Go impl returns them rather than mutating
-			// caller memory.
+			// caller memory. Both `T**` and the smart-pointer-by-
+			// pointer idiom (`unique_ptr<T>*`, `shared_ptr<T>*`) are
+			// recognised here; the response field type is the bare
+			// inner T's message name.
 			for i, p := range e.method.Params {
-				if !isOutputPointerHandle(p.Type) {
+				if !isCallbackOutputParam(p.Type) {
 					continue
 				}
-				// Strip `**` to get the base handle type name.
-				bare := p.Type.Name
-				bare = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(bare), "*"))
+				bare := callbackOutputInnerName(p.Type)
 				protoType := protoMessageName(bare)
 				fieldName := toSnakeCase(p.Name)
 				if fieldName == "" {
 					fieldName = fmt.Sprintf("arg%d", i)
 				}
-				fmt.Fprintf(b, "  %s %s = %d;\n", protoType, fieldName, i+1)
+				prefix := ""
+				if isCallbackOutputContainer(p.Type) {
+					prefix = "repeated "
+				}
+				// Mark smart-pointer-by-pointer output (`unique_ptr<T>*`
+				// / `shared_ptr<T>*`) with `wasm_take_ownership` so the
+				// plugin emits a `clearPtr()` after writing the
+				// returned handle to the wire — the C++ trampoline
+				// wraps the raw pointer in a fresh smart pointer and
+				// will delete the underlying object via its destructor.
+				// Without the clear, the Go GC would later double-free
+				// the same address through the wrapper's finalizer.
+				//
+				// Raw-pointer outputs (`T**` / `T*&`) leave the option
+				// off — those are borrowed views, the C++ side does
+				// not delete, and the Go wrapper retains ownership.
+				suffix := ""
+				if isCallbackOutputOwning(p.Type) {
+					suffix = " [(wasmify.wasm_take_ownership) = true]"
+				}
+				fmt.Fprintf(b, "  %s%s %s = %d%s;\n", prefix, protoType, fieldName, i+1, suffix)
 			}
 			b.WriteString("  string error = 15;\n")
 			b.WriteString("}\n\n")

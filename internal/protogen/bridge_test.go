@@ -209,6 +209,250 @@ func resetBridgeGenerators() {
 	valueTypeParsersSeen = map[string]bool{}
 }
 
+// TestIsCallbackCandidateForBridge_NonAbstract documents the default
+// exclusion of concrete classes — in C++ "concrete + virtuals" is the
+// same syntactic shape used both for customisation hooks (subclasses
+// expected) and data carriers (visitor pattern), so the generator
+// cannot distinguish them structurally. By default a concrete class
+// is rejected.
+//
+// `TestIsCallbackCandidateForBridge_NonAbstractOptIn` covers the
+// other half of the contract: a concrete class listed in
+// `bridge.CallbackClasses` becomes callback-eligible.
+func TestIsCallbackCandidateForBridge_NonAbstract(t *testing.T) {
+	prevSrc := classSourceFiles
+	prevQual := classQualNames
+	prevAbs := classAbstract
+	prevNoCtor := classNoDefaultCtor
+	prevCfg := bridgeConfig
+	classSourceFiles = map[string]string{
+		"calc::Counter": "calc/counter.h",
+	}
+	classQualNames = map[string]string{
+		"Counter": "calc::Counter",
+	}
+	classAbstract = map[string]bool{}
+	classNoDefaultCtor = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	defer func() {
+		classSourceFiles = prevSrc
+		classQualNames = prevQual
+		classAbstract = prevAbs
+		classNoDefaultCtor = prevNoCtor
+		bridgeConfig = prevCfg
+	}()
+
+	// Concrete class with a single non-pure virtual. Mirrors the shape
+	// of TableValuedFunction.Resolve(): the base class has a usable
+	// default implementation, and Go subclasses override it when they
+	// need different behaviour.
+	c := apispec.Class{
+		Name:                 "Counter",
+		QualName:             "calc::Counter",
+		Namespace:            "calc",
+		IsHandle:             true,
+		IsAbstract:           false,
+		HasPublicDefaultCtor: true,
+		HasPublicDtor:        true,
+		SourceFile:           "calc/counter.h",
+		Methods: []apispec.Function{
+			{
+				Name:      "next",
+				QualName:  "calc::Counter::next",
+				IsVirtual: true,
+				Access:    "public",
+				Params: []apispec.Param{{
+					Name: "step",
+					Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"},
+				}},
+				ReturnType: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"},
+			},
+		},
+	}
+
+	if isCallbackCandidateForBridge(&c) {
+		t.Errorf("non-abstract class must NOT be callback-eligible by default; opt-in via wasmify.json:bridge.CallbackClasses is the intended escape hatch")
+	}
+}
+
+// TestIsCallbackCandidateForBridge_NonAbstractOptIn confirms the
+// other half of the contract: when a concrete class is listed in
+// `bridge.CallbackClasses`, the predicate accepts it and the
+// generator proceeds to emit a callback service. The opt-in does
+// not bypass the per-method declarability checks (a class with an
+// inherited pure virtual we cannot declare is still rejected
+// because the trampoline could not satisfy the vtable).
+func TestIsCallbackCandidateForBridge_NonAbstractOptIn(t *testing.T) {
+	prevSrc := classSourceFiles
+	prevQual := classQualNames
+	prevAbs := classAbstract
+	prevNoCtor := classNoDefaultCtor
+	prevCfg := bridgeConfig
+	classSourceFiles = map[string]string{
+		"calc::Counter": "calc/counter.h",
+	}
+	classQualNames = map[string]string{
+		"Counter": "calc::Counter",
+	}
+	classAbstract = map[string]bool{}
+	classNoDefaultCtor = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	bridgeConfig.CallbackClasses = []string{"calc::Counter"}
+	defer func() {
+		classSourceFiles = prevSrc
+		classQualNames = prevQual
+		classAbstract = prevAbs
+		classNoDefaultCtor = prevNoCtor
+		bridgeConfig = prevCfg
+	}()
+
+	// Same shape as the previous (default-rejected) test, only the
+	// CallbackClasses listing differs.
+	c := apispec.Class{
+		Name:                 "Counter",
+		QualName:             "calc::Counter",
+		Namespace:            "calc",
+		IsHandle:             true,
+		IsAbstract:           false,
+		HasPublicDefaultCtor: true,
+		HasPublicDtor:        true,
+		SourceFile:           "calc/counter.h",
+		Methods: []apispec.Function{
+			{
+				Name:      "next",
+				QualName:  "calc::Counter::next",
+				IsVirtual: true,
+				Access:    "public",
+				Params: []apispec.Param{{
+					Name: "step",
+					Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"},
+				}},
+				ReturnType: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"},
+			},
+		},
+	}
+
+	if !isCallbackCandidateForBridge(&c) {
+		t.Errorf("concrete class listed in CallbackClasses must be callback-eligible")
+	}
+
+	// And once the class is removed from the opt-in list it falls back
+	// to the default rejection — the listing is the sole gate.
+	bridgeConfig.CallbackClasses = nil
+	if isCallbackCandidateForBridge(&c) {
+		t.Errorf("removing the class from CallbackClasses must restore default rejection")
+	}
+}
+
+// TestIsCallbackCandidateForBridge_AbstractStillEligible ensures the
+// pre-fix behaviour for genuinely abstract classes (one or more pure
+// virtuals) keeps working. Without this guard the predicate change
+// would risk regressing the existing Catalog / Connection / Logger
+// callback surface.
+func TestIsCallbackCandidateForBridge_AbstractStillEligible(t *testing.T) {
+	prevSrc := classSourceFiles
+	prevQual := classQualNames
+	prevAbs := classAbstract
+	prevNoCtor := classNoDefaultCtor
+	prevCfg := bridgeConfig
+	classSourceFiles = map[string]string{
+		"calc::Logger": "calc/logger.h",
+	}
+	classQualNames = map[string]string{
+		"Logger": "calc::Logger",
+	}
+	classAbstract = map[string]bool{}
+	classNoDefaultCtor = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	defer func() {
+		classSourceFiles = prevSrc
+		classQualNames = prevQual
+		classAbstract = prevAbs
+		classNoDefaultCtor = prevNoCtor
+		bridgeConfig = prevCfg
+	}()
+
+	c := apispec.Class{
+		Name:          "Logger",
+		QualName:      "calc::Logger",
+		Namespace:     "calc",
+		IsHandle:      true,
+		IsAbstract:    true,
+		HasPublicDtor: true,
+		SourceFile:    "calc/logger.h",
+		Methods: []apispec.Function{
+			{
+				Name:          "log",
+				QualName:      "calc::Logger::log",
+				IsVirtual:     true,
+				IsPureVirtual: true,
+				Access:        "public",
+				Params: []apispec.Param{{
+					Name: "message",
+					Type: apispec.TypeRef{Kind: apispec.TypeString, Name: "string", QualType: "const std::string &"},
+				}},
+				ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid, Name: "void", QualType: "void"},
+			},
+		},
+	}
+
+	if !isCallbackCandidateForBridge(&c) {
+		t.Error("abstract class with a pure-virtual must remain callback-eligible after the predicate change")
+	}
+}
+
+// TestIsCallbackCandidateForBridge_NoVirtualsRejected confirms that a
+// concrete class with no virtual methods at all is still rejected —
+// callbacks have no purpose for such classes and emitting one would
+// create a dead service in the proto schema.
+func TestIsCallbackCandidateForBridge_NoVirtualsRejected(t *testing.T) {
+	prevSrc := classSourceFiles
+	prevQual := classQualNames
+	prevAbs := classAbstract
+	prevNoCtor := classNoDefaultCtor
+	prevCfg := bridgeConfig
+	classSourceFiles = map[string]string{
+		"calc::PlainPOD": "calc/pod.h",
+	}
+	classQualNames = map[string]string{
+		"PlainPOD": "calc::PlainPOD",
+	}
+	classAbstract = map[string]bool{}
+	classNoDefaultCtor = map[string]bool{}
+	bridgeConfig = DefaultBridgeConfig()
+	defer func() {
+		classSourceFiles = prevSrc
+		classQualNames = prevQual
+		classAbstract = prevAbs
+		classNoDefaultCtor = prevNoCtor
+		bridgeConfig = prevCfg
+	}()
+
+	c := apispec.Class{
+		Name:                 "PlainPOD",
+		QualName:             "calc::PlainPOD",
+		Namespace:            "calc",
+		IsHandle:             true,
+		HasPublicDefaultCtor: true,
+		HasPublicDtor:        true,
+		SourceFile:           "calc/pod.h",
+		Methods: []apispec.Function{
+			{
+				Name:       "value",
+				QualName:   "calc::PlainPOD::value",
+				IsVirtual:  false,
+				Access:     "public",
+				Params:     nil,
+				ReturnType: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"},
+			},
+		},
+	}
+
+	if isCallbackCandidateForBridge(&c) {
+		t.Error("class with zero virtuals must not be callback-eligible")
+	}
+}
+
 func TestGenerateBridgeHeader(t *testing.T) {
 	spec := testAPISpec()
 	output := GenerateBridgeHeader(spec, "test")
