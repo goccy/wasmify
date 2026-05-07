@@ -767,13 +767,13 @@ func replaceBareIdent(qt, from, to string) string {
 		return qt
 	}
 	endsWell := func(c byte) bool {
-		return !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ':')
+		return c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != ':'
 	}
 	startsWell := func(c byte) bool {
 		// Allow `::` as a leading delimiter (for already-qualified
 		// names) but treat the delimiter as ":" only if it is part
 		// of the C++ scope operator.
-		return !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+		return c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9')
 	}
 	for idx >= 0 {
 		ok := true
