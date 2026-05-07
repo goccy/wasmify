@@ -677,6 +677,30 @@ public:
 
     ProtoWriter() : data_(nullptr), size_(0), cap_(0) {}
 
+    // Destructor frees any heap buffer the writer still owns. Two
+    // usage shapes own data_ differently. (1) The wasm export
+    // return path ends with finish(); finish() transfers ownership
+    // of data_ to the host (host calls wasm_free after reading) and
+    // NULLs data_ here so this destructor skips the free. (2) The
+    // callback trampoline (C++ to Go) hands data_/size_ to
+    // wasmify_callback_invoke; the host READS but does not take
+    // ownership, so when the writer goes out of scope this
+    // destructor must release data_. Without (2), every callback
+    // dispatch leaks 128+ bytes of wasm heap; after enough rounds
+    // dlmalloc fragments and subsequent allocations either return
+    // NULL or trip OOB inside the allocator's freelist walk.
+    ~ProtoWriter() {
+        if (data_ != nullptr) {
+            free(data_);
+            data_ = nullptr;
+        }
+    }
+
+    // Disable copy: data_ is malloc'd; copying would alias the
+    // pointer and double-free at scope exit.
+    ProtoWriter(const ProtoWriter&) = delete;
+    ProtoWriter& operator=(const ProtoWriter&) = delete;
+
     void ensure(int32_t need) {
         if (data_ == nullptr) {
             cap_ = need > 128 ? need : 128;
@@ -878,7 +902,15 @@ public:
             }
             return encode_result(nullptr, 0);
         }
-        return encode_result(data_, size_);
+        // Transfer ownership of data_ to the host. Clear our pointer
+        // so the destructor does not double-free what the host now
+        // owns and will release via wasm_free after reading.
+        uint8_t* released = data_;
+        int32_t released_size = size_;
+        data_ = nullptr;
+        size_ = 0;
+        cap_ = 0;
+        return encode_result(released, released_size);
     }
 };
 
@@ -970,6 +1002,24 @@ func isUsableType(ref apispec.TypeRef) bool {
 		if classSourceFiles == nil {
 			return true
 		}
+		// Set-like container parameters: when a method's signature
+		// uses an `std::set` / `std::unordered_set` / configured
+		// `BridgeConfig.SetLikeTypePrefixes` template, the proto
+		// schema emits `repeated <ElemHandle>` for it (handled by
+		// parseMapType / handleMapType), and the bridge body
+		// materialises the container element-by-element from the
+		// wire (see setLikeContainerInfo). The filter must
+		// reflect the same view: usable iff the element type is
+		// itself usable. Without this, every method taking a
+		// set-of-handles silently disappears from the binding even
+		// though the proto and bridge sides know how to handle it.
+		if elem, _, isSet := parseMapType(ref.Name); isSet && looksLikeSetTypeName(ref.Name) {
+			if elem == "" {
+				return false
+			}
+			elemRef := typeRefFromTemplateArg(strings.TrimSpace(elem))
+			return isUsableType(elemRef)
+		}
 		bareName := cppTypeName(ref)
 		qual := resolveTypeName(bareName)
 		src, known := classSourceFiles[qual]
@@ -1016,6 +1066,14 @@ func isUsableType(ref apispec.TypeRef) bool {
 			return false
 		}
 		if !isProjectSource(src) {
+			// Allow when explicitly opted in via either
+			// `bridge.IncludeExternalClasses` (for parsed external
+			// classes whose methods we want bridged) or
+			// `bridge.ExternalTypes` (for opaque external handles
+			// where we only need parameter passing).
+			if isIncludedExternalClass(qual) || isAllowedExternalType(qual) {
+				return true
+			}
 			return false
 		}
 		// Skip types from disabled libraries
@@ -1040,35 +1098,52 @@ func isInstantiableType(ref apispec.TypeRef) bool {
 	// if the copy is never called at runtime. Filter such vectors.
 	if ref.Kind == apispec.TypeVector && ref.Inner != nil {
 		innerQual := resolveTypeName(cppTypeName(*ref.Inner))
-		if classDeletedCopy != nil && classDeletedCopy[innerQual] {
-			return false
-		}
-		// Abstract classes cannot be stored by value in a vector.
-		if classAbstract != nil && classAbstract[innerQual] {
-			return false
-		}
-		// Classes without a public default constructor cannot be
-		// default-constructed in a vector... unless the bridge can
-		// emplace_back them from their fields. A POD-shaped value
-		// class (public fields, has a matching constructor) can be
-		// built element-by-element even when a vector-wide
-		// default-construct is impossible. valueClasses captures the
-		// field layout; we rely on bridge emission to produce
-		// emplace_back instead of default-construct-then-fill. Handle
-		// types are likewise fine: Go passes existing handles, so the
-		// bridge push_back's *deref'd_ptr via the class's copy ctor
-		// without ever default-constructing an element.
-		if classNoDefaultCtor != nil && classNoDefaultCtor[innerQual] &&
-			ref.Inner.Kind != apispec.TypeHandle {
-			if c, ok := valueClasses[innerQual]; !ok || len(c.Fields) == 0 {
+		// `vector<T*>` (or any pointer-element form) stores pointer
+		// slots, never T values. Properties of T that block by-value
+		// vector use — abstract, deleted copy ctor, no default ctor —
+		// are irrelevant when the element is a pointer. The bridge
+		// reads handle pointers from the proto wire and pushes them
+		// back as raw `T*` without ever constructing T.
+		innerIsPointer := ref.Inner.IsPointer
+		if !innerIsPointer {
+			if classDeletedCopy != nil && classDeletedCopy[innerQual] {
 				return false
+			}
+			// Abstract classes cannot be stored by value in a vector.
+			if classAbstract != nil && classAbstract[innerQual] {
+				return false
+			}
+			// Classes without a public default constructor cannot be
+			// default-constructed in a vector... unless the bridge can
+			// emplace_back them from their fields. A POD-shaped value
+			// class (public fields, has a matching constructor) can be
+			// built element-by-element even when a vector-wide
+			// default-construct is impossible. valueClasses captures the
+			// field layout; we rely on bridge emission to produce
+			// emplace_back instead of default-construct-then-fill. Handle
+			// types are likewise fine: Go passes existing handles, so the
+			// bridge push_back's *deref'd_ptr via the class's copy ctor
+			// without ever default-constructing an element.
+			if classNoDefaultCtor != nil && classNoDefaultCtor[innerQual] &&
+				ref.Inner.Kind != apispec.TypeHandle {
+				if c, ok := valueClasses[innerQual]; !ok || len(c.Fields) == 0 {
+					return false
+				}
 			}
 		}
 		innerName := ref.Inner.Name
 		if innerName == "" {
 			innerName = ref.Inner.QualType
 		}
-		if isSmartPointerType(innerName) || isSmartPointerType(cppTypeName(*ref.Inner)) {
+		// Smart-pointer inner types: unique_ptr is allowed because
+		// it's move-only and the bridge transports each element as a
+		// raw uint64 handle that the C++ side wraps via
+		// `std::unique_ptr<T>(reinterpret_cast<T*>(h))`. shared_ptr
+		// stays rejected — the bridge has no shared-ownership
+		// transport across the wasm boundary today (each side would
+		// need to keep its own live shared_ptr to participate in the
+		// refcount, and that round-trip isn't wired).
+		if isSharedPointerType(innerName) || isSharedPointerType(cppTypeName(*ref.Inner)) {
 			return false
 		}
 		if matchErrorType(innerName) != "" {
@@ -1224,8 +1299,17 @@ func isReturnableType(ref apispec.TypeRef) bool {
 // Requires: defined in project source, not abstract, has proper namespace,
 // and has an accessible destructor (so Free RPC can delete instances).
 func isBridgeableClass(c *apispec.Class) bool {
+	includedExternal := isIncludedExternalClass(c.QualName)
 	if !isProjectSource(c.SourceFile) {
-		return false
+		// External classes are bridgeable when the user opted them
+		// in via `bridge.IncludeExternalClasses`. This is the path
+		// for protobuf descriptor types and similar library
+		// internals: the headers are parsed (via
+		// `bridge.IncludeExternalHeaders`) but their source files
+		// don't pass `isProjectSource`.
+		if !includedExternal {
+			return false
+		}
 	}
 	// Abstract classes ARE bridgeable — they provide inherited methods
 	// (e.g., ResolvedFunctionCallBase::function()) that concrete subclass
@@ -1242,9 +1326,11 @@ func isBridgeableClass(c *apispec.Class) bool {
 	if strings.Contains(c.Namespace, "internal_") {
 		return false
 	}
-	// Skip classes from disabled libraries.
+	// Skip classes from disabled libraries — unless the user
+	// explicitly opted this class in via IncludeExternalClasses,
+	// in which case the library disable doesn't apply.
 	lib := classifyLibrary(c.SourceFile)
-	if !isLibraryEnabled(lib) {
+	if !isLibraryEnabled(lib) && !includedExternal {
 		return false
 	}
 	// Skip classes defined in headers excluded from the bridge's include
@@ -2007,7 +2093,26 @@ func cppTypeName(ref apispec.TypeRef) string {
 	if name == "" {
 		return "/* unknown type */"
 	}
-	// Strip qualifiers iteratively
+	name = stripCppTypeQualifiers(name)
+	// Resolve short names to fully qualified names
+	return resolveTypeName(name)
+}
+
+// stripCppTypeQualifiers reduces a clang-spelled C++ type expression
+// to its bare class/typedef identifier by repeatedly peeling off:
+//
+//   - trailing pointer / reference markers (`*`, `&`)
+//   - leading cv-qualifiers (`const`, `volatile`)
+//   - leading elaborated-type-specifiers (`class`, `struct`, `union`,
+//     `enum`)
+//
+// All four are part of standard C++ syntax and apply uniformly across
+// any header source, so the helper is library-agnostic. The
+// elaborated-type-specifier strip in particular matters because clang
+// occasionally re-emits the keyword in `qual_type` (e.g.
+// `const class Type *` rather than `const Type *`), and downstream
+// resolution against `classQualNames` keys on the bare name only.
+func stripCppTypeQualifiers(name string) string {
 	name = strings.TrimSpace(name)
 	for {
 		prev := name
@@ -2017,13 +2122,24 @@ func cppTypeName(ref apispec.TypeRef) string {
 		name = strings.TrimSpace(name)
 		name = strings.TrimPrefix(name, "const ")
 		name = strings.TrimPrefix(name, "volatile ")
+		name = strings.TrimPrefix(name, "class ")
+		name = strings.TrimPrefix(name, "struct ")
+		name = strings.TrimPrefix(name, "union ")
+		name = strings.TrimPrefix(name, "enum ")
+		// Leading `::` is the C++ global-namespace anchor: `::ns::Foo`
+		// names the exact same type as `ns::Foo`, but
+		// `classSourceFiles` / `classQualNames` are keyed without the
+		// anchor. Strip it here so downstream resolution lines up;
+		// otherwise clang's occasional double-colon spellings (e.g.
+		// `const ::googlesql::ResolvedCreateTableFunctionStmt *`)
+		// silently filter the method out at isUsableType time.
+		name = strings.TrimPrefix(name, "::")
 		name = strings.TrimSpace(name)
 		if name == prev {
 			break
 		}
 	}
-	// Resolve short names to fully qualified names
-	return resolveTypeName(name)
+	return name
 }
 
 // cppTypeNameInContext returns the C++ type name with class-context-aware resolution.
@@ -2050,20 +2166,7 @@ func cppTypeNameInContext(ref apispec.TypeRef, classContext string) string {
 	if name == "" {
 		return "/* unknown type */"
 	}
-	name = strings.TrimSpace(name)
-	for {
-		prev := name
-		name = strings.TrimSpace(name)
-		name = strings.TrimSuffix(name, "*")
-		name = strings.TrimSuffix(name, "&")
-		name = strings.TrimSpace(name)
-		name = strings.TrimPrefix(name, "const ")
-		name = strings.TrimPrefix(name, "volatile ")
-		name = strings.TrimSpace(name)
-		if name == prev {
-			break
-		}
-	}
+	name = stripCppTypeQualifiers(name)
 	return resolveTypeNameInContext(name, classContext)
 }
 
@@ -2082,6 +2185,13 @@ func cppLocalTypeInContext(ref apispec.TypeRef, classContext string) string {
 		}
 		return "std::string"
 	case apispec.TypeHandle:
+		// Set-like containers: declare the container as the local
+		// (mirrors cppLocalType). Class context only affects value
+		// types, so we delegate the recognition to setLikeContainerInfo
+		// which keys on the ref's spelling.
+		if container, _, ok := setLikeContainerInfo(ref); ok {
+			return container
+		}
 		return "uint64_t"
 	case apispec.TypeEnum:
 		return cppTypeNameInContext(ref, classContext)
@@ -2209,6 +2319,155 @@ func cppTypeNameInContextForValue(ref apispec.TypeRef, classContext string) stri
 }
 
 // cppLocalType returns the C++ type for a local variable declaration.
+// setLikeContainerInfo recognises a parameter that the proto-schema
+// side classifies as a set-like container (via parseMapType / the
+// bridge config's SetLikeTypePrefixes) and returns the C++ container
+// type plus the resolved element type to use on the bridge body
+// side. Returns ok=false when ref is not a set-like container.
+//
+// clang reports `absl::flat_hash_set<const Foo *>` as `kind: handle`
+// because the set is itself a class template instance — but the
+// proto schema emits `repeated <Handle>` for the same parameter.
+// The bridge body therefore needs to materialise the container from
+// the wire instead of taking a single opaque handle. This helper
+// keeps the recognition logic in one place so the local declaration,
+// per-element read, and call-site argument all agree on the shape.
+//
+// The recognition is library-agnostic: any prefix listed in
+// `BridgeConfig.SetLikeTypePrefixes` (or the std-library set-like
+// templates that parseMapType always recognises) participates.
+func setLikeContainerInfo(ref apispec.TypeRef) (containerType, elementType string, ok bool) {
+	if ref.Kind != apispec.TypeHandle && ref.Kind != apispec.TypeValue {
+		return "", "", false
+	}
+	elem, _, isMapOrSet := parseMapType(ref.Name)
+	if !isMapOrSet {
+		return "", "", false
+	}
+	// parseMapType returns elem != "" and val == "" for the set case;
+	// elem != "" and val != "" for the map case. We only handle sets here.
+	if elem == "" {
+		return "", "", false
+	}
+	// Maps come back from parseMapType with both key and value populated.
+	// Detect that by re-running with explicit set-prefix matching: if
+	// the input doesn't match a set prefix, fall through.
+	if !looksLikeSetTypeName(ref.Name) {
+		return "", "", false
+	}
+	// Element type: extract pointer / const qualifiers and resolve the
+	// base name to its fully-qualified form. Set elements are typically
+	// `const T*` (the canonical "non-owning reference set" idiom).
+	elemTrimmed := strings.TrimSpace(elem)
+	hasConst := strings.HasPrefix(elemTrimmed, "const ")
+	if hasConst {
+		elemTrimmed = strings.TrimSpace(strings.TrimPrefix(elemTrimmed, "const "))
+	}
+	isPtr := strings.HasSuffix(elemTrimmed, "*")
+	if isPtr {
+		elemTrimmed = strings.TrimSpace(strings.TrimSuffix(elemTrimmed, "*"))
+	}
+	resolvedBase := resolveTypeName(elemTrimmed)
+	if resolvedBase == "" {
+		resolvedBase = elemTrimmed
+	}
+	rebuilt := resolvedBase
+	if isPtr {
+		rebuilt += "*"
+	}
+	if hasConst {
+		rebuilt = "const " + rebuilt
+	}
+	containerPrefix := setContainerPrefix(ref.Name)
+	if containerPrefix == "" {
+		return "", "", false
+	}
+	return containerPrefix + "<" + rebuilt + ">", rebuilt, true
+}
+
+// setLikeCallExpr returns the C++ expression to pass `varName`
+// (a local of a set-like container type) to the callee, adapting to
+// how the callee declares the parameter. The local is always an
+// lvalue of the materialised container, so:
+//
+//   - `T*` (pointer-to-container, the writable out-param idiom):
+//     emit `&varName`. The callee mutates the set in place.
+//   - `T&&` (rvalue-ref by-value sink): emit `std::move(varName)`
+//     so move-only containers bind without falling back to a copy.
+//   - `T` (by-value): same as rvalue-ref — the move-into-parameter
+//     is always at least as cheap as a copy.
+//   - `const T&` / `T&` (lvalue ref): bind by name. Const-ref is the
+//     usual shape for read-only set-like inputs (e.g. labels in
+//     SimpleGraphElementLabel).
+//
+// The helper is library-agnostic: any set-like spelling that
+// `setLikeContainerInfo` accepts is handled the same way.
+func setLikeCallExpr(p apispec.Param, varName string) string {
+	if p.Type.IsPointer && !p.Type.IsRef {
+		return "&" + varName
+	}
+	qt := strings.TrimSpace(p.Type.QualType)
+	if strings.HasSuffix(qt, "&&") {
+		return "std::move(" + varName + ")"
+	}
+	if !p.Type.IsRef {
+		return "std::move(" + varName + ")"
+	}
+	return varName
+}
+
+// looksLikeSetTypeName reports whether name is a set-like container
+// per the std-library defaults plus `BridgeConfig.SetLikeTypePrefixes`.
+// Mirrors the prefix list parseMapType uses for sets (excluding
+// map prefixes).
+func looksLikeSetTypeName(name string) bool {
+	cleaned := strings.TrimPrefix(name, "const ")
+	cleaned = strings.TrimRight(cleaned, "* &")
+	cleaned = strings.TrimSpace(cleaned)
+	prefixes := []string{
+		"std::unordered_set<",
+		"unordered_set<",
+		"std::set<",
+		"set<",
+	}
+	for _, p := range bridgeConfig.SetLikeTypePrefixes {
+		prefixes = append(prefixes, p+"<")
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(cleaned, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// setContainerPrefix returns the C++ template prefix (without the
+// trailing `<`) for a set-like type spelling. Used to reconstruct the
+// container's local declaration after the element type has been
+// resolved.
+func setContainerPrefix(name string) string {
+	cleaned := strings.TrimPrefix(name, "const ")
+	cleaned = strings.TrimRight(cleaned, "* &")
+	cleaned = strings.TrimSpace(cleaned)
+	prefixes := []string{
+		"std::unordered_set",
+		"unordered_set",
+		"std::set",
+		"set",
+	}
+	prefixes = append(prefixes, bridgeConfig.SetLikeTypePrefixes...)
+	// Longest match first so `std::unordered_set` wins over `set`.
+	sort.SliceStable(prefixes, func(i, j int) bool {
+		return len(prefixes[i]) > len(prefixes[j])
+	})
+	for _, p := range prefixes {
+		if strings.HasPrefix(cleaned, p+"<") {
+			return p
+		}
+	}
+	return ""
+}
+
 func cppLocalType(ref apispec.TypeRef) string {
 	switch ref.Kind {
 	case apispec.TypePrimitive:
@@ -2220,6 +2479,12 @@ func cppLocalType(ref apispec.TypeRef) string {
 		}
 		return "std::string"
 	case apispec.TypeHandle:
+		// Set-like containers (e.g. `absl::flat_hash_set<const T*>`)
+		// declare the container as the local; the per-element wire
+		// reader inserts into it. See setLikeContainerInfo.
+		if container, _, ok := setLikeContainerInfo(ref); ok {
+			return container
+		}
 		return "uint64_t" // stored as pointer value in bridge
 	case apispec.TypeEnum:
 		return cppTypeName(ref)
@@ -2401,6 +2666,15 @@ func readExpr(ref apispec.TypeRef, varName string) string {
 		// shift here before casting to the C++ enum.
 		return fmt.Sprintf("%s = static_cast<%s>(reader.read_int32() - 1);", varName, cppTypeName(ref))
 	case apispec.TypeHandle:
+		// Set-like containers: each repeated wire entry contributes
+		// one element, so emit an `insert(...)` per entry rather
+		// than the single-handle assignment used for plain handles.
+		// See setLikeContainerInfo for the recognition rule.
+		if _, _, ok := setLikeContainerInfo(ref); ok {
+			elem, _, _ := parseMapType(ref.Name)
+			innerRef := typeRefFromTemplateArg(strings.TrimSpace(elem))
+			return readSetElementExpr(innerRef, varName)
+		}
 		return fmt.Sprintf("%s = read_handle_ptr(reader);", varName)
 	case apispec.TypeValue:
 		// View-type params (ValueViewTypes, e.g. absl::Span<const T>)
@@ -2476,7 +2750,14 @@ func readVectorElementExpr(inner apispec.TypeRef, varName string) string {
 	case apispec.TypeString:
 		return fmt.Sprintf("%s.push_back(reader.read_string());", varName)
 	case apispec.TypeHandle:
-		// Two cases for vector<Handle>:
+		// Three cases for vector<Handle>:
+		//   - unique_ptr<T> elements (std::vector<unique_ptr<T>>):
+		//     each wire entry transfers sole ownership of one heap
+		//     object. Construct a fresh unique_ptr<T> from the raw
+		//     handle and emplace_back via std::move so the vector
+		//     becomes the sole owner. Plain push_back of a
+		//     dereferenced unique_ptr* would not compile —
+		//     unique_ptr is move-only.
 		//   - Pointer elements (std::vector<Foo*> or const Foo*):
 		//     reinterpret the raw uint64 as the declared pointer
 		//     type and push_back directly.
@@ -2484,6 +2765,22 @@ func readVectorElementExpr(inner apispec.TypeRef, varName string) string {
 		//     as a handle but the vector holds it by value): we
 		//     receive a uint64 pointer from the Go side, dereference
 		//     it to copy-construct the element, then push_back.
+		if isUniquePointerType(inner.Name) || isUniquePointerType(inner.QualType) {
+			pointee := smartPointerInner(inner.QualType)
+			if pointee == "" {
+				pointee = smartPointerInner(inner.Name)
+			}
+			if pointee == "" {
+				return "/* vector<unique_ptr<T>>: pointee resolution failed */ reader.skip();"
+			}
+			// pointee carries any leading `const ` it picked up;
+			// keep it so the constructed unique_ptr matches the
+			// vector's declared element type.
+			return fmt.Sprintf(
+				"{ uint64_t _h = read_handle_ptr(reader); %s.emplace_back(reinterpret_cast<%s*>(_h)); }",
+				varName, pointee,
+			)
+		}
 		if inner.IsPointer {
 			return fmt.Sprintf("%s.push_back(reinterpret_cast<decltype(%s)::value_type>(read_handle_ptr(reader)));", varName, varName)
 		}
@@ -2512,17 +2809,95 @@ func readVectorElementExpr(inner apispec.TypeRef, varName string) string {
 	return "reader.skip();"
 }
 
-// vectorElementEmplaceBackExpr emits a C++ block that reads one
-// submessage into per-field locals and emplace_back's into `varName`
-// with the locals in field order. Use this for value classes that
-// have no public default constructor but expose a constructor that
-// takes their public fields positionally.
+// readSetElementExpr is the set-like sibling of
+// readVectorElementExpr. The proto schema emits `repeated <Elem>`
+// for any set-like container (configured via
+// BridgeConfig.SetLikeTypePrefixes — see parseMapType / handleMapType),
+// so each `case N:` invocation reads ONE element and inserts it into
+// the local container instead of push_back-ing.
 //
-// Handle fields are stored as uint64_t locals to keep the reader
-// assignment straightforward; the emplace_back arg-list casts them
-// back to the declared pointer type so the constructor picks the
-// right overload.
+// Behaviour mirrors the vector path element-by-element: primitives
+// and enums are read scalar-shaped, strings are read as std::string,
+// handle pointers are reinterpreted from the wire's uint64. The only
+// observable difference between vector and set emission is the
+// container API call (`push_back` vs `insert`).
+func readSetElementExpr(inner apispec.TypeRef, varName string) string {
+	switch inner.Kind {
+	case apispec.TypePrimitive:
+		cpp := cppPrimitiveType(inner.Name)
+		switch cpp {
+		case "bool":
+			return fmt.Sprintf("%s.insert(reader.read_bool());", varName)
+		case "float":
+			return fmt.Sprintf("%s.insert(reader.read_float());", varName)
+		case "double":
+			return fmt.Sprintf("%s.insert(reader.read_double());", varName)
+		case "int32_t":
+			return fmt.Sprintf("%s.insert(static_cast<%s>(reader.read_int32()));", varName, inner.Name)
+		case "uint32_t":
+			return fmt.Sprintf("%s.insert(static_cast<%s>(reader.read_uint32()));", varName, inner.Name)
+		case "int64_t":
+			return fmt.Sprintf("%s.insert(reader.read_int64());", varName)
+		case "uint64_t":
+			return fmt.Sprintf("%s.insert(reader.read_uint64());", varName)
+		}
+		return fmt.Sprintf("%s.insert(static_cast<%s>(reader.read_varint()));", varName, cpp)
+	case apispec.TypeEnum:
+		// cppTypeName for enums returns the bare api-spec name; the
+		// local declaration goes through setLikeContainerInfo which
+		// resolves it to the fully-qualified spelling. Resolving here
+		// keeps the cast in step with the local's actual type so the
+		// bridge's flat namespace context can find the enum.
+		enumName := cppTypeName(inner)
+		if resolved := resolveTypeName(enumName); resolved != "" {
+			enumName = resolved
+		}
+		return fmt.Sprintf("%s.insert(static_cast<%s>(reader.read_int32() - 1));", varName, enumName)
+	case apispec.TypeString:
+		return fmt.Sprintf("%s.insert(reader.read_string());", varName)
+	case apispec.TypeHandle:
+		// Pointer element: cast the wire handle back to the declared
+		// pointer type and insert it. value-by-handle elements
+		// (sets-of-T where T is a bridged handle) are vanishingly
+		// rare in real APIs (sets of value types require Hash + Eq);
+		// fall through to a skip + comment so the bridge still
+		// compiles even if such a shape ever shows up.
+		if inner.IsPointer {
+			return fmt.Sprintf("{ uint64_t _h = read_handle_ptr(reader); %s.insert(reinterpret_cast<decltype(%s)::value_type>(_h)); }", varName, varName)
+		}
+		return fmt.Sprintf("/* set element handle-by-value %s: not yet supported */ reader.skip();", inner.Name)
+	}
+	return "reader.skip();"
+}
+
+// vectorElementEmplaceBackExpr emits a C++ block that reads one
+// submessage into per-field locals and emplace_back's into `varName`.
+// Two emplace strategies are supported, picked from the class shape:
+//
+//   1. **All-fields ctor** — when the class has a non-default ctor
+//      whose param count equals its field count, the locals are
+//      forwarded positionally. Useful for value classes whose
+//      ctor mirrors the field list.
+//   2. **Best-match ctor + field-assign** — for `struct` types
+//      whose ctor takes a strict subset of public fields (e.g.
+//      `TVFSchemaColumn(name, type, is_pseudo_column)` over the
+//      6-field public layout), pick the ctor with the maximum
+//      number of name-matched fields, emplace with those, and
+//      assign every remaining public field via `.back().X = ...`.
+//
+// Without strategy 2 the generator emitted an emplace_back with
+// every field as a positional arg, which fails to compile when
+// the class has no matching ctor.
+//
+// Handle fields are stored as uint64_t locals so the reader
+// assignment stays straightforward; the casts are reapplied at
+// the call site.
 func vectorElementEmplaceBackExpr(c *apispec.Class, varName string) string {
+	// Pick the constructor we'll forward to. Prefer a ctor that
+	// matches every field; otherwise pick the ctor with the most
+	// name-matched fields.
+	ctorArgIdx, remainingFieldIdx := pickEmplaceCtor(c)
+
 	var b strings.Builder
 	b.WriteString("{\n")
 	b.WriteString("    ProtoReader _sub = reader.read_submessage();\n")
@@ -2546,23 +2921,153 @@ func vectorElementEmplaceBackExpr(c *apispec.Class, varName string) string {
 	b.WriteString("    }\n")
 	b.WriteString("    ")
 	fmt.Fprintf(&b, "%s.emplace_back(", varName)
-	for i, f := range c.Fields {
-		if i > 0 {
+	for n, idx := range ctorArgIdx {
+		if n > 0 {
 			b.WriteString(", ")
 		}
+		f := c.Fields[idx]
 		if f.Type.Kind == apispec.TypeHandle {
 			cpp := cppTypeName(f.Type) + "*"
 			if f.Type.IsConst {
 				cpp = "const " + cpp
 			}
-			fmt.Fprintf(&b, "reinterpret_cast<%s>(_f%d)", cpp, i)
+			fmt.Fprintf(&b, "reinterpret_cast<%s>(_f%d)", cpp, idx)
 		} else {
-			fmt.Fprintf(&b, "std::move(_f%d)", i)
+			fmt.Fprintf(&b, "std::move(_f%d)", idx)
 		}
 	}
 	b.WriteString(");\n")
+	for _, idx := range remainingFieldIdx {
+		f := c.Fields[idx]
+		b.WriteString("    ")
+		if f.Type.Kind == apispec.TypeHandle {
+			cpp := cppTypeName(f.Type) + "*"
+			if f.Type.IsConst {
+				cpp = "const " + cpp
+			}
+			fmt.Fprintf(&b, "%s.back().%s = reinterpret_cast<%s>(_f%d);\n", varName, f.Name, cpp, idx)
+		} else {
+			fmt.Fprintf(&b, "%s.back().%s = std::move(_f%d);\n", varName, f.Name, idx)
+		}
+	}
 	b.WriteString("}")
 	return b.String()
+}
+
+// pickEmplaceCtor returns the field indices that get passed to
+// emplace_back (in ctor-param order) plus the field indices that
+// must be assigned to `back().X` after construction. Strategy:
+//
+//   * If any non-default ctor's param count equals the field count,
+//     return all field indices in declaration order (the historical
+//     fast path — preserves behaviour for classes already aligned).
+//   * Else pick the ctor that name-matches the most fields. Order
+//     the matched indices to mirror the ctor's param sequence so
+//     `emplace_back(name, type, is_pseudo_column)` lines up. Any
+//     unmatched fields land in remainingFieldIdx for post-assign.
+//   * If no ctor exists or no fields match, fall back to "all
+//     fields, in declaration order" — same as the historical path,
+//     preserving behaviour for classes whose ctors weren't parsed.
+func pickEmplaceCtor(c *apispec.Class) (ctorArgIdx []int, remainingFieldIdx []int) {
+	if c == nil {
+		return nil, nil
+	}
+	allIdx := make([]int, len(c.Fields))
+	for i := range c.Fields {
+		allIdx[i] = i
+	}
+	defaultPath := func() ([]int, []int) {
+		return allIdx, nil
+	}
+
+	type ctorMatch struct {
+		matched []int // field indices in ctor-param order
+		missing []int // field indices not used by this ctor
+		score   int   // matched name count
+	}
+	var bestExact *ctorMatch
+	var bestPartial *ctorMatch
+	for _, m := range c.Methods {
+		if !m.IsConstructor {
+			continue
+		}
+		if m.Access != "" && m.Access != "public" {
+			continue
+		}
+		if len(m.Params) == 0 {
+			continue
+		}
+		used := make(map[int]bool)
+		match := ctorMatch{}
+		nameMatched := true
+		for _, p := range m.Params {
+			pn := normaliseCtorParamName(p.Name)
+			idx := -1
+			for fi, f := range c.Fields {
+				if used[fi] {
+					continue
+				}
+				if normaliseFieldName(f.Name) == pn {
+					idx = fi
+					break
+				}
+			}
+			if idx < 0 {
+				nameMatched = false
+				break
+			}
+			used[idx] = true
+			match.matched = append(match.matched, idx)
+			match.score++
+		}
+		if !nameMatched {
+			continue
+		}
+		for fi := range c.Fields {
+			if !used[fi] {
+				match.missing = append(match.missing, fi)
+			}
+		}
+		if len(match.matched) == len(c.Fields) && len(match.missing) == 0 {
+			bestExact = &match
+			break
+		}
+		if bestPartial == nil || match.score > bestPartial.score {
+			localCopy := match
+			bestPartial = &localCopy
+		}
+	}
+	if bestExact != nil {
+		return bestExact.matched, bestExact.missing
+	}
+	if bestPartial != nil && bestPartial.score > 0 {
+		return bestPartial.matched, bestPartial.missing
+	}
+	return defaultPath()
+}
+
+// normaliseCtorParamName strips trailing "_in" / "_arg" suffixes
+// commonly used in C++ ctor parameters
+// (`name_in`, `type_in`, …) so they line up with field names
+// (`name`, `type`, …).
+func normaliseCtorParamName(s string) string {
+	s = strings.TrimSpace(s)
+	for _, suf := range []string{"_in", "_arg", "Arg", "In"} {
+		if strings.HasSuffix(s, suf) && len(s) > len(suf) {
+			s = strings.TrimSuffix(s, suf)
+			break
+		}
+	}
+	return s
+}
+
+// normaliseFieldName trims a single trailing "_" some C++ code
+// uses to mark private members (`name_`) so it matches a ctor
+// parameter such as `name_in` after normalisation.
+func normaliseFieldName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "_")
+	return s
 }
 
 // readExprForSub is a tiny helper that emits read code operating on
@@ -2758,6 +3263,17 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 // a nested submessage at fieldNum. It looks the class up in valueClasses to
 // find its fields, then emits field-by-field writes into a sub ProtoWriter.
 func writeValueReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
+	// ValueViewTypes (e.g. `absl::Span<T>`) are non-owning views. The
+	// proto schema renders them as `repeated <Elem>` (see typeRefToProto's
+	// matchesValueViewType branch); the bridge response writer therefore
+	// has to iterate the view and emit one element per wire entry.
+	// Without this, getters that return a Span fall through to the
+	// "no fields found" TODO and silently return an empty result.
+	if matchesValueViewType(ref.QualType) {
+		if elem := extractTemplateArgFromQualType(ref.QualType); elem != "" {
+			return writeValueViewReturnExpr(elem, fieldNum, varName)
+		}
+	}
 	c := lookupValueClass(ref.Name)
 	if c == nil || len(c.Fields) == 0 {
 		return fmt.Sprintf("// TODO: serialize value %s (no fields found)", ref.Name)
@@ -2777,6 +3293,108 @@ func writeValueReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) str
 	}
 	fmt.Fprintf(&sb, "    _pw.write_submessage(%d, _subw);\n    free(_subw.data_);\n}", fieldNum)
 	return sb.String()
+}
+
+// writeValueViewReturnExpr emits a C++ for-each loop that writes
+// every element of a non-owning view (e.g. `absl::Span<const T>`) as
+// a separate wire entry at fieldNum. The dispatch by element kind
+// mirrors writeReturnExpr / writeVectorReturnExpr: primitive and
+// string elements use scalar write helpers; class-handle elements
+// emit `write_handle` per element.
+//
+// The helper is library-agnostic — any type registered in
+// `BridgeConfig.ValueViewTypes` is matched the same way; only the
+// inner element type drives the per-element emission.
+func writeValueViewReturnExpr(elem string, fieldNum int, varName string) string {
+	rawWithPtr := strings.TrimSpace(elem)
+	innerIsPointer := strings.HasSuffix(rawWithPtr, "*")
+	raw := rawWithPtr
+	if innerIsPointer {
+		raw = strings.TrimSpace(strings.TrimSuffix(raw, "*"))
+	}
+	raw = strings.TrimPrefix(raw, "const ")
+	raw = strings.TrimSpace(raw)
+
+	// String element (the common case for path-like APIs).
+	if raw == "std::string" || raw == "string" || raw == "std::string_view" {
+		var sb strings.Builder
+		sb.WriteString("for (const auto& _e : ")
+		sb.WriteString(varName)
+		sb.WriteString(") {\n        ")
+		fmt.Fprintf(&sb, "_pw.write_string(%d, std::string(_e));\n    }", fieldNum)
+		return sb.String()
+	}
+
+	// Primitive element: route through cppPrimitiveType to find the
+	// matching ProtoWriter scalar write.
+	if pt := tryPrimitiveToPbType(raw); pt != "" {
+		write := primitiveProtoWriterCall(raw, fieldNum, "_e")
+		if write != "" {
+			var sb strings.Builder
+			sb.WriteString("for (const auto& _e : ")
+			sb.WriteString(varName)
+			sb.WriteString(") {\n        ")
+			sb.WriteString(write)
+			sb.WriteString("\n    }")
+			return sb.String()
+		}
+	}
+
+	// Class element: handed back to Go as a borrowed uint64 handle
+	// pointing at the live C++ storage. The view is non-owning, so
+	// the underlying objects are kept alive by whatever owns the
+	// view's source — the Go caller MUST release the handles before
+	// that source goes out of scope.
+	//
+	//   - View<const T*> → `_e` is itself a pointer; cast directly.
+	//   - View<const T>  → `_e` is a const reference; take its
+	//     address to recover a pointer-to-T.
+	resolved := resolveTypeName(raw)
+	if resolved == "" {
+		resolved = raw
+	}
+	if classSourceFiles != nil {
+		if _, known := classSourceFiles[resolved]; known {
+			handleExpr := "_e"
+			if !innerIsPointer {
+				handleExpr = "&_e"
+			}
+			var sb strings.Builder
+			sb.WriteString("for (const auto& _e : ")
+			sb.WriteString(varName)
+			sb.WriteString(") {\n        ")
+			fmt.Fprintf(&sb, "_pw.write_handle(%d, reinterpret_cast<uint64_t>(%s));\n    }", fieldNum, handleExpr)
+			return sb.String()
+		}
+	}
+
+	return fmt.Sprintf("// TODO: serialize view-of-%s (unrecognised element kind)", elem)
+}
+
+// primitiveProtoWriterCall returns the per-element ProtoWriter scalar
+// write for a known primitive name, or "" when the name is not a
+// recognised primitive. Mirrors readVectorElementExpr's primitive
+// dispatch in reverse — kept private because the bridge writer is
+// the only consumer.
+func primitiveProtoWriterCall(primitiveName string, fieldNum int, expr string) string {
+	cpp := cppPrimitiveType(primitiveName)
+	switch cpp {
+	case "bool":
+		return fmt.Sprintf("_pw.write_bool(%d, %s);", fieldNum, expr)
+	case "float":
+		return fmt.Sprintf("_pw.write_float(%d, %s);", fieldNum, expr)
+	case "double":
+		return fmt.Sprintf("_pw.write_double(%d, %s);", fieldNum, expr)
+	case "int32_t":
+		return fmt.Sprintf("_pw.write_int32(%d, %s);", fieldNum, expr)
+	case "uint32_t":
+		return fmt.Sprintf("_pw.write_uint32(%d, %s);", fieldNum, expr)
+	case "int64_t":
+		return fmt.Sprintf("_pw.write_int64(%d, %s);", fieldNum, expr)
+	case "uint64_t":
+		return fmt.Sprintf("_pw.write_uint64(%d, %s);", fieldNum, expr)
+	}
+	return ""
 }
 
 // writeValueReturnExprForSub is a variant that writes fields directly into a
@@ -2868,6 +3486,22 @@ func matchErrorType(baseName string) string {
 // external types list from BridgeConfig. Returns true if the type
 // (after stripping qualifiers) matches any configured external type,
 // either exactly or as a template prefix (e.g., "Foo<" matches "Foo<Bar>").
+// isIncludedExternalClass reports whether qualName is opted into
+// bridge generation despite living outside the project source via
+// `bridge.IncludeExternalClasses` in wasmify.json.
+func isIncludedExternalClass(qualName string) bool {
+	q := strings.TrimSpace(qualName)
+	if q == "" {
+		return false
+	}
+	for _, c := range bridgeConfig.IncludeExternalClasses {
+		if c == q {
+			return true
+		}
+	}
+	return false
+}
+
 func isAllowedExternalType(name string) bool {
 	n := strings.TrimSpace(name)
 	n = strings.TrimPrefix(n, "const ")
@@ -2975,6 +3609,34 @@ func isSmartPointerType(qualType string) bool {
 		strings.HasPrefix(qt, "unique_ptr<") ||
 		strings.HasPrefix(qt, "std::shared_ptr<") ||
 		strings.HasPrefix(qt, "shared_ptr<")
+}
+
+// isUniquePointerType is the ownership-transfer-only variant of
+// isSmartPointerType. It matches only the `std::unique_ptr<...>`
+// spellings (with or without `const` / `std::` prefix), and is the
+// correct check for any code path that needs to recognise an
+// "owned-by-caller, exclusive ownership" handoff — most prominently
+// factory methods that produce a freshly-allocated object via an
+// out-parameter (`Status f(args..., std::unique_ptr<T>*)`).
+//
+// `std::shared_ptr` is intentionally excluded: it represents shared
+// ownership rather than transfer of sole ownership, and the bridge's
+// release-and-emit-handle path (`out.release()` then write the raw
+// pointer to the response) is only correct under exclusive ownership.
+//
+// The split between this and `isSmartPointerType` is the
+// representation-level expression of what is actually a semantic
+// distinction in the C++ standard: `unique_ptr` and `shared_ptr` are
+// different smart pointers with different ownership rules, and the
+// bridge has to handle them differently.
+func isUniquePointerType(qualType string) bool {
+	if qualType == "" {
+		return false
+	}
+	qt := strings.TrimSpace(qualType)
+	qt = strings.TrimPrefix(qt, "const ")
+	return strings.HasPrefix(qt, "std::unique_ptr<") ||
+		strings.HasPrefix(qt, "unique_ptr<")
 }
 
 // smartPointerInner returns the inner T of a std::unique_ptr<T> or
@@ -3112,11 +3774,17 @@ func writeFieldExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 		if strings.Contains(qt, "shared_ptr") {
 			return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(%s.get()));", fieldNum, varName)
 		}
-		// T** output: local is declared as T* pointer and the callee
-		// writes the pointer value. Return the pointer directly.
+		// T** / T*& output: local is declared as T* pointer and the
+		// callee writes the pointer value (either via `*ptr = ...`
+		// for `T**` or `ref = ...` for `T*&`). Either way the local
+		// holds the produced pointer when the call returns; emit it
+		// directly to the response.
 		stripped := strings.TrimSuffix(strings.TrimSpace(qt), "const")
 		stripped = strings.TrimSpace(stripped)
 		if strings.HasSuffix(stripped, "**") {
+			return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(%s));", fieldNum, varName)
+		}
+		if isReferenceToPointerHandle(ref) {
 			return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(%s));", fieldNum, varName)
 		}
 		// Output params: check if the local was declared as a pointer
@@ -3168,6 +3836,24 @@ func writeServiceMethodIDs(b *strings.Builder, freeFunctions []apispec.Function,
 		fmt.Fprintf(b, "static const int32_t SERVICE_%s = %d;\n", svcName, serviceID)
 		methodID := 0
 		methods := filterBridgeMethods(disambiguateMethodNames(c.Methods))
+		// Track every constant suffix we've emitted on this service so
+		// late-arriving methods that would alias an earlier constant get
+		// a numeric tail appended, mirroring the per-service uniqueness
+		// proto.go enforces on RPC names. Without this guard a class
+		// that defines both a constructor and a regular method named
+		// `New` (e.g. protobuf-generated message subclasses with
+		// `static T* New(Arena*)`) emits two `METHOD_<X>_NEW` constants
+		// at the top of the bridge translation unit and the C++ compile
+		// fails with a redefinition error.
+		usedConstSuffix := make(map[string]bool)
+		uniqueConstSuffix := func(suffix string) string {
+			candidate := suffix
+			for i := 2; usedConstSuffix[candidate]; i++ {
+				candidate = fmt.Sprintf("%s_%d", suffix, i)
+			}
+			usedConstSuffix[candidate] = true
+			return candidate
+		}
 		// Constructors first. Abstract classes skip constructors.
 		ctorCount := 0
 		for _, m := range methods {
@@ -3182,6 +3868,7 @@ func writeServiceMethodIDs(b *strings.Builder, freeFunctions []apispec.Function,
 			if ctorCount > 1 {
 				mName = fmt.Sprintf("NEW%d", ctorCount)
 			}
+			mName = uniqueConstSuffix(mName)
 			fmt.Fprintf(b, "static const int32_t METHOD_%s_%s = %d;\n", svcName, mName, methodID)
 			methodID++
 		}
@@ -3196,6 +3883,7 @@ func writeServiceMethodIDs(b *strings.Builder, freeFunctions []apispec.Function,
 				continue
 			}
 			mName := fmt.Sprintf("FACTORY_%d_%s", factoryIdx, toMethodConstName(rpcName))
+			mName = uniqueConstSuffix(mName)
 			fmt.Fprintf(b, "static const int32_t METHOD_%s_%s = %d;\n", svcName, mName, methodID)
 			methodID++
 			factoryIdx++
@@ -3209,12 +3897,12 @@ func writeServiceMethodIDs(b *strings.Builder, freeFunctions []apispec.Function,
 			if rpcName == "" {
 				continue
 			}
-			mName := toMethodConstName(rpcName)
+			mName := uniqueConstSuffix(toMethodConstName(rpcName))
 			fmt.Fprintf(b, "static const int32_t METHOD_%s_%s = %d;\n", svcName, mName, methodID)
 			methodID++
 		}
 		for _, f := range filterBridgeFields(c.Fields) {
-			gName := "GET_" + strings.ToUpper(toSnakeCase(f.Name))
+			gName := uniqueConstSuffix("GET_" + strings.ToUpper(toSnakeCase(f.Name)))
 			fmt.Fprintf(b, "static const int32_t METHOD_%s_%s = %d;\n", svcName, gName, methodID)
 			methodID++
 		}
@@ -3223,8 +3911,20 @@ func writeServiceMethodIDs(b *strings.Builder, freeFunctions []apispec.Function,
 		// conversion without a wasm round-trip. See CLAUDE.md:
 		// "do not emit Downcast APIs".
 		if isCallbackCandidateForBridge(c) {
-			fmt.Fprintf(b, "static const int32_t METHOD_%s_FROM_CALLBACK = %d;\n", svcName, methodID)
-			methodID++
+			ctorVariants := collectTrampolineCtors(c)
+			variantCount := len(ctorVariants)
+			if variantCount == 0 {
+				variantCount = 1
+			}
+			for i := 0; i < variantCount; i++ {
+				name := "FROM_CALLBACK"
+				if i > 0 {
+					name = fmt.Sprintf("FROM_CALLBACK%d", i+1)
+				}
+				name = uniqueConstSuffix(name)
+				fmt.Fprintf(b, "static const int32_t METHOD_%s_%s = %d;\n", svcName, name, methodID)
+				methodID++
+			}
 		}
 		// Emit the Free/release slot only when proto.go emits the RPC
 		// (matches the c.HasPublicDtor check there). For factory-owned
@@ -3279,32 +3979,127 @@ func writeCallbackTrampolines(b *strings.Builder, handleClasses map[string]*apis
 // lives in bridge.go. Walks ALL pure virtuals (not filterBridgeMethods)
 // because the trampoline must override every one to be instantiable.
 //
-// Exclusions:
-//   - Non-abstract classes.
-//   - Classes whose immediate base has no default constructor (the
-//     trampoline's initializer list can't invoke a non-default parent
-//     ctor without knowing the right arguments).
+// Two paths produce a callback service:
+//
+//  1. **Abstract classes** are picked up automatically. C++ refuses to
+//     instantiate a class with unimplemented pure virtuals, so the
+//     author has signalled "must be subclassed" at the language level.
+//     wasmify mirrors that signal one-for-one.
+//  2. **Concrete classes opt in** via `bridge.CallbackClasses` in
+//     `wasmify.json`. C++ has no language-level way to say "this
+//     concrete class is a customisation hook"; the same syntactic
+//     shape (concrete + virtuals) is used for both true subclass
+//     targets like `TableValuedFunction` and pure data carriers like
+//     every concrete `AST*` / `Resolved*` node. Auto-picking every
+//     concrete with virtuals would balloon the generated surface, so
+//     the user names the small set that actually needs subclassing.
+//
+// See `docs/callback-services.md` for the full design rationale,
+// including why naming-based heuristics are not used.
+//
+// Exclusions in either path:
+//   - Classes whose immediate base has no default constructor are
+//     excluded ONLY when no constructor-forwarding trampoline can be
+//     emitted (the generator forwards base ctor args automatically;
+//     this is not a user-tunable knob).
 //   - Classes where any pure-virtual has a signature the trampoline
 //     can't emit a valid C++ override declaration for — e.g. nested
 //     types from shortened clang spellings (`api::VisitResult`), or
 //     names that resolveTypeName can't map to a known class. Emitting
 //     broken overrides pollutes the whole api_bridge.cc compile.
 func isCallbackCandidateForBridge(c *apispec.Class) bool {
-	if !c.IsAbstract {
+	// Path A — C++-abstract classes are auto-eligible. The author
+	// has language-level forced subclassing by leaving at least one
+	// inherited pure virtual unimplemented; wasmify mirrors that
+	// signal one-for-one. See docs/callback-services.md for the rule
+	// in full.
+	if c.IsAbstract {
+		// Abstract classes whose immediate base lacks an accessible
+		// default ctor are intentionally NOT auto-callback-eligible
+		// here: the explicit opt-in path (CallbackClasses below)
+		// generates forwarding ctors and is the supported way to
+		// callback-enable such classes. Auto-enabling them would
+		// also bring in any inherited `final` virtuals from
+		// partially-implemented bases, which the apispec parser
+		// does not currently flag as final and which would silently
+		// produce illegal `override` declarations on the trampoline.
+		if classNoDefaultCtor != nil && classNoDefaultCtor[c.QualName] {
+			return isCallbackOptIn(c.QualName) && hasOverridableForOptIn(c)
+		}
+		// Every pure virtual must be declarable (otherwise the
+		// trampoline can't satisfy the vtable and the subclass stays
+		// abstract). Non-pure virtuals can be skipped on a per-method
+		// basis in the override set — the base class impl still runs
+		// for those.
+		pure := collectInheritedPureVirtuals(c)
+		if len(pure) == 0 {
+			return false
+		}
+		for _, m := range pure {
+			if !trampolineSignatureDeclarable(&m) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Path B — concrete classes opt in via wasmify.json's
+	// `bridge.CallbackClasses`. Concrete + virtuals is C++'s shape
+	// for both "customisation hook with default impl" (e.g.
+	// TableValuedFunction.Resolve) and "data carrier with visitor
+	// dispatch" (every concrete AST/Resolved node), and the
+	// generator can't tell them apart structurally.
+	if !isCallbackOptIn(c.QualName) {
 		return false
 	}
-	if classNoDefaultCtor != nil && classNoDefaultCtor[c.QualName] {
+	overridable := collectInheritedOverridableVirtuals(c)
+	if len(overridable) == 0 {
 		return false
 	}
-	// Every pure virtual must be declarable (otherwise the trampoline
-	// can't satisfy the vtable and the subclass stays abstract).
-	// Non-pure virtuals can be skipped on a per-method basis in the
-	// override set — the base class impl still runs for those.
-	pure := collectInheritedPureVirtuals(c)
-	if len(pure) == 0 {
+	// Pure virtuals (rare on concrete classes — usually only when
+	// inherited from a partially-implemented abstract base) must
+	// remain declarable for the same vtable-satisfaction reason as
+	// path A.
+	for _, m := range overridable {
+		if !m.IsPureVirtual {
+			continue
+		}
+		if !trampolineSignatureDeclarable(&m) {
+			return false
+		}
+	}
+	return true
+}
+
+// isCallbackOptIn reports whether qualName appears in
+// `bridge.CallbackClasses`. Concrete classes need this opt-in to
+// become callback candidates (see isCallbackCandidateForBridge for
+// the rationale).
+func isCallbackOptIn(qualName string) bool {
+	if qualName == "" {
 		return false
 	}
-	for _, m := range pure {
+	for _, n := range bridgeConfig.CallbackClasses {
+		if n == qualName {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOverridableForOptIn validates that an opt-in class has at least
+// one virtual method we can usefully override, and that any
+// inherited pure virtuals can be declared. Same per-method
+// declarability check as the auto-abstract path uses.
+func hasOverridableForOptIn(c *apispec.Class) bool {
+	overridable := collectInheritedOverridableVirtuals(c)
+	if len(overridable) == 0 {
+		return false
+	}
+	for _, m := range overridable {
+		if !m.IsPureVirtual {
+			continue
+		}
 		if !trampolineSignatureDeclarable(&m) {
 			return false
 		}
@@ -3431,6 +4226,17 @@ func trampolineTypeDeclarable(t apispec.TypeRef) bool {
 	if isViewOfStringType(t) {
 		return true
 	}
+	if inner, ok := statusOrInnerType(t); ok {
+		// `absl::StatusOr<T>` is declarable when T is a known
+		// handle-class. The override return type is preserved
+		// verbatim (with T resolved to its fully-qualified form)
+		// so the trampoline matches the base vtable slot.
+		resolved := resolveTypeName(strings.TrimSpace(inner))
+		if resolved == "" || (resolved == inner && !strings.Contains(resolved, "::")) {
+			return false
+		}
+		return true
+	}
 	if isOutputPointerHandle(t) {
 		// T** output params are declarable — we preserve qual_type and
 		// skip decoding them into the trampoline body (the Go adapter
@@ -3471,9 +4277,18 @@ func trampolineTypeDeclarable(t apispec.TypeRef) bool {
 		}
 		return true
 	case apispec.TypeVector:
-		// Vectors in callback declarations surface through qual_type;
-		// unsupported in this iteration.
-		return false
+		// `const std::vector<T>&` and `std::vector<T>` are declarable
+		// when the element type is itself declarable. Mutable vector
+		// references (`std::vector<T>&`) are output-shaped and would
+		// need a different marshalling story; we limit declarability
+		// to the read-only forms.
+		if t.Inner == nil {
+			return false
+		}
+		if t.IsRef && !t.IsConst {
+			return false
+		}
+		return trampolineTypeDeclarable(*t.Inner)
 	}
 	return false
 }
@@ -3485,10 +4300,30 @@ func writeCallbackTrampoline(b *strings.Builder, c *apispec.Class) {
 	// any non-pure virtuals whose signature the trampoline can marshal.
 	// Non-pure virtuals we skip keep their base class impl.
 	methods := collectTrampolineMethods(c)
+	ctors := collectTrampolineCtors(c)
 
 	fmt.Fprintf(b, "class %s : public %s {\n", trampolineName, cppType)
 	b.WriteString("public:\n")
-	fmt.Fprintf(b, "    explicit %s(int32_t callback_id) : _callback_id(callback_id) {}\n", trampolineName)
+
+	if len(ctors) == 0 {
+		// Default-ctor path: the base either declares an accessible
+		// default ctor (typical for abstract classes like Catalog,
+		// Logger, etc.) or its implicit default ctor is reachable.
+		// The trampoline only needs a callback_id; everything else
+		// comes from the base's default initialisation.
+		fmt.Fprintf(b, "    explicit %s(int32_t callback_id) : _callback_id(callback_id) {}\n", trampolineName)
+	} else {
+		// Forwarding-ctor path: one trampoline ctor per base ctor.
+		// Each trampoline ctor takes the same arguments as the base
+		// plus a trailing callback_id, then forwards via the
+		// initializer list. This is what lets concrete classes whose
+		// only constructors take arguments (e.g. TableValuedFunction)
+		// be subclassed from Go without the bridge ever calling a
+		// non-existent default ctor.
+		for _, ctor := range ctors {
+			writeTrampolineCtor(b, trampolineName, c.QualName, ctor)
+		}
+	}
 	fmt.Fprintf(b, "    ~%s() override = default;\n", trampolineName)
 
 	for i := range methods {
@@ -3498,6 +4333,99 @@ func writeCallbackTrampoline(b *strings.Builder, c *apispec.Class) {
 	b.WriteString("private:\n")
 	b.WriteString("    int32_t _callback_id;\n")
 	b.WriteString("};\n\n")
+}
+
+// collectTrampolineCtors returns every public constructor of c whose
+// every parameter has a usable type. Used by writeCallbackTrampoline
+// to emit one trampoline ctor variant per base ctor variant. If the
+// class has only an implicit default ctor (no IsConstructor entries
+// in api-spec), the returned slice is empty and the caller emits the
+// no-arg trampoline ctor that delegates to the base's default ctor.
+func collectTrampolineCtors(c *apispec.Class) []apispec.Function {
+	var result []apispec.Function
+	for _, m := range disambiguateMethodNames(c.Methods) {
+		if !m.IsConstructor {
+			continue
+		}
+		if m.Access != "" && m.Access != "public" {
+			continue
+		}
+		if m.IsRvalueRef {
+			continue
+		}
+		usable := true
+		for _, p := range m.Params {
+			if !isUsableType(p.Type) || !isInstantiableType(p.Type) {
+				usable = false
+				break
+			}
+		}
+		if !usable {
+			continue
+		}
+		result = append(result, m)
+	}
+	return result
+}
+
+// writeTrampolineCtor emits one forwarding constructor for the
+// trampoline subclass. The signature is `(<base ctor args>, int32_t
+// callback_id)`; the initializer list forwards each base-ctor arg by
+// name and stores callback_id.
+//
+// Argument types are taken straight from the base ctor's qual_type
+// (after fully qualifying class names so the bridge's flat namespace
+// resolves them). Each argument is stored on the trampoline as-is —
+// no marshalling is performed at construction time. The wasm
+// dispatch (`writeHandleDispatch`'s FromCallback emit) is responsible
+// for reading the args off the wire and passing them to this ctor.
+func writeTrampolineCtor(b *strings.Builder, trampolineName, baseName string, ctor apispec.Function) {
+	var declParts []string
+	var fwdParts []string
+	for i, p := range ctor.Params {
+		name := paramVarName(p, i)
+		ty := trampolineParamTypeDecl(p.Type)
+		declParts = append(declParts, fmt.Sprintf("%s %s", ty, name))
+		fwdParts = append(fwdParts, fmt.Sprintf("std::move(%s)", name))
+	}
+	declParts = append(declParts, "int32_t callback_id")
+
+	fmt.Fprintf(b,
+		"    %s(%s) : %s(%s), _callback_id(callback_id) {}\n",
+		trampolineName,
+		strings.Join(declParts, ", "),
+		baseName,
+		strings.Join(fwdParts, ", "),
+	)
+}
+
+// trampolineParamTypeDecl returns the C++ type declaration string for
+// a base-ctor parameter when used in the trampoline's forwarding
+// ctor signature. Uses the qual_type verbatim where it's already
+// fully qualified, otherwise resolves bare class names through
+// classQualNames so the bridge's flat namespace context can find
+// them.
+func trampolineParamTypeDecl(t apispec.TypeRef) string {
+	qt := strings.TrimSpace(t.QualType)
+	if qt == "" {
+		qt = t.Name
+	}
+	// Strip rvalue-ref / lvalue-ref / pointer markers, qualify the
+	// inner class, then put them back. We don't try to fully parse
+	// the qual_type; we just pull the bare class identifier off the
+	// front and resolve it.
+	stripped := stripCppTypeQualifiers(qt)
+	resolved := resolveTypeName(stripped)
+	if resolved == "" {
+		resolved = stripped
+	}
+	if resolved == stripped {
+		return qt
+	}
+	// Replace the first occurrence of the bare name with the
+	// resolved form. This handles both `T`, `const T&`, `T*`, etc.
+	// without needing to know the exact decoration.
+	return strings.Replace(qt, stripped, resolved, 1)
 }
 
 // writeTrampolineMethod emits the override for a single pure-virtual
@@ -3515,7 +4443,15 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 		constQual = " const"
 	}
 
-	fmt.Fprintf(b, "    %s %s(%s)%s override {\n", retType, m.Name, paramDecls, constQual)
+	// `m.Name` may be the disambiguated proto-side name (e.g.
+	// `Accept2` for an overloaded virtual), but the C++ override
+	// must match the base class's actual method name to satisfy the
+	// vtable. Use OriginalName when present.
+	cppName := m.Name
+	if m.OriginalName != "" {
+		cppName = m.OriginalName
+	}
+	fmt.Fprintf(b, "    %s %s(%s)%s override {\n", retType, cppName, paramDecls, constQual)
 
 	// Check if every signature piece is supported; if not, abort.
 	if !trampolineSignatureSupported(m) {
@@ -3527,11 +4463,12 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 		return
 	}
 
-	// Serialize inputs into a ProtoWriter. Output pointer params are
-	// skipped here and captured on the response side instead.
+	// Serialize inputs into a ProtoWriter. Output handle params
+	// (T** or smart-pointer-by-pointer) are skipped here and
+	// captured on the response side instead.
 	b.WriteString("        ProtoWriter _pw;\n")
 	for i, p := range m.Params {
-		if isOutputPointerHandle(p.Type) {
+		if isCallbackOutputParam(p.Type) {
 			continue
 		}
 		fieldNum := i + 1
@@ -3543,11 +4480,11 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 	b.WriteString("        uintptr_t _resp_ptr = static_cast<uintptr_t>(static_cast<uint64_t>(_rc) >> 32);\n")
 	b.WriteString("        int32_t _resp_len = static_cast<int32_t>(_rc & 0xFFFFFFFFu);\n")
 
-	// If the method has output pointer params, decode them from the
+	// If the method has output handle params, decode them from the
 	// response and write through.
 	hasOutputPtrs := false
 	for _, p := range m.Params {
-		if isOutputPointerHandle(p.Type) {
+		if isCallbackOutputParam(p.Type) {
 			hasOutputPtrs = true
 			break
 		}
@@ -3559,28 +4496,87 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 		b.WriteString("            while (_pr.next()) {\n")
 		b.WriteString("                switch (_pr.field()) {\n")
 		for i, p := range m.Params {
-			if !isOutputPointerHandle(p.Type) {
+			if !isCallbackOutputParam(p.Type) {
 				continue
 			}
 			fieldNum := i + 1
 			varName := paramVarName(p, i)
-			// Inner type: strip both pointers and const from qual_type,
-			// resolve, then re-add const+*.
 			qt := strings.TrimSpace(p.Type.QualType)
-			stripped := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(qt, "*")), "*"))
-			hasConst := strings.HasPrefix(stripped, "const ")
-			stripped = strings.TrimSpace(strings.TrimPrefix(stripped, "const "))
-			resolved := resolveTypeName(stripped)
-			if resolved == "" {
-				resolved = stripped
-			}
-			ptrType := resolved + "*"
-			if hasConst {
-				ptrType = "const " + ptrType
-			}
+			// Two output shapes:
+			//   - `T**` / `const T**`: writes a raw pointer.
+			//   - `unique_ptr<T>*` / `shared_ptr<T>*`: writes a fresh
+			//     smart-pointer wrapping the raw pointer.
+			peeled := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+			peeled = strings.TrimPrefix(peeled, "const ")
+			peeled = strings.TrimSpace(peeled)
+			isSmart := isSmartPointerType(peeled)
+
 			fmt.Fprintf(b, "                    case %d: {\n", fieldNum)
+			// Container output (set<T*>& / vector<T*>&): each
+			// repeated wire entry is a single handle that we
+			// insert into the caller-allocated container.
+			if isCallbackOutputContainer(p.Type) {
+				inner := callbackOutputInnerName(p.Type)
+				resolvedInner := resolveTypeName(inner)
+				if resolvedInner == "" {
+					resolvedInner = inner
+				}
+				// Element pointer type: const T* by default
+				// (read-only borrowed view); flip when the
+				// container's parameterised element drops const.
+				elemPtr := "const " + resolvedInner + "*"
+				if t := p.Type.Inner; t != nil && !t.IsConst {
+					elemPtr = resolvedInner + "*"
+				}
+				b.WriteString("                        uint64_t _p = read_handle_ptr(_pr);\n")
+				inserter := "insert"
+				if p.Type.Kind == apispec.TypeVector {
+					inserter = "push_back"
+				}
+				fmt.Fprintf(b, "                        %s.%s(reinterpret_cast<%s>(_p));\n", varName, inserter, elemPtr)
+				b.WriteString("                        break;\n")
+				b.WriteString("                    }\n")
+				continue
+			}
 			b.WriteString("                        uint64_t _p = read_handle_ptr(_pr);\n")
-			fmt.Fprintf(b, "                        if (%s != nullptr) *%s = reinterpret_cast<%s>(_p);\n", varName, varName, ptrType)
+			if isSmart {
+				inner := smartPointerInner(peeled)
+				inner = strings.TrimPrefix(inner, "const ")
+				inner = strings.TrimSpace(inner)
+				resolvedInner := resolveTypeName(inner)
+				if resolvedInner == "" {
+					resolvedInner = inner
+				}
+				wrapperPrefix := peeled
+				if open := strings.Index(peeled, "<"); open >= 0 {
+					wrapperPrefix = peeled[:open]
+				}
+				fmt.Fprintf(b, "                        if (%s != nullptr) *%s = %s<%s>(reinterpret_cast<%s*>(_p));\n",
+					varName, varName, wrapperPrefix, resolvedInner, resolvedInner)
+			} else {
+				// `T**` or `T*&` shape: strip the trailing `&` (if any),
+				// then both stars, plus one optional const. The two
+				// shapes differ only in the LHS of the assignment:
+				// `T**` is a plain pointer (deref to write), `T*&` is
+				// a reference (assign directly).
+				peeled := strings.TrimSpace(strings.TrimSuffix(qt, "&"))
+				stripped := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(peeled, "*")), "*"))
+				hasConst := strings.HasPrefix(stripped, "const ")
+				stripped = strings.TrimSpace(strings.TrimPrefix(stripped, "const "))
+				resolved := resolveTypeName(stripped)
+				if resolved == "" {
+					resolved = stripped
+				}
+				ptrType := resolved + "*"
+				if hasConst {
+					ptrType = "const " + ptrType
+				}
+				if isReferenceToPointerHandle(p.Type) {
+					fmt.Fprintf(b, "                        %s = reinterpret_cast<%s>(_p);\n", varName, ptrType)
+				} else {
+					fmt.Fprintf(b, "                        if (%s != nullptr) *%s = reinterpret_cast<%s>(_p);\n", varName, varName, ptrType)
+				}
+			}
 			b.WriteString("                        break;\n")
 			b.WriteString("                    }\n")
 		}
@@ -3618,9 +4614,103 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 		// the Go side, so the user's Go impl can simply `return err`.
 		writeErrorOnlyTrampolineRead(b, m.ReturnType, "        ")
 	default:
-		writeTrampolineResultRead(b, m.ReturnType, "        ")
+		if _, ok := statusOrInnerType(m.ReturnType); ok {
+			writeStatusOrTrampolineRead(b, m.ReturnType, "        ")
+		} else {
+			writeTrampolineResultRead(b, m.ReturnType, "        ")
+		}
 	}
 	b.WriteString("    }\n")
+}
+
+// writeStatusOrTrampolineRead emits the C++ for a trampoline override
+// whose return is a Status-or-value wrapper such as
+// `absl::StatusOr<T>`. The wire format mirrors the proto schema
+// generated by writeCallbackService: a single `<T> result = 1` field
+// (a handle submessage) plus the standard `string error = 15`. The
+// reconstruction is:
+//
+//   - Drain the response into `_err_msg` (field 15) and
+//     `_result_handle` (field 1).
+//   - If the error message is non-empty, return the configured
+//     `ErrorExpr` for the wrapper type — this implicitly converts
+//     to the wrapper (e.g. `absl::InternalError(...)` ⇢
+//     `absl::StatusOr<T>`).
+//   - If the handle is zero, surface a synthetic
+//     "callback returned no value" error so the caller sees a clear
+//     failure rather than a use-after-free.
+//   - Otherwise dereference the handle and copy-return the value.
+//
+// Ownership: the handle was produced by the Go callback adapter,
+// which takes the rawPtr of a Go-side wrapper. The C++ side does
+// NOT take ownership — it copy-constructs the value and returns
+// the copy. The Go-side wrapper's GC finalizer continues to manage
+// the original storage.
+func writeStatusOrTrampolineRead(b *strings.Builder, ret apispec.TypeRef, indent string) {
+	inner, _ := statusOrInnerType(ret)
+	resolvedInner := resolveTypeName(strings.TrimSpace(inner))
+	if resolvedInner == "" {
+		resolvedInner = inner
+	}
+	wrapperName := matchErrorType(strings.TrimSpace(ret.QualType))
+	_ = wrapperName // recognised already, kept for clarity
+	wrapperBase := matchErrorTypeBase(ret)
+	spec, hasSpec := bridgeConfig.ErrorReconstruct[wrapperBase]
+
+	fmt.Fprintf(b, "%sstd::string _err_msg;\n", indent)
+	fmt.Fprintf(b, "%suint64_t _result_handle = 0;\n", indent)
+	fmt.Fprintf(b, "%sif (_resp_ptr != 0) {\n", indent)
+	fmt.Fprintf(b, "%s    ProtoReader _pr(reinterpret_cast<const void*>(_resp_ptr), _resp_len);\n", indent)
+	fmt.Fprintf(b, "%s    while (_pr.next()) {\n", indent)
+	fmt.Fprintf(b, "%s        switch (_pr.field()) {\n", indent)
+	fmt.Fprintf(b, "%s        case 1: _result_handle = read_handle_ptr(_pr); break;\n", indent)
+	fmt.Fprintf(b, "%s        case 15: _err_msg = _pr.read_string(); break;\n", indent)
+	fmt.Fprintf(b, "%s        default: _pr.skip(); break;\n", indent)
+	fmt.Fprintf(b, "%s        }\n", indent)
+	fmt.Fprintf(b, "%s    }\n", indent)
+	fmt.Fprintf(b, "%s    wasm_free(reinterpret_cast<void*>(_resp_ptr));\n", indent)
+	fmt.Fprintf(b, "%s}\n", indent)
+
+	if hasSpec {
+		errExpr := strings.ReplaceAll(spec.ErrorExpr, "{err_msg}", "_err_msg")
+		fmt.Fprintf(b, "%sif (!_err_msg.empty()) return %s;\n", indent, errExpr)
+		fmt.Fprintf(b, "%sif (_result_handle == 0) return %s;\n",
+			indent,
+			strings.ReplaceAll(spec.ErrorExpr, "{err_msg}", "std::string(\"callback returned no value\")"))
+	} else {
+		// No reconstruct spec — fall back to a hard trap so the
+		// missing config surfaces as a build/test failure rather
+		// than silent garbage.
+		fmt.Fprintf(b, "%sif (!_err_msg.empty()) __builtin_trap();\n", indent)
+		fmt.Fprintf(b, "%sif (_result_handle == 0) __builtin_trap();\n", indent)
+	}
+	// std::move so move-only inner types (e.g. `unique_ptr<T>`)
+	// can return; copy-constructible types are unaffected because
+	// the StatusOr<T> ctor still picks the move overload first.
+	fmt.Fprintf(b, "%sreturn std::move(*reinterpret_cast<%s*>(_result_handle));\n", indent, resolvedInner)
+}
+
+// matchErrorTypeBase returns the configured ErrorTypes key (without
+// any template tail) that t matches. e.g. for
+// `absl::StatusOr<TVFSignature>` returns `"absl::StatusOr"`. Used to
+// look up the reconstruction spec for templated error wrappers.
+func matchErrorTypeBase(t apispec.TypeRef) string {
+	name := strings.TrimSpace(t.QualType)
+	if name == "" {
+		name = t.Name
+	}
+	name = strings.TrimPrefix(name, "const ")
+	name = strings.TrimSpace(strings.TrimSuffix(name, "&"))
+	name = strings.TrimSpace(strings.TrimSuffix(name, "*"))
+	for typeName := range bridgeConfig.ErrorTypes {
+		if name == typeName {
+			return typeName
+		}
+		if !strings.Contains(typeName, "<") && strings.HasPrefix(name, typeName+"<") {
+			return typeName
+		}
+	}
+	return ""
 }
 
 // writeErrorOnlyTrampolineRead emits the C++ that reads the standard
@@ -3664,7 +4754,19 @@ func trampolineTypeSupported(t apispec.TypeRef) bool {
 	if isViewOfStringType(t) {
 		return true
 	}
-	if isOutputPointerHandle(t) {
+	if isCallbackOutputParam(t) {
+		// Output handles — both `T**` and the smart-pointer-by-
+		// pointer idiom. The trampoline body skips reading them
+		// off the wire (they live on the response side) and the
+		// per-element write loop below handles serialisation.
+		return true
+	}
+	if _, ok := statusOrInnerType(t); ok {
+		// `absl::StatusOr<T>` (or any ErrorTypes-templated wrapper)
+		// where T is a usable handle-class. The wire format is
+		// `<HandleMsg> result = 1; string error = 15` and the
+		// trampoline reconstructs the StatusOr<T> from those two
+		// fields. See writeTrampolineStatusOrRead below.
 		return true
 	}
 	switch t.Kind {
@@ -3674,9 +4776,35 @@ func trampolineTypeSupported(t apispec.TypeRef) bool {
 		// std::string is marshalable. Views / compressed strings
 		// (configured via UnsupportedStringTypes) aren't — they need
 		// backing-store lifetime we can't guarantee across callbacks.
+		// `ExtraStringTypes` opt-ins (e.g. absl::string_view) are
+		// reclassified to TypeString upstream; they are marshalable
+		// across the trampoline because the std::string read from
+		// the wire converts implicitly to the view, and a view
+		// argument coming from C++ converts to std::string before
+		// it hits the wire. Honour the opt-in here so the
+		// `string_view` substring used to reject unrelated types
+		// (e.g. an unowned compressed-string view) doesn't catch
+		// them in the same net.
+		qt := strings.TrimSpace(t.QualType)
+		for _, e := range bridgeConfig.ExtraStringTypes {
+			if qt == e || t.Name == e {
+				return true
+			}
+		}
 		return !isUnsupportedStringType(t.QualType)
 	case apispec.TypeHandle:
 		return true
+	case apispec.TypeVector:
+		// `const std::vector<T>&` (and by-value forms) carry a list
+		// of repeated elements on the wire — supported as long as
+		// the inner element type is itself trampoline-supported.
+		// Mutable vector references are output-shaped: handled via
+		// isCallbackOutputContainer earlier (caught by
+		// isCallbackOutputParam).
+		if t.Inner == nil {
+			return false
+		}
+		return trampolineTypeSupported(*t.Inner)
 	case apispec.TypeVoid:
 		return false
 	}
@@ -3712,11 +4840,189 @@ func isOutputPointerHandle(t apispec.TypeRef) bool {
 		return false
 	}
 	qt := strings.TrimSpace(t.QualType)
-	return strings.Contains(qt, "**")
+	if strings.Contains(qt, "**") {
+		return true
+	}
+	// Reference-to-pointer (`T*&` / `T* &`) is the same output shape
+	// as `T**` — caller passes a slot, callee writes the pointer.
+	// Recognising it here lets the trampoline declarability check,
+	// the callback request/response split, and the dispatch
+	// emit-loop all treat it uniformly.
+	if t.IsRef && (strings.Contains(qt, "*&") || strings.Contains(qt, "* &")) {
+		return true
+	}
+	return false
+}
+
+// isReferenceToPointerHandle reports whether t is the `T*&` /
+// `T* &` shape specifically (output via reference rather than
+// `T**`). Used by the trampoline body emitter and the dispatch
+// builder to pick the correct deref/assign syntax: `*var = ...` for
+// `T**`, `var = ...` for `T*&`.
+func isReferenceToPointerHandle(t apispec.TypeRef) bool {
+	if t.Kind != apispec.TypeHandle {
+		return false
+	}
+	if !t.IsRef {
+		return false
+	}
+	qt := strings.TrimSpace(t.QualType)
+	return strings.Contains(qt, "*&") || strings.Contains(qt, "* &")
+}
+
+// callbackOutputInnerName extracts the bare inner class name from
+// a callback output parameter — strip the trailing `*` /  `**` plus
+// any smart-pointer wrapper. e.g.
+//
+//	`const ResolvedNode**`              → `ResolvedNode`
+//	`std::unique_ptr<TVFSignature>*`    → `TVFSignature`
+//	`std::shared_ptr<const Foo>*`       → `Foo`
+//
+// Used by writeCallbackService to pick the response-field message
+// type for an output param. The caller is responsible for verifying
+// the param is an output param via isCallbackOutputParam.
+func callbackOutputInnerName(t apispec.TypeRef) string {
+	// Mutable container reference: extract the (already-resolved)
+	// element type.
+	if isCallbackOutputContainer(t) {
+		// set-like first (works on TypeHandle/TypeValue with the
+		// recognised template prefix; clang doesn't populate Inner
+		// for these): setLikeContainerInfo returns
+		// (containerType, elementType, ok) — we want the element.
+		if _, elem, ok := setLikeContainerInfo(t); ok && elem != "" {
+			elem = strings.TrimSpace(elem)
+			elem = strings.TrimPrefix(elem, "const ")
+			elem = strings.TrimSpace(strings.TrimSuffix(elem, "*"))
+			return strings.TrimSpace(elem)
+		}
+		// vector<T>& — Inner is populated by classifyType.
+		if t.Inner != nil && t.Inner.Name != "" {
+			n := strings.TrimSpace(t.Inner.Name)
+			n = strings.TrimPrefix(n, "const ")
+			n = strings.TrimSuffix(n, "*")
+			return strings.TrimSpace(n)
+		}
+	}
+	qt := strings.TrimSpace(t.QualType)
+	if qt == "" {
+		qt = t.Name
+	}
+	// Reference-to-pointer (`T*&` / `T* &`): peel the reference
+	// marker and one trailing `*` to reveal the bare T.
+	qt = strings.TrimSpace(strings.TrimSuffix(qt, "&"))
+	// Peel one trailing `*` (the writability marker).
+	stripped := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+	stripped = strings.TrimPrefix(stripped, "const ")
+	stripped = strings.TrimSpace(stripped)
+	if isSmartPointerType(stripped) {
+		inner := smartPointerInner(stripped)
+		inner = strings.TrimPrefix(inner, "const ")
+		inner = strings.TrimSpace(inner)
+		return inner
+	}
+	// `T**` shape: strip the second `*`.
+	stripped = strings.TrimSpace(strings.TrimSuffix(stripped, "*"))
+	stripped = strings.TrimPrefix(stripped, "const ")
+	return strings.TrimSpace(stripped)
+}
+
+// isCallbackOutputParam reports whether a callback method parameter
+// is an output slot — wider than `isOutputPointerHandle` because
+// the callback request/response split also moves smart-pointer-by-
+// pointer out-params (`unique_ptr<T>*`, `shared_ptr<T>*`) onto the
+// response side. Keeping these two predicates separate avoids
+// changing the trampoline-body emit path, which relies on
+// `isOutputPointerHandle`'s strict `T**` semantics for its
+// param-write loop.
+func isCallbackOutputParam(t apispec.TypeRef) bool {
+	if isOutputPointerHandle(t) {
+		return true
+	}
+	// Mutable container reference (`set<T>&`, `vector<T>&`,
+	// `flat_hash_set<T>&`) is an output: the callee fills the
+	// caller-allocated container. The trampoline marshals the
+	// produced items on the response, the C++ trampoline body
+	// inserts each into the local set/vector before returning.
+	if isCallbackOutputContainer(t) {
+		return true
+	}
+	if t.Kind != apispec.TypeHandle {
+		return false
+	}
+	qt := strings.TrimSpace(t.QualType)
+	if !t.IsPointer || t.IsRef {
+		return false
+	}
+	stripped := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+	stripped = strings.TrimPrefix(stripped, "const ")
+	stripped = strings.TrimSpace(stripped)
+	return isSmartPointerType(stripped)
+}
+
+// isCallbackOutputOwning reports whether the C++ output parameter
+// shape transfers ownership of the produced handle to the C++ side
+// (the trampoline wraps the wire-decoded raw pointer in a fresh
+// `std::unique_ptr<T>` / `std::shared_ptr<T>` and writes through to
+// the caller's slot, so the C++ side will eventually delete it).
+//
+// Raw-pointer output shapes (`T**`, `T*&`) are NOT owning — those
+// represent borrowed handles where the callee just hands a pointer
+// back; the Go callback retains ownership and its finalizer must
+// still free the underlying object.
+//
+// The plugin uses this signal (carried over via the
+// `wasm_take_ownership` field option on the response message) to
+// decide whether to call `clearPtr()` on the returned handle after
+// writing it to the wire. clearPtr-on-borrowed would leak the
+// memory; clearPtr-omitted-on-owning would double-free.
+func isCallbackOutputOwning(t apispec.TypeRef) bool {
+	if t.Kind != apispec.TypeHandle {
+		return false
+	}
+	qt := strings.TrimSpace(t.QualType)
+	if !t.IsPointer || t.IsRef {
+		return false
+	}
+	stripped := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+	stripped = strings.TrimPrefix(stripped, "const ")
+	stripped = strings.TrimSpace(stripped)
+	return isSmartPointerType(stripped)
+}
+
+// isCallbackOutputContainer reports whether t is a mutable
+// reference to a set / vector / map of pointers — the canonical
+// "fill this caller-allocated collection" output shape used by
+// virtual methods like `Catalog::GetTables(vector<Table*>&)` or
+// `PropertyGraph::GetNodeTables(flat_hash_set<const NodeTable*>&)`.
+func isCallbackOutputContainer(t apispec.TypeRef) bool {
+	if !t.IsRef || t.IsConst {
+		return false
+	}
+	switch t.Kind {
+	case apispec.TypeVector:
+		return t.Inner != nil
+	case apispec.TypeValue, apispec.TypeHandle:
+		// set-like containers come through as TypeValue / TypeHandle
+		// because clang doesn't classify them as TypeVector. Use the
+		// project's set-like recogniser if available.
+		if _, _, ok := setLikeContainerInfo(t); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func trampolineReturnSupported(t apispec.TypeRef) bool {
 	if isErrorOnlyReturnType(t) {
+		return true
+	}
+	if _, ok := statusOrInnerType(t); ok {
+		return true
+	}
+	if isViewOfStringType(t) {
+		// `absl::Span<const std::string>` — the trampoline
+		// reconstructs a vector<string> from the wire and returns
+		// a Span over it. See writeTrampolineResultRead.
 		return true
 	}
 	switch t.Kind {
@@ -3735,6 +5041,52 @@ func trampolineReturnSupported(t apispec.TypeRef) bool {
 	return false
 }
 
+// statusOrInnerType extracts the template argument T of a
+// `BridgeConfig.ErrorTypes`-templated wrapper (e.g.
+// `absl::StatusOr<TVFSignature>` → `TVFSignature`). Returns
+// ("", false) for plain non-templated error types like `absl::Status`
+// (which carry no value) and for non-error types.
+//
+// Used by the trampoline writer to recognise and round-trip
+// "Status-or-value" returns: the wire format is `<HandleMsg> result
+// = 1; string error = 15`, mirrored on the Go callback side via
+// `(*T, error)`. The trampoline body reads both fields and either
+// returns `absl::InternalError(err)` (which implicitly converts to
+// the StatusOr<T>) or constructs the StatusOr<T> from a copy of
+// the heap-allocated T whose handle the Go adapter shipped back.
+//
+// The recognition is library-agnostic: any name-prefix entry in
+// `BridgeConfig.ErrorTypes` participates, so a project's own
+// status-or-value wrappers (e.g. `myapp::Result<T>`) are picked up
+// the same way as abseil's `absl::StatusOr`.
+func statusOrInnerType(t apispec.TypeRef) (string, bool) {
+	name := strings.TrimSpace(t.QualType)
+	if name == "" {
+		name = t.Name
+	}
+	name = strings.TrimPrefix(name, "const ")
+	name = strings.TrimSpace(strings.TrimSuffix(name, "&"))
+	name = strings.TrimSpace(strings.TrimSuffix(name, "*"))
+	name = strings.TrimSpace(name)
+
+	if !strings.Contains(name, "<") {
+		return "", false
+	}
+	if matchErrorType(name) == "" {
+		return "", false
+	}
+	open := strings.Index(name, "<")
+	inner := name[open+1:]
+	if end := strings.LastIndex(inner, ">"); end >= 0 {
+		inner = inner[:end]
+	}
+	inner = strings.TrimSpace(inner)
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
+}
+
 // trampolineTypeDecl returns the C++ type used in the override's
 // declaration. It resolves the short name to its fully qualified form
 // (so `Column*` becomes `googlesql::Column*` — important because the
@@ -3747,6 +5099,26 @@ func trampolineTypeDecl(t apispec.TypeRef) string {
 	if name := matchErrorOnlyReturnType(t); name != "" {
 		return name
 	}
+	if inner, ok := statusOrInnerType(t); ok {
+		// Preserve the wrapper spelling (e.g. `absl::StatusOr<...>`)
+		// verbatim, but qualify the inner type so the override
+		// declaration resolves correctly in the bridge's flat
+		// namespace. Without this `absl::StatusOr<TVFSignature>`
+		// would compile against the wrong (or no) `TVFSignature`
+		// in scope.
+		resolvedInner := resolveTypeName(strings.TrimSpace(inner))
+		if resolvedInner == "" {
+			resolvedInner = inner
+		}
+		qt := strings.TrimSpace(t.QualType)
+		if qt == "" {
+			qt = t.Name
+		}
+		if resolvedInner != inner {
+			qt = strings.Replace(qt, inner, resolvedInner, 1)
+		}
+		return qt
+	}
 	if isViewOfStringType(t) {
 		// Keep qual_type verbatim so `const View<const std::string>&`
 		// vs `View<const std::string>` both round-trip unchanged.
@@ -3755,27 +5127,35 @@ func trampolineTypeDecl(t apispec.TypeRef) string {
 		}
 	}
 	if isOutputPointerHandle(t) {
-		// Preserve qual_type (`const T**`) verbatim; fully-qualify the
-		// inner class so the override matches the base's vtable slot.
+		// Preserve qual_type (`const T**` or `const T*&`) verbatim;
+		// fully-qualify the inner class so the override matches the
+		// base's vtable slot. We branch on which output shape the
+		// signature uses — both shapes share the same recogniser so
+		// the trampoline body emitter can treat them uniformly, but
+		// the override DECLARATION must keep the exact spelling.
 		qt := strings.TrimSpace(t.QualType)
-		// Normalize: `const T **` / `const T **` / `const T** `
-		// → resolve the stripped base name and reassemble.
-		stripped := qt
-		stripped = strings.TrimSuffix(stripped, "*")
-		stripped = strings.TrimSpace(stripped)
-		stripped = strings.TrimSuffix(stripped, "*")
-		stripped = strings.TrimSpace(stripped)
+		isRefToPtr := isReferenceToPointerHandle(t)
+		// Peel the trailing decorator: `&` for `T*&`, second `*` for
+		// `T**`. Then peel one more `*` and any leading `const`.
+		if isRefToPtr {
+			qt = strings.TrimSpace(strings.TrimSuffix(qt, "&"))
+		}
+		stripped := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+		stripped = strings.TrimSpace(strings.TrimSuffix(stripped, "*"))
 		hasConst := strings.HasPrefix(stripped, "const ")
-		stripped = strings.TrimPrefix(stripped, "const ")
-		stripped = strings.TrimSpace(stripped)
+		stripped = strings.TrimSpace(strings.TrimPrefix(stripped, "const "))
 		resolved := resolveTypeName(stripped)
 		if resolved == "" {
 			resolved = stripped
 		}
-		if hasConst {
-			return "const " + resolved + "**"
+		suffix := "**"
+		if isRefToPtr {
+			suffix = "*&"
 		}
-		return resolved + "**"
+		if hasConst {
+			return "const " + resolved + suffix
+		}
+		return resolved + suffix
 	}
 	if t.Kind == apispec.TypeVoid {
 		// `void` itself is valid only as a return type — `void*` is a
@@ -3891,7 +5271,26 @@ func writeTrampolineParamWrite(b *strings.Builder, p apispec.Param, fieldNum int
 			fmt.Fprintf(b, "%s_pw.write_int64(%d, static_cast<int64_t>(%s));\n", indent, fieldNum, varName)
 		}
 	case apispec.TypeString:
-		fmt.Fprintf(b, "%s_pw.write_string(%d, %s);\n", indent, fieldNum, varName)
+		// `absl::string_view` (and other ExtraStringTypes) reach
+		// here as TypeString after reclassification, but they don't
+		// implicitly convert to `const std::string&`. Use the
+		// (data, size) overload of ProtoWriter::write_string so
+		// any string-like type with `.data()` / `.size()` works
+		// without materialising a temporary std::string.
+		qt := strings.TrimSpace(p.Type.QualType)
+		isView := false
+		for _, e := range bridgeConfig.ExtraStringTypes {
+			if qt == e || p.Type.Name == e {
+				isView = true
+				break
+			}
+		}
+		if isView {
+			fmt.Fprintf(b, "%s_pw.write_string(%d, %s.data(), static_cast<uint32_t>(%s.size()));\n",
+				indent, fieldNum, varName, varName)
+		} else {
+			fmt.Fprintf(b, "%s_pw.write_string(%d, %s);\n", indent, fieldNum, varName)
+		}
 	case apispec.TypeHandle:
 		// Handle params wire as a submessage { uint64 ptr = 1 } so the
 		// shape matches the Go client's pbAppendHandle encoding. Take
@@ -3901,10 +5300,85 @@ func writeTrampolineParamWrite(b *strings.Builder, p apispec.Param, fieldNum int
 		} else {
 			fmt.Fprintf(b, "%s_pw.write_handle(%d, reinterpret_cast<uint64_t>(&%s));\n", indent, fieldNum, varName)
 		}
+	case apispec.TypeVector:
+		// `const vector<T>&` (and friends) flow per-element on the
+		// wire. The Go callback adapter accumulates each repeated
+		// field N entry into a slice. Without this the trampoline
+		// silently dropped the vector — leaving callbacks like
+		// TVF.Resolve receiving `actualArguments` as an empty
+		// slice even when the caller passed real elements.
+		if p.Type.Inner == nil {
+			fmt.Fprintf(b, "%s/* vector with unknown inner skipped */\n", indent)
+			break
+		}
+		inner := *p.Type.Inner
+		switch inner.Kind {
+		case apispec.TypeHandle:
+			fmt.Fprintf(b, "%sfor (const auto& _e : %s) {\n", indent, varName)
+			if inner.IsPointer {
+				fmt.Fprintf(b, "%s    _pw.write_handle(%d, reinterpret_cast<uint64_t>(_e));\n", indent, fieldNum)
+			} else {
+				fmt.Fprintf(b, "%s    _pw.write_handle(%d, reinterpret_cast<uint64_t>(&_e));\n", indent, fieldNum)
+			}
+			fmt.Fprintf(b, "%s}\n", indent)
+		case apispec.TypeString:
+			fmt.Fprintf(b, "%sfor (const auto& _e : %s) { _pw.write_string(%d, _e); }\n",
+				indent, varName, fieldNum)
+		case apispec.TypePrimitive:
+			cpp := cppPrimitiveType(inner.Name)
+			writer := "write_int64"
+			cast := "static_cast<int64_t>"
+			switch cpp {
+			case "bool":
+				writer, cast = "write_bool", ""
+			case "float":
+				writer, cast = "write_float", ""
+			case "double":
+				writer, cast = "write_double", ""
+			case "int32_t":
+				writer, cast = "write_int32", ""
+			case "uint32_t":
+				writer, cast = "write_uint32", ""
+			case "int64_t":
+				writer, cast = "write_int64", ""
+			case "uint64_t":
+				writer, cast = "write_uint64", ""
+			}
+			if cast != "" {
+				fmt.Fprintf(b, "%sfor (const auto& _e : %s) { _pw.%s(%d, %s(_e)); }\n",
+					indent, varName, writer, fieldNum, cast)
+			} else {
+				fmt.Fprintf(b, "%sfor (const auto& _e : %s) { _pw.%s(%d, _e); }\n",
+					indent, varName, writer, fieldNum)
+			}
+		default:
+			fmt.Fprintf(b, "%s/* vector inner kind %v not yet wired for trampoline */\n", indent, inner.Kind)
+		}
 	}
 }
 
 func writeTrampolineResultRead(b *strings.Builder, t apispec.TypeRef, indent string) {
+	// `absl::Span<const std::string>` (and other configured
+	// ValueViewTypes) — the Go callback returns a `[]string`; the
+	// trampoline stores the strings in a per-instance buffer and
+	// returns a Span pointing into it. Lifetime: the buffer is a
+	// thread-local static so consecutive calls invalidate prior
+	// Spans, but a single caller that consumes the Span before
+	// the next callback fires sees stable data.
+	if isViewOfStringType(t) {
+		fmt.Fprintf(b, "%sthread_local std::vector<std::string> _backing;\n", indent)
+		fmt.Fprintf(b, "%s_backing.clear();\n", indent)
+		fmt.Fprintf(b, "%sif (_resp_ptr != 0) {\n", indent)
+		fmt.Fprintf(b, "%s    ProtoReader _pr(reinterpret_cast<const void*>(_resp_ptr), _resp_len);\n", indent)
+		fmt.Fprintf(b, "%s    while (_pr.next()) {\n", indent)
+		fmt.Fprintf(b, "%s        if (_pr.field() == 1) _backing.push_back(_pr.read_string());\n", indent)
+		fmt.Fprintf(b, "%s        else _pr.skip();\n", indent)
+		fmt.Fprintf(b, "%s    }\n", indent)
+		fmt.Fprintf(b, "%s    wasm_free(reinterpret_cast<void*>(_resp_ptr));\n", indent)
+		fmt.Fprintf(b, "%s}\n", indent)
+		fmt.Fprintf(b, "%sreturn absl::MakeConstSpan(_backing);\n", indent)
+		return
+	}
 	// Default-construct a holder, parse field 1 into it, free the
 	// response buffer, and return.
 	switch t.Kind {
@@ -4100,21 +5574,85 @@ func writeHandleDispatch(b *strings.Builder, c *apispec.Class, allHandles map[st
 	// subclass instance bound to the supplied Go callback_id and returns
 	// it as a handle pointer. Must appear at the same method_id the
 	// proto schema placed it.
+	//
+	// One FromCallback variant per base ctor: the trampoline forwards
+	// each base ctor's arguments through the wire so the Go-side
+	// `NewXxxFromImpl(impl, args...)` can drive the construction
+	// without the bridge ever needing to know an args-less form. For
+	// classes with no ctors in api-spec (typical of abstract classes
+	// whose only ctor is implicit-default), a single variant with
+	// just callback_id is emitted.
 	if isCallbackCandidateForBridge(c) {
 		trampolineName := protoMessageName(c.QualName) + "Trampoline"
-		emit(methodID, "FromCallback", func() {
-			b.WriteString("    ProtoReader _pr(req, req_len);\n")
-			b.WriteString("    int32_t _callback_id = 0;\n")
-			b.WriteString("    while (_pr.next()) {\n")
-			b.WriteString("        if (_pr.field() == 1) _callback_id = _pr.read_int32();\n")
-			b.WriteString("        else _pr.skip();\n")
-			b.WriteString("    }\n")
-			fmt.Fprintf(b, "    auto* _t = new %s(_callback_id);\n", trampolineName)
-			b.WriteString("    ProtoWriter _pw;\n")
-			b.WriteString("    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));\n")
-			b.WriteString("    return _pw.finish();\n")
-		})
-		methodID++
+		ctorVariants := collectTrampolineCtors(c)
+		emitVariant := func(variantIdx int, ctor *apispec.Function) {
+			label := "FromCallback"
+			if variantIdx > 0 {
+				label = fmt.Sprintf("FromCallback%d", variantIdx+1)
+			}
+			emit(methodID, label, func() {
+				// Use `reader` as the ProtoReader name — readExpr's
+				// generated read calls reference it by that name
+				// (existing convention shared with writeCallBody /
+				// writeConstructorBody).
+				b.WriteString("    ProtoReader reader(req, req_len);\n")
+				b.WriteString("    int32_t _callback_id = 0;\n")
+				if ctor != nil {
+					for i, p := range ctor.Params {
+						varName := paramVarName(p, i)
+						localType := cppLocalType(p.Type)
+						fmt.Fprintf(b, "    %s %s{};\n", localType, varName)
+					}
+				}
+				b.WriteString("    while (reader.has_data() && reader.next()) {\n")
+				b.WriteString("        switch (reader.field()) {\n")
+				b.WriteString("        case 1: _callback_id = reader.read_int32(); break;\n")
+				if ctor != nil {
+					for i, p := range ctor.Params {
+						varName := paramVarName(p, i)
+						fieldNum := i + 2
+						fmt.Fprintf(b, "        case %d: %s break;\n", fieldNum, readExpr(p.Type, varName))
+					}
+				}
+				b.WriteString("        default: reader.skip(); break;\n")
+				b.WriteString("        }\n")
+				b.WriteString("    }\n")
+				if ctor == nil {
+					fmt.Fprintf(b, "    auto* _t = new %s(_callback_id);\n", trampolineName)
+				} else {
+					var args []string
+					for i, p := range ctor.Params {
+						varName := paramVarName(p, i)
+						if p.Type.Kind == apispec.TypeHandle {
+							castType := cppTypeName(p.Type)
+							constQual := ""
+							if p.Type.IsConst {
+								constQual = "const "
+							}
+							args = append(args, handleArgExpr(p, varName, castType, constQual))
+						} else if p.Type.Kind == apispec.TypeVector &&
+							(!p.Type.IsRef || strings.HasSuffix(strings.TrimSpace(p.Type.QualType), "&&")) {
+							args = append(args, "std::move("+varName+")")
+						} else {
+							args = append(args, varName)
+						}
+					}
+					args = append(args, "_callback_id")
+					fmt.Fprintf(b, "    auto* _t = new %s(%s);\n", trampolineName, strings.Join(args, ", "))
+				}
+				b.WriteString("    ProtoWriter _pw;\n")
+				b.WriteString("    _pw.write_uint64(1, reinterpret_cast<uint64_t>(_t));\n")
+				b.WriteString("    return _pw.finish();\n")
+			})
+			methodID++
+		}
+		if len(ctorVariants) == 0 {
+			emitVariant(0, nil)
+		} else {
+			for i := range ctorVariants {
+				emitVariant(i, &ctorVariants[i])
+			}
+		}
 	}
 
 	// Free — only when the class has a public destructor. proto.go
@@ -4199,14 +5737,19 @@ func writeCallBody(b *strings.Builder, fn *apispec.Function, handleClass string,
 		if p.Type.Kind == apispec.TypeHandle {
 			typeName := cppTypeName(p.Type)
 			resolved := resolveTypeName(typeName)
-			// T** output: callee writes a pointer value into *out_var.
-			// Declare the local as `T* out_var = nullptr;` and pass
-			// `&out_var` to produce `T**`. Preserve `const T**` by
-			// adding `const` to the pointee type.
+			// T** / T*& output: callee writes a pointer value into the
+			// caller-provided slot. Declare the local as
+			// `T* out_var = nullptr;` and pass either `&out_var`
+			// (binds to `T**`) or `out_var` (binds to `T*&`) at the
+			// call site (handled in buildCallExpr). Preserve const
+			// qualifiers so the call expression's pointer type
+			// matches the function param type.
 			qtTrim := strings.TrimSpace(p.Type.QualType)
 			qtNoConst := strings.TrimSuffix(qtTrim, "const")
 			qtNoConst = strings.TrimSpace(qtNoConst)
-			if strings.HasSuffix(qtNoConst, "**") {
+			isPtrPtr := strings.HasSuffix(qtNoConst, "**")
+			isRefToPtr := isReferenceToPointerHandle(p.Type)
+			if isPtrPtr || isRefToPtr {
 				if strings.HasPrefix(qtTrim, "const ") {
 					cppType = "const " + typeName + "*"
 				} else {
@@ -4345,10 +5888,29 @@ func buildCallExpr(fn *apispec.Function, handleClass string, inputParams, output
 	for _, p := range fn.Params {
 		if isOutputParam(p) {
 			varName := "out_" + paramVarName(p, outputIdx)
-			args = append(args, "&"+varName)
+			// `T*&` callee receives a reference to a local pointer:
+			// pass the pointer lvalue directly. `T**` callee receives
+			// a pointer to a local pointer: pass its address.
+			if isReferenceToPointerHandle(p.Type) {
+				args = append(args, varName)
+			} else {
+				args = append(args, "&"+varName)
+			}
 			outputIdx++
 		} else {
 			varName := paramVarName(p, inputIdx)
+			// Set-like containers were materialised as locals of the
+			// container type (see setLikeContainerInfo + cppLocalType).
+			// The call site adapts the local to the callee's accepted
+			// shape: pointer params get `&name`, rvalue-ref and
+			// by-value params get `std::move(name)` so move-only
+			// containers (or move-friendly ones) avoid an extra copy,
+			// and lvalue-ref params bind directly.
+			if _, _, ok := setLikeContainerInfo(p.Type); ok {
+				args = append(args, setLikeCallExpr(p, varName))
+				inputIdx++
+				continue
+			}
 			// Cast handle params according to how the callee receives them:
 			//   - T&   : dereference the bridge-side pointer once (`*ptr`)
 			//   - T*   : pass the pointer as-is
@@ -4453,15 +6015,21 @@ func buildCallExpr(fn *apispec.Function, handleClass string, inputParams, output
 // isStaticFactory returns true if the method is a static method that returns
 // an instance of the containing class (by value or pointer). These factory
 // methods are treated like constructors in the bridge.
+//
+// Two factory shapes are recognised:
+//
+//  1. By-value return: `static T Foo::Make(args...)` — the original
+//     pattern. The C++ call site is `auto* obj = new T(T::Make(args...))`.
+//
+//  2. Status-with-out-param: `static absl::Status Foo::Create(args...,
+//     std::unique_ptr<T>* out)` or the equivalent `T**` shape. The
+//     constructed instance is delivered through the out-parameter, and
+//     a non-OK Status is reported as an error to the Go caller.
+//     This is the conventional ZetaSQL / Abseil "factory returning Status"
+//     idiom; the bridge unifies it with the by-value form by recognising
+//     the out-parameter as the produced value.
 func isStaticFactory(m apispec.Function) bool {
 	if !m.IsStatic {
-		return false
-	}
-	if m.ReturnType.Kind != apispec.TypeHandle && m.ReturnType.Kind != apispec.TypeValue {
-		return false
-	}
-	// Skip if return type is an error type (e.g., absl::Status)
-	if matchErrorType(m.ReturnType.Name) != "" || matchErrorType(m.ReturnType.QualType) != "" {
 		return false
 	}
 	// Skip static methods listed in the bridge config (e.g., protobuf internals).
@@ -4469,6 +6037,48 @@ func isStaticFactory(m apispec.Function) bool {
 		if m.Name == skip {
 			return false
 		}
+	}
+	rpcName, _ := toProtoRPCName(m.Name)
+	if rpcName == "" {
+		return false
+	}
+
+	containingClass := m.QualName
+	if idx := strings.LastIndex(containingClass, "::"); idx >= 0 {
+		containingClass = containingClass[:idx]
+	}
+
+	// Shape (2): Status-with-out-param. When the return type is an error
+	// type, look for an output param whose pointee is the containing class.
+	if matchErrorType(m.ReturnType.Name) != "" || matchErrorType(m.ReturnType.QualType) != "" {
+		if !hasFactoryOutParam(m, containingClass) {
+			return false
+		}
+		// All other (non-out) params must still be marshalable.
+		for _, p := range m.Params {
+			if isOutputParam(p) {
+				continue
+			}
+			if !isUsableType(p.Type) {
+				return false
+			}
+			if !isInstantiableType(p.Type) {
+				return false
+			}
+		}
+		// Class must still be heap-allocatable on the C++ side.
+		if classAbstract != nil && classAbstract[containingClass] {
+			return false
+		}
+		if classNoNew != nil && classNoNew[containingClass] {
+			return false
+		}
+		return true
+	}
+
+	// Shape (1): by-value return of the containing class.
+	if m.ReturnType.Kind != apispec.TypeHandle && m.ReturnType.Kind != apispec.TypeValue {
+		return false
 	}
 	// Static factory must return by value (not pointer/reference).
 	if m.ReturnType.IsPointer || m.ReturnType.IsRef {
@@ -4478,10 +6088,6 @@ func isStaticFactory(m apispec.Function) bool {
 	// Methods returning unrelated types are not factories.
 	retName := cppTypeName(m.ReturnType)
 	retQual := resolveTypeName(retName)
-	containingClass := m.QualName
-	if idx := strings.LastIndex(containingClass, "::"); idx >= 0 {
-		containingClass = containingClass[:idx]
-	}
 	if retQual != containingClass {
 		return false
 	}
@@ -4510,8 +6116,83 @@ func isStaticFactory(m apispec.Function) bool {
 			return false
 		}
 	}
-	rpcName, _ := toProtoRPCName(m.Name)
-	return rpcName != ""
+	return true
+}
+
+// hasFactoryOutParam reports whether m has at least one output parameter
+// whose pointee resolves to the containing class. The pointee may be
+// `T**` (raw pointer-to-pointer) or `std::unique_ptr<T>*` (smart pointer
+// out-param transferring ownership). Both forms are recognised by
+// `isOutputParam` already; this helper additionally requires the
+// pointee type to match the containing class so that we can interpret
+// the parameter as the factory's produced value.
+func hasFactoryOutParam(m apispec.Function, containingClass string) bool {
+	for _, p := range m.Params {
+		if !isOutputParam(p) {
+			continue
+		}
+		if factoryOutParamMatches(p.Type, containingClass) {
+			return true
+		}
+	}
+	return false
+}
+
+// factoryOutParamMatches checks whether t — which must already have
+// passed isOutputParam — points at the containing class. The helper
+// peels exactly one level of indirection from the parameter type and
+// asks whether what remains resolves to the same class as the method
+// is declared on. The peeled level can be:
+//
+//   - One trailing `*` of a `T**` (the outer pointer is what makes the
+//     parameter writable; the inner pointer is the factory's produced
+//     value).
+//   - One `std::unique_ptr<T>` wrapper. Only `unique_ptr` is
+//     accepted (not `shared_ptr`) because the factory contract is
+//     exclusive ownership transfer: the produced object becomes the
+//     caller's, and the bridge releases the wrapper into a raw
+//     pointer to populate the response.
+//
+// `isUniquePointerType` is the canonical check for the unique-
+// ownership wrapper. Centralising the recognition there keeps the
+// representation-level matching (string-prefix check on the wrapper
+// name) in one place, separated from this function's structural job
+// of comparing the pointee class.
+func factoryOutParamMatches(t apispec.TypeRef, containingClass string) bool {
+	qt := strings.TrimSpace(t.QualType)
+
+	// `unique_ptr<T>*` (or `std::unique_ptr<const T>*` etc.): peel
+	// the trailing `*` that makes the parameter writable, confirm
+	// the wrapper is unique_ptr (not shared_ptr), then ask the
+	// canonical `smartPointerInner` to extract T. Reusing
+	// smartPointerInner keeps the inner-type extraction logic
+	// shared with `handleArgExpr` and `paramTakesOwnership`, so any
+	// future change to inner-type resolution (qualifier preservation,
+	// nested-template handling, etc.) automatically flows through.
+	stripped := strings.TrimSpace(strings.TrimSuffix(qt, "*"))
+	stripped = strings.TrimPrefix(stripped, "const ")
+	stripped = strings.TrimSpace(stripped)
+	if isUniquePointerType(stripped) {
+		inner := smartPointerInner(stripped)
+		if inner == "" {
+			return false
+		}
+		// smartPointerInner re-attaches a leading `const` when the
+		// wrapper held one; strip it here because containingClass
+		// is the bare class name without cv-qualifiers.
+		inner = strings.TrimPrefix(inner, "const ")
+		inner = strings.TrimSpace(inner)
+		return resolveTypeName(inner) == containingClass
+	}
+
+	// `T**` / `const T**` — strip both stars and one optional const.
+	doubleStripped := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(qt, "*")), "*"))
+	doubleStripped = strings.TrimPrefix(doubleStripped, "const ")
+	doubleStripped = strings.TrimSpace(doubleStripped)
+	if doubleStripped == "" {
+		doubleStripped = cppTypeName(t)
+	}
+	return resolveTypeName(doubleStripped) == containingClass
 }
 
 // bridgeReservedNames are variable names used internally in bridge dispatch
@@ -4656,6 +6337,12 @@ func writeStaticFactoryBody(b *strings.Builder, fn *apispec.Function, handleClas
 	var args []string
 	for i, p := range inputParams {
 		varName := paramVarName(p, i)
+		// Set-like container locals are passed by name directly (see
+		// setLikeContainerInfo + cppLocalType).
+		if _, _, ok := setLikeContainerInfo(p.Type); ok {
+			args = append(args, varName)
+			continue
+		}
 		if p.Type.Kind == apispec.TypeHandle {
 			castType := cppTypeName(p.Type)
 			constQual := ""
@@ -4674,13 +6361,104 @@ func writeStaticFactoryBody(b *strings.Builder, fn *apispec.Function, handleClas
 			args = append(args, varName)
 		}
 	}
-	argStr := strings.Join(args, ", ")
-
 	methodName := fn.Name
 	if fn.OriginalName != "" {
 		methodName = fn.OriginalName
 	}
 
+	// Status-with-out-param factory: declare an out-pointer local, pass
+	// it as the trailing argument, then translate the Status into either
+	// a populated handle response (success) or a wire-format error
+	// (field 15) so the Go side can `return err`.
+	containingClass := fn.QualName
+	if idx := strings.LastIndex(containingClass, "::"); idx >= 0 {
+		containingClass = containingClass[:idx]
+	}
+	if matchErrorType(fn.ReturnType.Name) != "" || matchErrorType(fn.ReturnType.QualType) != "" {
+		var outIsUniquePointer bool
+		var outUniquePointerWrapper string // e.g. "std::unique_ptr"
+		for _, p := range fn.Params {
+			if !isOutputParam(p) {
+				continue
+			}
+			if !factoryOutParamMatches(p.Type, containingClass) {
+				continue
+			}
+			// Strip the trailing `*` (which is what makes the
+			// parameter writable) and any leading `const ` to
+			// recover the plain wrapper spelling, then ask the
+			// canonical unique-pointer recogniser whether we are
+			// looking at one. shared_ptr is intentionally NOT
+			// matched: factory ownership is exclusive transfer, and
+			// the bridge's `release()`-then-emit-raw-pointer path is
+			// only correct under unique ownership.
+			peeled := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(p.Type.QualType), "*"))
+			peeled = strings.TrimPrefix(peeled, "const ")
+			peeled = strings.TrimSpace(peeled)
+			if isUniquePointerType(peeled) {
+				outIsUniquePointer = true
+				if open := strings.Index(peeled, "<"); open >= 0 {
+					outUniquePointerWrapper = peeled[:open]
+				}
+			}
+			break
+		}
+		// Declare the local that backs the out-parameter. Unique-
+		// pointer out-params take ownership of the produced object
+		// at construction time and we hand it to the bridge by
+		// `release()`-ing the wrapper. Raw `T**` out-params yield a
+		// borrowed pointer that we forward to the response channel
+		// directly. In both cases the inner / pointee type is the
+		// containing class — verified above by
+		// factoryOutParamMatches — so the local always uses the
+		// fully-qualified containing-class name regardless of how
+		// the api-spec qual-type happened to spell it.
+		if outIsUniquePointer {
+			fmt.Fprintf(b, "%s%s<%s> _out_obj;\n", indent, outUniquePointerWrapper, resolvedClass)
+			args = append(args, "&_out_obj")
+		} else {
+			fmt.Fprintf(b, "%s%s* _out_obj = nullptr;\n", indent, resolvedClass)
+			args = append(args, "&_out_obj")
+		}
+		callArgStr := strings.Join(args, ", ")
+		retName := matchErrorOnlyReturnType(fn.ReturnType)
+		if retName == "" {
+			// matchErrorOnlyReturnType handles types listed in
+			// ErrorOnlyReturnTypes; matchErrorType handles ErrorTypes
+			// (a superset). Fall back to the latter so we always have a
+			// name for the reconstruction lookup below.
+			retName = strings.TrimSpace(fn.ReturnType.QualType)
+			if retName == "" {
+				retName = fn.ReturnType.Name
+			}
+		}
+		// retName / ErrorReconstruct are tracked here for parity with
+		// the trampoline path, even though the bridge body writes the
+		// error message directly via field 15 rather than going through
+		// the reconstruction template.
+		_ = retName
+		_ = bridgeConfig.ErrorReconstruct[retName]
+		fmt.Fprintf(b, "%sauto _st = %s::%s(%s);\n", indent, resolvedClass, methodName, callArgStr)
+		fmt.Fprintf(b, "%sProtoWriter _pw;\n", indent)
+		fmt.Fprintf(b, "%sif (!_st.ok()) {\n", indent)
+		fmt.Fprintf(b, "%s    _pw.write_string(15, std::string(_st.message()));\n", indent)
+		fmt.Fprintf(b, "%s    return _pw.finish();\n", indent)
+		fmt.Fprintf(b, "%s}\n", indent)
+		// _st is OK — extract the constructed instance. Unique-pointer
+		// wrappers transferred sole ownership to us; release() pulls
+		// the raw pointer out so the bridge owns the heap object after
+		// the wrapper destructs. Raw `T**` factories yield a borrowed
+		// pointer that we forward as-is.
+		if outIsUniquePointer {
+			fmt.Fprintf(b, "%s_pw.write_uint64(1, reinterpret_cast<uint64_t>(_out_obj.release()));\n", indent)
+		} else {
+			fmt.Fprintf(b, "%s_pw.write_uint64(1, reinterpret_cast<uint64_t>(_out_obj));\n", indent)
+		}
+		fmt.Fprintf(b, "%sreturn _pw.finish();\n", indent)
+		return
+	}
+
+	argStr := strings.Join(args, ", ")
 	// Static factory returns by value — heap-allocate via move construction
 	fmt.Fprintf(b, "%sauto* _obj = new %s(%s::%s(%s));\n",
 		indent, resolvedClass, resolvedClass, methodName, argStr)
@@ -4760,10 +6538,23 @@ func writeConstructorBody(b *strings.Builder, fn *apispec.Function, handleClass 
 	for _, p := range fn.Params {
 		if isOutputParam(p) {
 			varName := "out_" + paramVarName(p, outputIdx)
-			args = append(args, "&"+varName)
+			// `T*&` callee receives a reference to a local pointer:
+			// pass the pointer lvalue directly. `T**` callee receives
+			// a pointer to a local pointer: pass its address.
+			if isReferenceToPointerHandle(p.Type) {
+				args = append(args, varName)
+			} else {
+				args = append(args, "&"+varName)
+			}
 			outputIdx++
 		} else {
 			varName := paramVarName(p, inputIdx)
+			// Set-like container: pass the local container directly.
+			if _, _, ok := setLikeContainerInfo(p.Type); ok {
+				args = append(args, varName)
+				inputIdx++
+				continue
+			}
 			if p.Type.Kind == apispec.TypeHandle {
 				castType := cppTypeNameInContext(p.Type, resolvedClass)
 				constQual := ""

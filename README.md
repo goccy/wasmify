@@ -18,7 +18,7 @@ User code — calls pure Go/TS/etc. functions, no wasm details exposed
 - **Transform** native builds to wasm32-wasip1 automatically; the captured bazel/cmake/make recording is replayed under wasi-sdk.
 - **Parse** public headers via clang AST to extract APIs (functions, classes with methods + fields, enums, virtual hierarchies, doc comments).
 - **Generate** Protobuf service definitions plus a C++ bridge that exposes every exported method as its own `WASM_EXPORT` — wasm-opt can DCE everything the host doesn't actually call.
-- **Generate** language-native bindings (Go via `protoc-gen-wasmify-go`): singleton module, GC-based cleanup, type-safe enums, abstract type dispatch, callback factories for user-implementable interfaces, zero protobuf leakage.
+- **Generate** language-native bindings (Go via `protoc-gen-wasmify-go`): singleton module, GC-based cleanup, type-safe enums, abstract type dispatch, callback factories for user-implementable interfaces (automatic for abstract classes, opt-in for concrete classes — see [docs/callback-services.md](docs/callback-services.md)), zero protobuf leakage.
 - **Containerised pipeline**: a single `ghcr.io/<owner>/wasmify` image bakes wasi-sdk + binaryen + bazelisk + buf + the wasmify CLI + `protoc-gen-wasmify-go`, so CI and local builds use exactly the same toolchain.
 - **One committed file** per project: `wasmify.json` carries project metadata, target selection, bridge config, and declarative skip rules. `arch.json` and `bridge-config.json` are gone.
 - **Non-interactive mode** (`--non-interactive` / `WASMIFY_NON_INTERACTIVE`) plus declarative `skip` rules so CI never hangs on a y/N prompt.
@@ -114,7 +114,16 @@ Project decisions live under typed sections:
     "ExportFunctions":    [ "mylib::ParseStatement", "mylib::Analyzer" ],
     "ExternalTypes":      [ "absl::Status", "absl::string_view" ],
     "ErrorTypes":         { "absl::Status": "if (!{result}.ok()) { _pw.write_error(std::string({result}.message())); }" },
-    "ExportEnumPrefixes": [ "mylib::" ]
+    "ExportEnumPrefixes": [ "mylib::" ],
+    // Concrete classes the user wants to subclass from Go. Abstract
+    // classes are picked up automatically; concrete classes with
+    // virtuals require this opt-in because C++ has no language-level
+    // way to say "this concrete class is a customisation hook" — the
+    // same syntactic shape is used for data-carrier classes (every
+    // AST/Resolved node, etc.) and would balloon the generated
+    // surface if auto-picked. See docs/callback-services.md for the
+    // distinction.
+    "CallbackClasses":    [ "mylib::TableValuedFunction" ]
   },
   "skip": {
     "files": [ { "path": "external/abseil-cpp~/absl/debugging/stacktrace.cc", "reason": "uses host-only stack unwinder" } ]

@@ -96,6 +96,14 @@ type fieldInfo struct {
 	// Go-side method wrapper must clear the arg's ptr after the invoke
 	// so the per-instance finalizer does not double-free.
 	takesOwnership bool
+	// takeOwnershipWhen names a sibling proto field of bool type
+	// whose runtime value selects ownership transfer. When set, the
+	// Go-side method wrapper emits a runtime guard
+	// `if <takeOwnershipWhen> { handle.clearPtr() }` after the
+	// invoke. Carried by `[(wasmify.wasm_take_ownership_when) =
+	// "<field_name>"]` on the proto field; project-specific opt-in
+	// via wasmify.json:bridge.ConditionalOwnershipTransferMethods.
+	takeOwnershipWhen string
 }
 
 type msgInfo struct {
@@ -479,6 +487,7 @@ const unifiedImports = `import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero"
@@ -502,6 +511,7 @@ const unifiedImportAnchors = `var (
 	_ = strings.TrimSpace
 	_ = strconv.Itoa
 	_ = sync.Once{}
+	_ = atomic.Int64{}
 	_ = unsafe.Sizeof(byte(0))
 	_ = wazero.NewRuntime
 	_ = api.ValueType(0)
@@ -588,6 +598,9 @@ func analyzeField(f *protogen.Field, handles map[string]msgInfo) fieldInfo {
 	if opts, ok := f.Desc.Options().(*descriptorpb.FieldOptions); ok && opts != nil {
 		if v, _ := proto.GetExtension(opts, wasmifyopts.E_WasmTakeOwnership).(bool); v {
 			fi.takesOwnership = true
+		}
+		if v, _ := proto.GetExtension(opts, wasmifyopts.E_WasmTakeOwnershipWhen).(string); v != "" {
+			fi.takeOwnershipWhen = v
 		}
 	}
 	return fi
@@ -682,6 +695,73 @@ func pbAppendSubmessage(buf []byte, field uint32, sub []byte) []byte {
 func pbAppendHandle(buf []byte, field uint32, ptr uint64) []byte {
 	sub := pbAppendUint64(nil, 1, ptr)
 	return pbAppendSubmessage(buf, field, sub)
+}
+
+// pbAppendHandlePtr is the nil-safe one-line wrapper around
+// pbAppendHandle. Generic + comparable lets it accept any
+// pointer-typed wrapper that provides rawPtr() and short-circuit
+// when the pointer is nil. The caller writes
+//
+//	buf = pbAppendHandlePtr(buf, N, v.X)
+//
+// which gofmt keeps as one line; the alternative
+//
+//	if v.X != nil { buf = pbAppendHandle(buf, N, v.X.rawPtr()) }
+//
+// is gofmt-expanded to three lines per occurrence and accounts
+// for several hundred KB of bloat across the binding.
+func pbAppendHandlePtr[T interface {
+	comparable
+	rawPtr() uint64
+}](buf []byte, field uint32, v T) []byte {
+	var zero T
+	if v == zero {
+		return buf
+	}
+	return pbAppendHandle(buf, field, v.rawPtr())
+}
+
+// pbAppendSubmessagePtr is the value-type-message counterpart of
+// pbAppendHandlePtr: nil-safe, gofmt-friendly one-liner around
+// pbAppendSubmessage + the type's marshal() helper.
+func pbAppendSubmessagePtr[T interface {
+	comparable
+	marshal() []byte
+}](buf []byte, field uint32, v T) []byte {
+	var zero T
+	if v == zero {
+		return buf
+	}
+	return pbAppendSubmessage(buf, field, v.marshal())
+}
+
+// clearPtrAny is the gofmt-friendly nil-safe ownership-transfer
+// helper for handle parameters. Replaces the inline expansion
+//
+//	if c, ok := v.(interface{ clearPtr() }); ok { c.clearPtr() }
+//
+// (3 lines after gofmt) plus its surrounding nil-guard with a
+// single function call. Handles both interface values
+// (CatalogNode et al) and concrete pointers; the type assertion
+// short-circuits when v is a true-nil interface, and the wrapped
+// clearPtr() is itself nil-receiver-safe so a typed-nil pointer
+// passed through the interface no-ops cleanly.
+func clearPtrAny(v any) {
+	if c, ok := v.(interface{ clearPtr() }); ok {
+		c.clearPtr()
+	}
+}
+
+// clearPtrAll is the slice variant of clearPtrAny. Used when the
+// proto-field's wire shape is repeated-handle and the C++ side
+// adopts ownership of every element. Each element runs through
+// the same type-assertion shortcut so the helper handles
+// concrete-pointer slices, interface slices, and slices that mix
+// nil and non-nil entries uniformly.
+func clearPtrAll[T any](items []T) {
+	for _, item := range items {
+		clearPtrAny(item)
+	}
 }
 
 // pbReader is a streaming protobuf decoder.
@@ -988,8 +1068,10 @@ const moduleBody = `import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -1020,9 +1102,34 @@ type Module struct {
 	freeFn           api.Function
 	typeNameFn       api.Function
 	exportFns        map[uint64]api.Function
+	// callbacksMu guards callbacks and nextCBID. RegisterCallback /
+	// UnregisterCallback are called from arbitrary goroutines
+	// (including finalisers running concurrently with a wasm export
+	// on a different goroutine), so the map must not be mutated
+	// without locking. handleCallback runs inside the host-import
+	// dispatch on whatever goroutine currently owns m.mu — its
+	// read also goes through callbacksMu so it sees a consistent
+	// map view even when an Unregister fires during the same
+	// outer wasm export.
+	//
+	// Why a SEPARATE mutex from m.mu: handleCallback runs while
+	// m.mu is already held by the outer callExport on the same
+	// goroutine; sync.Mutex is non-recursive, so reusing m.mu
+	// here would self-deadlock on the read. callbacksMu is held
+	// briefly only for the map lookup / mutation and is released
+	// before any wasm or user code runs, so it does not interact
+	// with m.mu's serialisation invariant.
+	callbacksMu      sync.RWMutex
 	callbacks        map[int32]CallbackHandler
 	nextCBID         int32
 	compilationCache wazero.CompilationCache // owned; closed in Close()
+	// holderGID identifies the goroutine currently inside fn.Call.
+	// Same-goroutine reentry from a host-import callback (e.g. the
+	// user's HandleCallback runs Go code that itself invokes a
+	// wasm export) skips m.mu so it doesn't self-deadlock — but
+	// other goroutines still wait on m.mu, preserving wazero's
+	// per-module single-threaded execution invariant.
+	holderGID atomic.Int64
 }
 
 var (
@@ -1082,8 +1189,20 @@ type CallbackHandler interface {
 
 // RegisterCallback registers a Go callback handler and returns its ID.
 // The ID can be passed to C++ as a handle pointer for callback dispatch.
+//
+// callbacksMu serialises map mutations: this is called from arbitrary
+// goroutines (test setup, user code, occasionally finaliser-driven
+// re-registration), so without the lock concurrent writes against
+// the same map would corrupt its internal hash buckets and the next
+// handleCallback would dispatch to a stale or wrong handler — a
+// bug surface that does not present as a panic but as a delayed
+// "out of bounds memory access" inside C++ code that subsequently
+// dereferenced the wrong borrowed handle the wrong adapter handed
+// it.
 func RegisterCallback(handler CallbackHandler) int32 {
 	m := module()
+	m.callbacksMu.Lock()
+	defer m.callbacksMu.Unlock()
 	if m.callbacks == nil {
 		m.callbacks = make(map[int32]CallbackHandler)
 	}
@@ -1094,13 +1213,28 @@ func RegisterCallback(handler CallbackHandler) int32 {
 }
 
 // UnregisterCallback removes a previously registered callback handler.
+//
+// Called from runtime.SetFinalizer functions on the Go-side wrapper
+// for FromImpl-constructed handles. Finalisers run on a dedicated
+// goroutine that is NOT the test goroutine; without callbacksMu,
+// this would race with concurrent RegisterCallback / handleCallback
+// on the active wasm export.
 func UnregisterCallback(id int32) {
-	module().callbacks[id] = nil
-	delete(module().callbacks, id)
+	m := module()
+	m.callbacksMu.Lock()
+	defer m.callbacksMu.Unlock()
+	delete(m.callbacks, id)
 }
 
 func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+	// Read under the callbacks lock so we see a consistent map view
+	// even if a finaliser-driven UnregisterCallback fires on a
+	// different goroutine in parallel. The lock is released before
+	// the user's HandleCallback runs (which itself may invoke wasm
+	// exports — those acquire m.mu the usual way).
+	m.callbacksMu.RLock()
 	handler, ok := m.callbacks[callbackID]
+	m.callbacksMu.RUnlock()
 	if !ok {
 		return 0
 	}
@@ -1112,6 +1246,14 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 		copy(buf, req)
 		req = buf
 	}
+	// m.mu is held by the outer callExport. The user's
+	// HandleCallback runs on the same goroutine; any nested
+	// callExport it triggers detects same-goroutine reentry via
+	// holderGID and skips re-acquiring m.mu (sync.Mutex is
+	// non-recursive). Cross-goroutine calls during this window
+	// still wait on m.mu, preserving the wazero per-module
+	// serialisation invariant — only same-goroutine reentry is
+	// permitted.
 	resp, err := handler.HandleCallback(methodID, req)
 	if err != nil {
 		// Encode error response
@@ -1120,15 +1262,51 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	if len(resp) == 0 {
 		return 0
 	}
-	// Write response to wasm memory
+	// Write response to wasm memory.
+	//
+	// allocFn returns 0 when wasm allocation fails (dlmalloc OOM
+	// / arena limit). Without the explicit zero-pointer guard the
+	// Memory().Write below would clobber the module's static data
+	// at offset 0 and silently corrupt every subsequent export.
+	// The observable symptom is a delayed out-of-bounds memory
+	// access from an unrelated call path several iterations later.
 	ctx := context.Background()
 	results, callErr := m.allocFn.Call(ctx, uint64(len(resp)))
 	if callErr != nil || len(results) == 0 {
 		return 0
 	}
 	ptr := results[0]
+	if ptr == 0 {
+		return 0
+	}
 	m.mod.Memory().Write(uint32(ptr), resp)
 	return int64(ptr)<<32 | int64(len(resp))
+}
+
+// currentGID returns a stable per-goroutine identifier extracted
+// from runtime.Stack. The cost is small (a fixed-size buffer
+// scan + integer parse) and only matters during cross-goroutine
+// contention. Same-goroutine reentry never blocks so the cost
+// is not on the hot path.
+func currentGID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Stack output starts with "goroutine N [...".
+	const prefix = "goroutine "
+	s := string(buf[:n])
+	if !strings.HasPrefix(s, prefix) {
+		return 0
+	}
+	rest := s[len(prefix):]
+	id := int64(0)
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + int64(c-'0')
+	}
+	return id
 }
 
 // envStub returns a GoModuleFunction for an unresolved env import.
@@ -1350,32 +1528,68 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte) ([]byte, error) {
 
 // exportFor returns the cached api.Function for (serviceID, methodID),
 // performing a one-time mod.ExportedFunction lookup if absent.
+//
+// Like callExport, the lock here is goroutine-aware-reentrant:
+// same-goroutine reentry skips the mutex (we already hold it via
+// the outer callExport).
 func (m *Module) exportFor(serviceID, methodID int32) (api.Function, error) {
 	key := uint64(uint32(serviceID))<<32 | uint64(uint32(methodID))
-	m.mu.Lock()
+	gid := currentGID()
+	reentrant := m.holderGID.Load() == gid && gid != 0
+	if !reentrant {
+		m.mu.Lock()
+	}
 	if fn, ok := m.exportFns[key]; ok {
-		m.mu.Unlock()
+		if !reentrant {
+			m.mu.Unlock()
+		}
 		return fn, nil
 	}
-	m.mu.Unlock()
+	if !reentrant {
+		m.mu.Unlock()
+	}
 	name := fmt.Sprintf("w_%d_%d", serviceID, methodID)
 	fn := m.mod.ExportedFunction(name)
 	if fn == nil {
 		return nil, fmt.Errorf("wasm export %q not found", name)
 	}
-	m.mu.Lock()
+	if !reentrant {
+		m.mu.Lock()
+	}
 	m.exportFns[key] = fn
-	m.mu.Unlock()
+	if !reentrant {
+		m.mu.Unlock()
+	}
 	return fn, nil
 }
 
-// callExport copies req into wasm memory, calls fn, and reads back the
-// packed response. Holds the runtime lock for the duration of the wasm
-// call to keep the underlying memory writes atomic w.r.t. the
-// callback invoke path.
+// callExport copies req into wasm memory, calls fn, and reads back
+// the packed response. The mutex is goroutine-aware-recursive:
+//
+//   - Cross-goroutine calls serialise on m.mu so wasm execution
+//     stays single-threaded per module (wazero requires this).
+//   - Same-goroutine reentry (e.g. a host-import callback whose
+//     HandleCallback wants to make further wasm calls for
+//     abstract-handle type lookup, finaliser-driven Free RPC, …)
+//     skips re-acquiring m.mu — the outer callExport on this
+//     goroutine already holds it; sync.Mutex is non-recursive
+//     and would self-deadlock.
+//
+// Reentry is detected via holderGID: the outermost frame on a
+// goroutine sets it; nested frames see their own GID and skip
+// the lock; cross-goroutine frames see a different GID and wait
+// on m.mu as usual.
 func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	gid := currentGID()
+	reentrant := m.holderGID.Load() == gid && gid != 0
+	if !reentrant {
+		m.mu.Lock()
+		m.holderGID.Store(gid)
+		defer func() {
+			m.holderGID.Store(0)
+			m.mu.Unlock()
+		}()
+	}
 	ctx := context.Background()
 	var reqPtr, reqLen uint64
 	if len(req) > 0 {
@@ -1384,6 +1598,13 @@ func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
 			return nil, fmt.Errorf("wasm_alloc: %w", err)
 		}
 		reqPtr = results[0]
+		// allocFn returns 0 on allocation failure (dlmalloc OOM /
+		// arena limit). Without this guard the Memory().Write
+		// below would clobber the wasm module's static data at
+		// offset 0 and silently corrupt every subsequent export.
+		if reqPtr == 0 {
+			return nil, fmt.Errorf("wasm_alloc returned NULL (out of memory)")
+		}
 		reqLen = uint64(len(req))
 		if !m.mod.Memory().Write(uint32(reqPtr), req) {
 			return nil, fmt.Errorf("failed to write request to wasm memory")
@@ -1756,10 +1977,27 @@ func generateOrphanHandles(pkg string, names []string, messages map[string]msgIn
 		// their (possibly renamed) struct names so a child of an abstract
 		// `<X>Node` parent embeds `*<X>NodeBase` rather than the
 		// non-existent `*<X>Node`.
-		parentStruct := handleStructName(parent, messages[parent].isAbstract)
-		secondaryStructs := make([]string, len(secondary))
-		for i, sp := range secondary {
-			secondaryStructs[i] = handleStructName(sp, messages[sp].isAbstract)
+		// Drop parents that aren't being emitted as a Go type (e.g.
+		// external bases like google::protobuf::Message that are
+		// transitively visible through IncludeExternalHeaders but
+		// haven't been opted into IncludeExternalClasses). Embedding
+		// `*Message` when no `type Message struct {…}` exists
+		// produces an undefined-type compile error.
+		if parent != "" {
+			if _, ok := messages[parent]; !ok {
+				parent = ""
+			}
+		}
+		parentStruct := ""
+		if parent != "" {
+			parentStruct = handleStructName(parent, messages[parent].isAbstract)
+		}
+		secondaryStructs := make([]string, 0, len(secondary))
+		for _, sp := range secondary {
+			if _, ok := messages[sp]; !ok {
+				continue
+			}
+			secondaryStructs = append(secondaryStructs, handleStructName(sp, messages[sp].isAbstract))
 		}
 		if doc := formatGoDocComment(messages[name].comment); doc != "" {
 			b.WriteString(doc)
@@ -1980,11 +2218,16 @@ func zeroValueLiteral(t string) string {
 func callbackGoType(f fieldInfo) string {
 	if f.isRepeated {
 		// analyzeField already prepends "[]" to the element type, so
-		// `repeated string` arrives here as goType=="[]string". Only
-		// `[]string` is fully wired into the callback adapter so far;
-		// any other list shape falls back to opaque `[]byte`.
+		// `repeated string` arrives here as goType=="[]string" and
+		// `repeated <HandleMsg>` arrives as goType=="[]<HandleType>".
+		// Both shapes are wired into the callback adapter — strings
+		// via readString, handles via the abstract-handle resolver
+		// (mirroring the per-element decoder in writeCallbackCaseBody).
 		if f.goType == "[]string" {
 			return "[]string"
+		}
+		if f.isHandle {
+			return f.goType
 		}
 		return "[]byte"
 	}
@@ -2036,6 +2279,32 @@ func writeCallbackCaseBody(b *strings.Builder, handleName string, m svcMethodInf
 				// Repeated string: append each occurrence to the slice.
 				fmt.Fprintf(b, "\t\t\tcase %d: %s = append(%s, _r.readString())\n",
 					f.fieldNum, goIdent(f.fieldName), goIdent(f.fieldName))
+			case f.isRepeated && f.isHandle:
+				// Repeated handle: each wire entry is a submessage
+				// `{ uint64 ptr = 1 }`. Decode the pointer, materialise
+				// the typed handle, append.
+				fmt.Fprintf(b, "\t\t\tcase %d:\n", f.fieldNum)
+				b.WriteString("\t\t\t\t_sub := _r.readSubmessage()\n")
+				b.WriteString("\t\t\t\tvar _ptr uint64\n")
+				b.WriteString("\t\t\t\tfor _sf, _sw, _sok := _sub.next(); _sok; _sf, _sw, _sok = _sub.next() {\n")
+				b.WriteString("\t\t\t\t\tif _sf == 1 { _ptr = _sub.readUint64() } else { _sub.skip(_sw) }\n")
+				b.WriteString("\t\t\t\t}\n")
+				// callbackGoType for repeated handle returns the
+				// `[]<Handle>` slice type; trim "[]" to recover the
+				// element Go type.
+				elem := strings.TrimPrefix(callbackGoType(f), "[]")
+				if f.isAbstract {
+					fmt.Fprintf(b, "\t\t\t\tif _ptr != 0 { if _v, _err := resolveAbstractHandle(_ptr); _err == nil { if _h, _ok := _v.(%s); _ok { %s = append(%s, _h) } } }\n", elem, goIdent(f.fieldName), goIdent(f.fieldName))
+				} else {
+					// Borrowed handle: the C++ side passes a raw
+					// pointer it still owns, so use the NoFinalizer
+					// constructor. Without it, the temporary Go
+					// wrapper would acquire its own finaliser and
+					// race the outer Go wrapper that already tracks
+					// the same address — both would call Free RPC,
+					// double-freeing the C++ object.
+					fmt.Fprintf(b, "\t\t\t\tif _ptr != 0 { %s = append(%s, new%sNoFinalizer(_ptr)) }\n", goIdent(f.fieldName), goIdent(f.fieldName), f.handleName)
+				}
 			case f.isHandle:
 				// Submessage { uint64 ptr = 1 }; wrap as typed handle.
 				fmt.Fprintf(b, "\t\t\tcase %d:\n", f.fieldNum)
@@ -2047,7 +2316,10 @@ func writeCallbackCaseBody(b *strings.Builder, handleName string, m svcMethodInf
 				if f.isAbstract {
 					fmt.Fprintf(b, "\t\t\t\tif _ptr != 0 { if _v, _err := resolveAbstractHandle(_ptr); _err == nil { if _h, _ok := _v.(%s); _ok { %s = _h } } }\n", callbackGoType(f), goIdent(f.fieldName))
 				} else {
-					fmt.Fprintf(b, "\t\t\t\tif _ptr != 0 { %s = new%s(_ptr) }\n", goIdent(f.fieldName), f.handleName)
+					// See repeated-handle branch above: borrowed
+					// pointers must use NoFinalizer to avoid
+					// double-freeing the outer Go wrapper.
+					fmt.Fprintf(b, "\t\t\t\tif _ptr != 0 { %s = new%sNoFinalizer(_ptr) }\n", goIdent(f.fieldName), f.handleName)
 				}
 			default:
 				fmt.Fprintf(b, "\t\t\tcase %d: %s = _r.%s()\n", f.fieldNum, goIdent(f.fieldName), callbackReader(f))
@@ -2075,13 +2347,70 @@ func writeCallbackCaseBody(b *strings.Builder, handleName string, m svcMethodInf
 		fmt.Fprintf(b, "\t\t_v, err := a.impl.%s(%s)\n", m.name, argList)
 		b.WriteString("\t\tif err != nil { return nil, err }\n")
 		b.WriteString("\t\tvar _out []byte\n")
-		if f.isHandle {
+		switch {
+		case f.isRepeated && f.isHandle:
+			// Repeated handle return — the Go callback produces a
+			// `[]<HandleNode>` slice (used by methods like
+			// PropertyGraph.GetNodeTables / GetEdgeTables / …).
+			// Each element gets its own wire entry on field N so
+			// the C++ trampoline can insert it into the caller-
+			// allocated container. Borrowed-handle semantics:
+			// elements are NOT clearPtr'd because the analyser
+			// just inspects them, it doesn't take ownership.
+			fmt.Fprintf(b, "\t\tfor _, _e := range _v {\n")
+			b.WriteString("\t\t\tif _e == nil { continue }\n")
+			fmt.Fprintf(b, "\t\t\t_out = pbAppendHandle(_out, %d, _e.rawPtr())\n", f.fieldNum)
+			b.WriteString("\t\t}\n")
+		case f.isHandle:
 			// Encode the handle's ptr into a submessage on field N.
+			// Whether to clear the Go-side wrapper's `ptr` afterward
+			// hinges on whether the C++ trampoline takes ownership
+			// of the handle:
+			//
+			//   - Owning  (`unique_ptr<T>*` / `shared_ptr<T>*` C++
+			//     output param): the trampoline wraps the wire-
+			//     decoded raw pointer in a fresh smart pointer and
+			//     writes it through to the caller's slot, so its
+			//     destructor will eventually delete the underlying
+			//     object. The Go wrapper must drop its own
+			//     finalizer obligation (clearPtr) — otherwise the
+			//     finalizer would later issue a Free RPC on the
+			//     same address, double-freeing.
+			//
+			//   - Borrowed (`T**` / `T*&` C++ output param): the
+			//     callee just hands back a pointer it doesn't own;
+			//     the C++ side does NOT delete. The Go wrapper
+			//     retains ownership and its finalizer must still
+			//     run. Emitting clearPtr here would orphan the
+			//     allocation: Go finalizer becomes a no-op, C++
+			//     never deletes either, and any subsequent invoke
+			//     that re-returns the same wrapper would see
+			//     `rawPtr() == 0` — passing NULL into the C++
+			//     consumer and corrupting state on the next code
+			//     path that dereferenced the slot.
+			//
+			// The bridge marks owning fields with
+			// `wasm_take_ownership`, which the field parser lifts
+			// into `f.takesOwnership`. Mirror that signal here.
 			b.WriteString("\t\tif _v == nil {\n")
 			b.WriteString("\t\t\treturn _out, nil\n")
 			b.WriteString("\t\t}\n")
 			fmt.Fprintf(b, "\t\t_out = pbAppendHandle(_out, %d, _v.rawPtr())\n", f.fieldNum)
-		} else {
+			if f.takesOwnership {
+				// clearPtrAny collapses both the abstract-interface
+				// type-assertion path and the concrete-pointer
+				// nil-safe call into one line, matching what
+				// emitOwnershipTransfer emits for input params.
+				b.WriteString("\t\tclearPtrAny(_v)\n")
+			}
+		case f.isRepeated && f.goType == "[]string":
+			// Repeated string return: emit one wire entry per
+			// element. Mirrors the input-side `case f.fieldNum:`
+			// handler that appends to the slice when reading.
+			fmt.Fprintf(b, "\t\tfor _, _e := range _v {\n")
+			fmt.Fprintf(b, "\t\t\t_out = pbAppendString(_out, %d, _e)\n", f.fieldNum)
+			b.WriteString("\t\t}\n")
+		default:
 			fmt.Fprintf(b, "\t\t_out = %s\n", callbackWriter(f, "_out", "_v"))
 		}
 		b.WriteString("\t\treturn _out, nil\n")
@@ -2371,11 +2700,28 @@ func generateHandleBatch(pkg string, batch []svcInfo, messages map[string]msgInf
 		// to their (possibly renamed) struct names so a child of an
 		// abstract `<X>Node` parent embeds `*<X>NodeBase` rather than
 		// the non-existent `*<X>Node`.
-		parentStruct := handleStructName(parent, messages[parent].isAbstract)
-		secondaryStructs := make([]string, len(secondary))
-		for i, sp := range secondary {
-			secondaryStructs[i] = handleStructName(sp, messages[sp].isAbstract)
+		// Drop parents not emitted as Go types (e.g. unbridged
+		// external bases) — embedding a non-existent struct would
+		// produce undefined-type compile errors downstream.
+		if parent != "" {
+			if _, ok := messages[parent]; !ok {
+				parent = ""
+			}
 		}
+		parentStruct := ""
+		if parent != "" {
+			parentStruct = handleStructName(parent, messages[parent].isAbstract)
+		}
+		secondaryStructs := make([]string, 0, len(secondary))
+		filteredSecondary := make([]string, 0, len(secondary))
+		for _, sp := range secondary {
+			if _, ok := messages[sp]; !ok {
+				continue
+			}
+			filteredSecondary = append(filteredSecondary, sp)
+			secondaryStructs = append(secondaryStructs, handleStructName(sp, messages[sp].isAbstract))
+		}
+		secondary = filteredSecondary
 		if doc := formatGoDocComment(messages[name].comment); doc != "" {
 			b.WriteString(doc)
 		}
@@ -2505,32 +2851,59 @@ func writeMethod(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName st
 	}
 }
 
-// writeCallbackFactory emits `NewXFromImpl(impl XCallback) (*X, error)`
-// which registers a Go adapter with the runtime callback registry and
-// invokes the C++ FromCallback RPC to construct a trampoline handle
-// backed by that callback ID. The handle's finalizer is re-bound so
-// the callback is unregistered once the handle is freed — otherwise
-// the adapter (and the user's closure it captures) would outlive the
-// C++ object it stands in for.
+// writeCallbackFactory emits `NewXFromImpl(impl XCallback, args...)
+// (*X, error)` which registers a Go adapter with the runtime callback
+// registry and invokes the C++ FromCallback RPC to construct a
+// trampoline handle backed by that callback ID. Any extra request
+// fields beyond `callback_id` are forwarded as ctor arguments to the
+// underlying base class (used when the base has only arg-taking
+// constructors — see docs/callback-services.md).
+//
+// When the proto schema declares multiple FromCallback variants
+// (FromCallback / FromCallback2 / ...) the Go function name carries
+// the matching numeric suffix (`NewXFromImpl`, `NewXFromImpl2`, ...),
+// mirroring how multi-variant constructors get `NewX`, `NewX2`, ....
+//
+// The handle's finalizer is re-bound so the callback is unregistered
+// once the handle is freed — otherwise the adapter (and the user's
+// closure it captures) would outlive the C++ object it stands in for.
 func writeCallbackFactory(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName string, messages map[string]msgInfo) {
-	// handleName is the original (un-renamed) class name and drives
-	// all user-facing identifiers (`New<X>FromImpl`, `<X>Callback`
-	// interface, adapter struct). The Go struct name may differ
-	// (a `Base` suffix is appended when the abstract class itself
-	// ends in `Node`); that suffix only surfaces on the receiver /
-	// return type, never on the public symbol the user types.
 	structName := handleStructName(handleName, messages[handleName].isAbstract)
 	interfaceName := handleName + "Callback"
 	adapterName := lowerFirst(handleName) + "CallbackAdapter"
+
+	// callback_id is at field 1 by construction (proto.go writes
+	// it first). Everything else is a base-ctor argument.
+	var ctorArgs []fieldInfo
+	for _, f := range m.inputFields {
+		if f.fieldNum == 1 {
+			continue
+		}
+		ctorArgs = append(ctorArgs, f)
+	}
+
+	// Variant suffix: FromCallback → "", FromCallback2 → "2", etc.
+	suffix := strings.TrimPrefix(m.name, "FromCallback")
+
 	if doc := formatGoDocComment(m.comment); doc != "" {
 		b.WriteString(doc)
 	}
-	fmt.Fprintf(b, "func New%sFromImpl(impl %s) (*%s, error) {\n", handleName, interfaceName, structName)
+	implParam := fmt.Sprintf("impl %s", interfaceName)
+	paramStr := implParam
+	if extra := buildParamStr(ctorArgs); extra != "" {
+		paramStr = implParam + ", " + extra
+	}
+	fmt.Fprintf(b, "func New%sFromImpl%s(%s) (*%s, error) {\n",
+		handleName, suffix, paramStr, structName)
 	fmt.Fprintf(b, "\tadapter := &%s{impl: impl}\n", adapterName)
 	b.WriteString("\tid := RegisterCallback(adapter)\n")
 	b.WriteString("\tvar buf []byte\n")
 	b.WriteString("\tbuf = pbAppendInt32(buf, 1, id)\n")
+	for _, a := range ctorArgs {
+		writeEncode(b, a, "buf")
+	}
 	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
+	emitOwnershipTransfer(b, ctorArgs)
 	b.WriteString("\tif err != nil { UnregisterCallback(id); return nil, err }\n")
 	fmt.Fprintf(b, "\th := new%s(readScalarAtField(resp, 1, (*pbReader).readUint64))\n", structName)
 	// new<X>(ptr) already installed a finalizer that just calls free.
@@ -2539,6 +2912,32 @@ func writeCallbackFactory(b *strings.Builder, svc svcInfo, m svcMethodInfo, hand
 	// first cleared, so nil-reset before setting the new one.
 	fmt.Fprintf(b, "\truntime.SetFinalizer(h, nil)\n")
 	fmt.Fprintf(b, "\truntime.SetFinalizer(h, func(h *%s) { h.free(); UnregisterCallback(id) })\n", structName)
+	// keepAlive: the C++ trampoline embeds whatever its base ctor
+	// stored (signatures, options, etc.). Anchor every non-owned
+	// handle / value-message arg on the returned handle so the
+	// underlying C++ object isn't dereferencing freed memory after
+	// finaliser ordering puts the receiver first. Mirrors the same
+	// chain emitted by writeConstructor for non-callback ctors.
+	for _, p := range ctorArgs {
+		if !p.isHandle || p.takesOwnership {
+			continue
+		}
+		if p.isRepeated {
+			fmt.Fprintf(b, "\tfor _, _ka := range %s { if _ka != nil { h.setKeepAlive(_ka) } }\n", p.goName)
+		} else {
+			fmt.Fprintf(b, "\tif %s != nil { h.setKeepAlive(%s) }\n", p.goName, p.goName)
+		}
+	}
+	for _, p := range ctorArgs {
+		if p.isHandle || !p.isValueMsg {
+			continue
+		}
+		if p.isRepeated {
+			fmt.Fprintf(b, "\tfor _, _ka := range %s { if _ka != nil { h.setKeepAlive(_ka) } }\n", p.goName)
+		} else {
+			fmt.Fprintf(b, "\tif %s != nil { h.setKeepAlive(%s) }\n", p.goName, p.goName)
+		}
+	}
 	b.WriteString("\treturn h, nil\n")
 	b.WriteString("}\n\n")
 }
@@ -2568,7 +2967,45 @@ func writeConstructor(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleNa
 	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf)\n", svc.serviceID, m.methodID)
 	emitOwnershipTransfer(b, params)
 	b.WriteString("\tif err != nil { return nil, err }\n")
-	fmt.Fprintf(b, "\treturn new%s(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil\n", structName)
+	fmt.Fprintf(b, "\t_h := new%s(readScalarAtField(resp, 1, (*pbReader).readUint64))\n", structName)
+	// keepAlive chain: every input handle the C++ ctor likely
+	// stored a reference to (we can't know for sure without
+	// signature-level analysis, so be conservative and retain
+	// every non-ownership-transferred handle) is anchored to the
+	// returned wrapper. Without this, an input held only as a
+	// transient by the caller can be GC'd while the C++ side still
+	// dereferences it through the new instance — finalisers run in
+	// undefined order, so e.g. a TVFRelation holding `const Type*`
+	// borrowed from the test's TypeFactory would dangle once the
+	// factory's finaliser ran first.
+	for _, p := range params {
+		if !p.isHandle || p.takesOwnership {
+			continue
+		}
+		if p.isRepeated {
+			fmt.Fprintf(b, "\tfor _, _ka := range %s { if _ka != nil { _h.setKeepAlive(_ka) } }\n", p.goName)
+		} else {
+			fmt.Fprintf(b, "\tif %s != nil { _h.setKeepAlive(%s) }\n", p.goName, p.goName)
+		}
+	}
+	// Value-class params (e.g. TVFSchemaColumn carrying a
+	// borrowed `*Type`) need their internal handle fields kept
+	// alive too. We can't enumerate fields here without a richer
+	// schema, but the surrounding tests show the value-struct's
+	// Go wrapper (`*TVFSchemaColumn`) already carries the live
+	// reference; keep the wrapper itself anchored on the result
+	// so its keepAlive list (when it has one) flows up.
+	for _, p := range params {
+		if p.isHandle || !p.isValueMsg {
+			continue
+		}
+		if p.isRepeated {
+			fmt.Fprintf(b, "\tfor _, _ka := range %s { if _ka != nil { _h.setKeepAlive(_ka) } }\n", p.goName)
+		} else {
+			fmt.Fprintf(b, "\tif %s != nil { _h.setKeepAlive(%s) }\n", p.goName, p.goName)
+		}
+	}
+	b.WriteString("\treturn _h, nil\n")
 	b.WriteString("}\n\n")
 }
 
@@ -2774,24 +3211,25 @@ func writeEncode(b *strings.Builder, f fieldInfo, bufVar string) {
 	fn := uint32(f.fieldNum)
 	v := f.goName
 	if f.isHandle {
+		// Single-line nil-safe append via pbAppendHandlePtr.
+		// Calling the helper avoids the gofmt-expanded
+		// `if X != nil { buf = pbAppendHandle(buf, N, X.rawPtr()) }`
+		// stanza which costs ~70 bytes per occurrence and adds up
+		// to several hundred KB across the full binding.
 		if f.isRepeated {
-			fmt.Fprintf(b, "\tfor _, item := range %s {\n", v)
-			fmt.Fprintf(b, "\t\tif item != nil { %s = pbAppendHandle(%s, %d, item.rawPtr()) }\n", bufVar, bufVar, fn)
-			b.WriteString("\t}\n")
+			fmt.Fprintf(b, "\tfor _, item := range %s { %s = pbAppendHandlePtr(%s, %d, item) }\n", v, bufVar, bufVar, fn)
 		} else {
-			fmt.Fprintf(b, "\tif %s != nil { %s = pbAppendHandle(%s, %d, %s.rawPtr()) }\n", v, bufVar, bufVar, fn, v)
+			fmt.Fprintf(b, "\t%s = pbAppendHandlePtr(%s, %d, %s)\n", bufVar, bufVar, fn, v)
 		}
 		return
 	}
 	if f.isValueMsg {
-		// Value-type submessage: delegate to the type's own marshal() helper
-		// and wrap its bytes as a length-delimited sub-message field.
+		// Value-type submessage: delegate via pbAppendSubmessagePtr,
+		// the same gofmt-friendly one-liner shape.
 		if f.isRepeated {
-			fmt.Fprintf(b, "\tfor _, item := range %s {\n", v)
-			fmt.Fprintf(b, "\t\tif item != nil { %s = pbAppendSubmessage(%s, %d, item.marshal()) }\n", bufVar, bufVar, fn)
-			b.WriteString("\t}\n")
+			fmt.Fprintf(b, "\tfor _, item := range %s { %s = pbAppendSubmessagePtr(%s, %d, item) }\n", v, bufVar, bufVar, fn)
 		} else {
-			fmt.Fprintf(b, "\tif %s != nil { %s = pbAppendSubmessage(%s, %d, %s.marshal()) }\n", v, bufVar, bufVar, fn, v)
+			fmt.Fprintf(b, "\t%s = pbAppendSubmessagePtr(%s, %d, %s)\n", bufVar, bufVar, fn, v)
 		}
 		return
 	}
@@ -3338,21 +3776,49 @@ func getWasmParents(msg *protogen.Message) []string {
 // every concrete handle implements.
 func emitOwnershipTransfer(b *strings.Builder, params []fieldInfo) {
 	for _, p := range params {
-		if !p.takesOwnership || !p.isHandle {
+		if p.isHandle && p.takesOwnership {
+			// All four shapes collapse to a single helper call.
+			// clearPtrAny / clearPtrAll handle the nil-interface
+			// short-circuit and the typed-nil-pointer no-op via
+			// the wrapped type assertion + nil-safe clearPtr,
+			// so the surrounding `if X != nil` guard can be
+			// dropped and the assertion stanza needs only one
+			// line. Saves ~50 bytes per occurrence over the
+			// gofmt-expanded inline form.
+			if p.isRepeated {
+				fmt.Fprintf(b, "\tclearPtrAll(%s)\n", p.goName)
+			} else {
+				fmt.Fprintf(b, "\tclearPtrAny(%s)\n", p.goName)
+			}
 			continue
 		}
-		switch {
-		case p.isRepeated && p.isAbstract:
-			fmt.Fprintf(b, "\tfor _, _co := range %s { if _co != nil { if _c, _ok := _co.(interface{ clearPtr() }); _ok { _c.clearPtr() } } }\n", p.goName)
-		case p.isRepeated:
-			fmt.Fprintf(b, "\tfor _, _co := range %s { if _co != nil { _co.clearPtr() } }\n", p.goName)
-		case p.isAbstract:
-			fmt.Fprintf(b, "\tif %s != nil { if _c, _ok := %s.(interface{ clearPtr() }); _ok { _c.clearPtr() } }\n", p.goName, p.goName)
-		default:
-			fmt.Fprintf(b, "\tif %s != nil { %s.clearPtr() }\n", p.goName, p.goName)
+		// Runtime-conditional ownership transfer: the field carries
+		// `wasm_take_ownership_when=<sibling_bool_field>`. Gate the
+		// clearPtrAny call on the bool selector — the helper itself
+		// already handles nil and typed-nil so the body collapses to
+		// one line per branch.
+		if p.isHandle && p.takeOwnershipWhen != "" {
+			selectorGo := goNameOfField(params, p.takeOwnershipWhen)
+			if selectorGo == "" {
+				continue
+			}
+			fmt.Fprintf(b, "\tif %s { clearPtrAny(%s) }\n", selectorGo, p.goName)
 		}
 	}
 }
+
+// goNameOfField finds the Go-name (camelCase) of a sibling proto
+// field given its snake_case proto field name. Returns "" if no
+// sibling matches; the caller then skips the conditional emit.
+func goNameOfField(params []fieldInfo, protoFieldName string) string {
+	for _, p := range params {
+		if p.fieldName == protoFieldName {
+			return p.goName
+		}
+	}
+	return ""
+}
+
 
 // methodRetainsHandleArgs reports whether a C++ method name suggests the
 // receiver will store a reference to any handle-typed argument. Setter

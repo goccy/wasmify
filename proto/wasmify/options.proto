@@ -39,6 +39,17 @@ extend google.protobuf.FieldOptions {
   // Typical symptom is a panic on the next handle accessed through
   // the parent (vtable read against freed memory).
   bool wasm_take_ownership = 50019;
+
+  // Conditional ownership-transfer marker for the C++ idiom where
+  // a method takes both a raw `T*` and a separate `bool` runtime
+  // selector that decides whether the receiver adopts ownership
+  // (e.g. `SimpleTable::AddColumn(const Column*, bool is_owned)`).
+  // The string value is the snake_case proto field name of the
+  // bool selector. The plugin emits a runtime guard
+  // `if <selector> { handle.clearPtr() }` after the invoke so the
+  // wrapper's ptr is dropped only when the selector indicates
+  // ownership was actually transferred.
+  string wasm_take_ownership_when = 50020;
 }
 
 extend google.protobuf.ServiceOptions {

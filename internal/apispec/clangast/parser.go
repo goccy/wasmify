@@ -1861,12 +1861,74 @@ func (p *Parser) parseClass(node *Node, namespace string) {
 	// `using Value = intptr_t;` we replace that TypeRef with one derived
 	// from the underlying type.
 	if aliases := p.classAliases[qualName]; aliases != nil {
-		substitute := func(ref *apispec.TypeRef) {
-			if ref == nil || ref.Name == "" {
+		// isAliasSubstitutable reports whether the alias target's
+		// shape is one we can faithfully marshal across the wire.
+		// Two patterns qualify:
+		//
+		//   1. Class-rename alias —
+		//        `using Column = TVFSchemaColumn;`
+		//      Bare class identifier (qualified or not).
+		//
+		//   2. Container-of-class alias —
+		//        `using ColumnList = vector<Column>;`
+		//      A single-level template (`vector<X>`, `set<X>`,
+		//      etc.) whose argument is a bare class identifier.
+		//      Substitution recurses into Inner so the element
+		//      ends up resolved to its underlying class.
+		//
+		// Anything deeper (e.g. `using PathParts =
+		// vector<vector<string_view>>` — a container of a
+		// container) is rejected. Those shapes need view-lifetime
+		// handling the bridge dispatch can't yet provide.
+		isBareIdent := func(s string) bool {
+			t := strings.TrimSpace(s)
+			t = strings.TrimPrefix(t, "const ")
+			t = strings.TrimSpace(strings.TrimRight(t, "*& "))
+			return t != "" && !strings.ContainsAny(t, "<,&* ")
+		}
+		isAliasSubstitutable := func(s string) bool {
+			t := strings.TrimSpace(s)
+			if isBareIdent(t) {
+				return true
+			}
+			// Single-level template: <one identifier inside>.
+			if i := strings.Index(t, "<"); i > 0 && strings.HasSuffix(t, ">") {
+				inner := t[i+1 : len(t)-1]
+				inner = strings.TrimSpace(inner)
+				return isBareIdent(inner)
+			}
+			return false
+		}
+		var substitute func(ref *apispec.TypeRef, insideTemplate bool)
+		substitute = func(ref *apispec.TypeRef, insideTemplate bool) {
+			if ref == nil {
+				return
+			}
+			// Recurse into Inner so vector / set / map element
+			// types in this class's signatures are alias-resolved
+			// too. (Without the recursion, e.g. `vector<Column>`
+			// in a TVFRelation method keeps Inner.Name="Column",
+			// which the bridge generator can't resolve to the
+			// underlying TVFSchemaColumn class.)
+			if ref.Inner != nil {
+				substitute(ref.Inner, insideTemplate || ref.Kind == apispec.TypeVector)
+			}
+			if ref.Name == "" {
 				return
 			}
 			underlying, ok := aliases[ref.Name]
 			if !ok {
+				return
+			}
+			// Skip aliases the bridge can't yet round-trip:
+			//   * vector-of-vector etc. at top level.
+			//   * any template alias when we're already inside a
+			//     template (would expand to a nested template the
+			//     wire-format layer doesn't yet support).
+			if !isAliasSubstitutable(underlying) {
+				return
+			}
+			if insideTemplate && !isBareIdent(underlying) {
 				return
 			}
 			// Reclassify based on the underlying type. Preserve const/
@@ -1880,28 +1942,82 @@ func (p *Parser) parseClass(node *Node, namespace string) {
 				return
 			}
 			// If the underlying type is complex (not a simple primitive,
-			// string, or enum), keep the alias name but qualify it with
-			// the enclosing class name. This avoids emitting unresolved
-			// nested type names in the bridge code. For example,
-			// `NameAndAnnotatedType` → `ClassName::NameAndAnnotatedType`.
+			// string, or enum), prefer the underlying class's actual
+			// qualified name so the bridge generator can look it up
+			// in classQualNames / classSourceFiles. The previous
+			// behaviour ("qualify the alias with enclosing class")
+			// produced names like `TVFRelation::Column` that no class
+			// is registered under — bridges of methods touching them
+			// were silently filtered out. Falling back to the alias
+			// path (qualify-with-enclosing-class) is preserved for
+			// the case where the underlying spelling is itself a
+			// nested name we couldn't resolve to a known class.
 			if resolved.Kind == apispec.TypeValue || resolved.Kind == apispec.TypeHandle {
-				qualAlias := qualName + "::" + ref.Name
-				resolved.QualType = qualAlias
-				resolved.Name = qualAlias
+				// Class-rename alias (e.g. `using Column = TVFSchemaColumn;`).
+				// Strip qualifiers off the underlying spelling so we can
+				// look it up against the known class set.
+				underlyingName := strings.TrimSpace(underlying)
+				underlyingName = strings.TrimPrefix(underlyingName, "const ")
+				underlyingName = strings.TrimSpace(strings.TrimRight(underlyingName, "*& "))
+				resolvedQual := ""
+				if underlyingName != "" {
+					if _, known := p.classes[underlyingName]; known {
+						// Already fully qualified.
+						resolvedQual = underlyingName
+					} else {
+						// Short-name lookup against the known class set.
+						match := ""
+						ambiguous := false
+						for q := range p.classes {
+							short := q
+							if i := strings.LastIndex(q, "::"); i >= 0 {
+								short = q[i+2:]
+							}
+							if short == underlyingName {
+								if match != "" && match != q {
+									ambiguous = true
+									break
+								}
+								match = q
+							}
+						}
+						if !ambiguous && match != "" {
+							resolvedQual = match
+						}
+					}
+				}
+				if resolvedQual != "" {
+					resolved.QualType = resolvedQual
+					resolved.Name = resolvedQual
+				} else {
+					// Couldn't resolve. Fall back to
+					// `EnclosingClass::AliasName` so at least the
+					// spelling is unambiguous within the project.
+					qualAlias := qualName + "::" + ref.Name
+					resolved.QualType = qualAlias
+					resolved.Name = qualAlias
+				}
 			}
 			resolved.IsConst = ref.IsConst || resolved.IsConst
 			resolved.IsPointer = ref.IsPointer || resolved.IsPointer
 			resolved.IsRef = ref.IsRef || resolved.IsRef
 			*ref = resolved
+			// After substituting the outer ref (e.g. ColumnList →
+			// vector<Column>), recurse into the new Inner so the
+			// element type is also alias-resolved
+			// (Column → TVFRelation::Column → TVFSchemaColumn).
+			if ref.Inner != nil {
+				substitute(ref.Inner, insideTemplate || ref.Kind == apispec.TypeVector)
+			}
 		}
 		for i := range cls.Methods {
-			substitute(&cls.Methods[i].ReturnType)
+			substitute(&cls.Methods[i].ReturnType, false)
 			for j := range cls.Methods[i].Params {
-				substitute(&cls.Methods[i].Params[j].Type)
+				substitute(&cls.Methods[i].Params[j].Type, false)
 			}
 		}
 		for i := range cls.Fields {
-			substitute(&cls.Fields[i].Type)
+			substitute(&cls.Fields[i].Type, false)
 		}
 	}
 }
