@@ -52,13 +52,20 @@ func wasmifyVersion() string {
 // AST JSON through the parser, and returns the per-batch APISpec. It is
 // a package-level variable so tests can substitute a stub that records
 // the call count and returns a synthetic spec — no real clang needed.
+// runBatchAllowedExternalClasses lists fully-qualified class names
+// to retain even when declared in non-project headers. Populated
+// at parse-headers entry from `bridge.ExternalTypes` so users do
+// not have to mirror protobuf descriptor / abseil opt-ins across
+// a second `IncludeExternalClasses` knob.
+var runBatchAllowedExternalClasses []string
+
 // Production calls go through the default implementation below.
 var runBatchClang = func(clangPath, umbrellaFile string, batch []string, compileFlags []string) (*apispec.APISpec, error) {
 	reader, cleanup, err := clangast.DumpASTStream(clangPath, umbrellaFile, compileFlags)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start clang: %w", err)
 	}
-	spec, err := clangast.ParseStreamMulti(reader, batch)
+	spec, err := clangast.ParseStreamMultiWithOptions(reader, batch, runBatchAllowedExternalClasses)
 	if waitErr := cleanup(); waitErr != nil && err == nil {
 		err = waitErr
 	}
@@ -1547,14 +1554,26 @@ func cmdParseHeaders(args []string) error {
 		// their methods parsed alongside the project headers. Each
 		// config entry is matched as a path substring against the
 		// .d file dependency lines.
+		// bridge.ExternalTypes drives the parser allow-list: classes
+		// whose qualified name appears here are retained even when
+		// declared in non-project headers. This subsumes the older
+		// IncludeExternalHeaders / IncludeExternalClasses workaround
+		// for the common case where the user has already declared the
+		// type permitted in I/F signatures.
+		runBatchAllowedExternalClasses = nil
 		if s, err := state.Load(outDir); err == nil &&
-			s != nil && s.Bridge != nil &&
-			len(s.Bridge.IncludeExternalHeaders) > 0 {
-			extras := externalHeadersFromBuild(b, s.Bridge.IncludeExternalHeaders)
-			for h := range extras {
-				projectHeaders[h] = true
+			s != nil && s.Bridge != nil {
+			if len(s.Bridge.ExternalTypes) > 0 {
+				runBatchAllowedExternalClasses = append([]string(nil), s.Bridge.ExternalTypes...)
+				fmt.Fprintf(os.Stderr, "[parse-headers] External classes allowed via bridge.ExternalTypes: %d\n", len(runBatchAllowedExternalClasses))
 			}
-			fmt.Fprintf(os.Stderr, "[parse-headers] External headers (from IncludeExternalHeaders): %d files\n", len(extras))
+			if len(s.Bridge.IncludeExternalHeaders) > 0 {
+				extras := externalHeadersFromBuild(b, s.Bridge.IncludeExternalHeaders)
+				for h := range extras {
+					projectHeaders[h] = true
+				}
+				fmt.Fprintf(os.Stderr, "[parse-headers] External headers (from IncludeExternalHeaders): %d files\n", len(extras))
+			}
 		}
 		headerFiles, headerGroups = discoverProjectHeadersFromBuild(absPath, b, projectHeaders)
 		if len(headerFiles) == 0 {
@@ -1663,6 +1682,14 @@ func cmdParseHeaders(args []string) error {
 		// another. Re-run after the full merge so cross-batch references
 		// are promoted to TypeHandle.
 		clangast.PostProcessHandleClasses(merged)
+		// Re-resolve any unqualified type spellings against the merged
+		// class / enum universe. The per-batch pass inside
+		// ParseStreamMultiWithOptions can only see classes from its own
+		// batch, so a method declared in batch A whose parameter type is
+		// defined in batch B would have stayed unqualified. Running the
+		// pass again on the merged spec gives every reference a chance to
+		// resolve against the full universe.
+		clangast.PostProcessQualifyShortNames(merged)
 
 		// Defer cache writes until after the spec is known good; if
 		// PostProcess panics or apispec.Save fails the next run will

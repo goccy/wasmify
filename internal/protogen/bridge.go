@@ -1301,13 +1301,14 @@ func isReturnableType(ref apispec.TypeRef) bool {
 func isBridgeableClass(c *apispec.Class) bool {
 	includedExternal := isIncludedExternalClass(c.QualName)
 	if !isProjectSource(c.SourceFile) {
-		// External classes are bridgeable when the user opted them
-		// in via `bridge.IncludeExternalClasses`. This is the path
-		// for protobuf descriptor types and similar library
-		// internals: the headers are parsed (via
-		// `bridge.IncludeExternalHeaders`) but their source files
-		// don't pass `isProjectSource`.
-		if !includedExternal {
+		// External classes are bridgeable when:
+		//   - explicitly opted in via bridge.IncludeExternalClasses
+		//     (legacy escape hatch, still honoured), OR
+		//   - listed in bridge.ExternalTypes -- the same class also
+		//     appears as an allowed parameter / return type, so its
+		//     constructors and methods should be reachable without a
+		//     parallel config knob.
+		if !includedExternal && !isAllowedExternalType(c.QualName) {
 			return false
 		}
 	}
@@ -1327,10 +1328,11 @@ func isBridgeableClass(c *apispec.Class) bool {
 		return false
 	}
 	// Skip classes from disabled libraries — unless the user
-	// explicitly opted this class in via IncludeExternalClasses,
-	// in which case the library disable doesn't apply.
+	// explicitly opted this class in via IncludeExternalClasses
+	// or it appears in bridge.ExternalTypes, in which case the
+	// library disable doesn't apply.
 	lib := classifyLibrary(c.SourceFile)
-	if !isLibraryEnabled(lib) && !includedExternal {
+	if !isLibraryEnabled(lib) && !includedExternal && !isAllowedExternalType(c.QualName) {
 		return false
 	}
 	// Skip classes defined in headers excluded from the bridge's include
@@ -1726,6 +1728,14 @@ func resolveTypeName(name string) string {
 //     default resolution points to a handle class while the original type was
 //     declared as a value type, try the nested type form
 //     (e.g., "Column" inside ns::TVFRelation → ns::TVFRelation::Column).
+//
+// The parser's postProcessQualifyShortNames pass rewrites unqualified type
+// spellings to their FQDN at parse time using clang's namespace / class
+// scope information, so by the time names reach this function they are
+// almost always already qualified. The remaining work here is the
+// nested-type alias path (clang sometimes records `using X = ::ns::X;`
+// as the enclosing class spelling) and the "name equals enclosing class"
+// case.
 func resolveTypeNameInContext(name, classContext string) string {
 	if classQualNames == nil {
 		return name
@@ -5624,7 +5634,7 @@ func writeHandleDispatch(b *strings.Builder, c *apispec.Class, allHandles map[st
 					for i, p := range ctor.Params {
 						varName := paramVarName(p, i)
 						if p.Type.Kind == apispec.TypeHandle {
-							castType := cppTypeName(p.Type)
+							castType := cppTypeNameInContext(p.Type, c.QualName)
 							constQual := ""
 							if p.Type.IsConst {
 								constQual = "const "
@@ -5852,10 +5862,28 @@ func writeCallBody(b *strings.Builder, fn *apispec.Function, handleClass string,
 		fmt.Fprintf(b, "%s%s;\n", indent, callExpr)
 	} else if fn.ReturnType.Kind == apispec.TypeHandle && !fn.ReturnType.IsPointer && !fn.ReturnType.IsRef &&
 		!isSmartPointerType(cppTypeName(fn.ReturnType)) && !isSmartPointerType(fn.ReturnType.QualType) {
-		// Handle by-value return: use direct heap construction to avoid
-		// needing a copy or move constructor (guaranteed copy elision in C++17).
-		// e.g., `auto* _result = new ScopedTimer(MakeScopedTimerStarted(...));`
-		typeName := resolveTypeName(cppTypeName(fn.ReturnType))
+		// Handle by-value return: use direct heap construction to
+		// avoid needing a copy or move constructor (guaranteed
+		// copy elision in C++17). When the resolved type is
+		// abstract, `new <T>(...)` is illegal — discard the
+		// result and emit a wire-format error so the Go side
+		// observes the call was attempted on a non-instantiable
+		// surface rather than failing the C++ compile. The parser-
+		// side `postProcessQualifyShortNames` pass is the primary
+		// fix for the historical short-name ambiguity that landed
+		// resolution on the wrong (abstract) candidate; this guard
+		// is a defence-in-depth safety net for any future spec
+		// that legitimately exposes a method whose declared return
+		// type is abstract (e.g. a covariant return whose top-level
+		// declaration names the abstract base).
+		typeName := resolveTypeNameInContext(cppTypeName(fn.ReturnType), handleClass)
+		if classAbstract != nil && classAbstract[typeName] {
+			fmt.Fprintf(b, "%s(void)(%s);\n", indent, callExpr)
+			fmt.Fprintf(b, "%sProtoWriter _pw;\n", indent)
+			fmt.Fprintf(b, "%s_pw.write_error(\"cannot construct abstract class %s\");\n", indent, typeName)
+			fmt.Fprintf(b, "%sreturn _pw.finish();\n", indent)
+			return
+		}
 		fmt.Fprintf(b, "%sauto* _result = new %s(%s);\n", indent, typeName, callExpr)
 	} else {
 		retType := cppReturnType(fn.ReturnType)
@@ -6344,7 +6372,7 @@ func writeStaticFactoryBody(b *strings.Builder, fn *apispec.Function, handleClas
 			continue
 		}
 		if p.Type.Kind == apispec.TypeHandle {
-			castType := cppTypeName(p.Type)
+			castType := cppTypeNameInContext(p.Type, handleClass)
 			constQual := ""
 			if p.Type.IsConst {
 				constQual = "const "
@@ -6357,6 +6385,23 @@ func writeStaticFactoryBody(b *strings.Builder, fn *apispec.Function, handleClas
 			// std::move to bind our local to the callee. Mirrors the
 			// logic in writeConstructorBody / writeCallBody.
 			args = append(args, "std::move("+varName+")")
+		} else if p.Type.Kind == apispec.TypeString &&
+			strings.Contains(p.Type.QualType, "char") &&
+			!strings.Contains(p.Type.QualType, "std::") &&
+			!strings.Contains(p.Type.QualType, "string") {
+			// C-style string param (`const char *` / `char *`):
+			// the local is std::string from the wire, but the
+			// callee wants char data. Pick c_str() for const,
+			// data() for mutable. Mirrors writeCallBody — without
+			// this branch, static factories like
+			// SourceLocation::DoNotInvokeDirectly(unsigned, const
+			// char *) failed to compile because the bridge passed
+			// the std::string local directly.
+			if strings.Contains(p.Type.QualType, "const") {
+				args = append(args, varName+".c_str()")
+			} else {
+				args = append(args, varName+".data()")
+			}
 		} else {
 			args = append(args, varName)
 		}
