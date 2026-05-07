@@ -211,6 +211,13 @@ type Parser struct {
 	headerFile  string                    // single header (legacy, for backward compat)
 	headerFiles map[string]bool           // set of target header file paths
 	classes     map[string]*apispec.Class // qualName -> Class for dedup
+	// allowedExternalClasses lists fully-qualified class names whose
+	// declarations the parser keeps even when their source file is
+	// outside the project header set. Populated from
+	// `bridge.ExternalTypes` so callers no longer need a parallel
+	// `IncludeExternalClasses` knob to expose the methods of types
+	// already permitted in I/F signatures.
+	allowedExternalClasses map[string]bool
 	// classIDs maps clang AST declaration ID → fully qualified class name.
 	// Used to resolve parentDeclContextId references for out-of-line nested
 	// class definitions.
@@ -313,14 +320,27 @@ func newParser(headerFiles []string) *Parser {
 		singleHeader = headerFiles[0]
 	}
 	return &Parser{
-		spec:           &apispec.APISpec{SourceFile: normalizeSourceFile(sourceFile)},
-		headerFile:     singleHeader,
-		headerFiles:    hf,
-		classes:        make(map[string]*apispec.Class),
-		classIDs:       make(map[string]string),
-		classParentIDs: make(map[string]string),
-		classAliases:   make(map[string]map[string]string),
-		globalAliases:  make(map[string]aliasInfo),
+		spec:                   &apispec.APISpec{SourceFile: normalizeSourceFile(sourceFile)},
+		headerFile:             singleHeader,
+		headerFiles:            hf,
+		classes:                make(map[string]*apispec.Class),
+		classIDs:               make(map[string]string),
+		classParentIDs:         make(map[string]string),
+		classAliases:           make(map[string]map[string]string),
+		globalAliases:          make(map[string]aliasInfo),
+		allowedExternalClasses: make(map[string]bool),
+	}
+}
+
+// SetAllowedExternalClasses lets the caller list fully-qualified
+// class names that the parser should retain even when their
+// declaration site is outside the project header set. The classes
+// still have to appear in clang's AST (typically via a transitive
+// `#include` from a project header); without this list the parser
+// drops them at the matchesTarget filter.
+func (p *Parser) SetAllowedExternalClasses(qualNames []string) {
+	for _, q := range qualNames {
+		p.allowedExternalClasses[q] = true
 	}
 }
 
@@ -392,6 +412,25 @@ func (p *Parser) fixupNestedClassQualNames() {
 	}
 }
 
+// qualNameAllowed reports whether the (namespace, name) tuple
+// resolves to a fully-qualified class name listed in
+// allowedExternalClasses. Used as the type-system-driven fallback
+// path so bridge.ExternalTypes-listed classes survive
+// matchesTarget filtering even when declared in non-project
+// headers.
+func (p *Parser) qualNameAllowed(namespace, name string) bool {
+	if name == "" || len(p.allowedExternalClasses) == 0 {
+		return false
+	}
+	if p.allowedExternalClasses[name] {
+		return true
+	}
+	if namespace != "" && p.allowedExternalClasses[namespace+"::"+name] {
+		return true
+	}
+	return false
+}
+
 // matchesTarget checks if a file path matches any of the target header files.
 func (p *Parser) matchesTarget(file string) bool {
 	if p.headerFile != "" {
@@ -417,6 +456,10 @@ func Parse(root *Node, headerFile string) *apispec.APISpec {
 	// Expand namespace-scope typedefs now that the full alias map is
 	// known — see postProcessTypedefAliases for the motivation.
 	p.postProcessTypedefAliases()
+	// Resolve unqualified type references against the full namespace /
+	// class scope universe before downstream code looks them up by
+	// FQDN — see postProcessQualifyShortNames for the rationale.
+	p.postProcessQualifyShortNames()
 	// Flatten classes map
 	for _, c := range p.classes {
 		p.spec.Classes = append(p.spec.Classes, *c)
@@ -461,6 +504,298 @@ func PostProcessHandleClasses(spec *apispec.APISpec) {
 // print "Type", not "googlesql::Type") are re-qualified against the
 // project's class map and the typedef's defining namespace so
 // downstream type lookups land on the real qualified class.
+// postProcessQualifyShortNames rewrites parameter and return type
+// `qualType` strings whose bare class name is not yet
+// fully-qualified, using C++ unqualified-name lookup against the
+// namespaces and class scopes already discovered during the
+// stream parse.
+//
+// clang's `-ast-dump=json` preserves the source spelling of types,
+// so a parameter declared inside `namespace google::protobuf`
+// as `SourceLocation*` lands here with `qualType =
+// "SourceLocation *"`. Downstream code that maps short names to
+// FQDNs via classQualNames picks whichever entry happened to land
+// in the map -- which can resolve `SourceLocation` to
+// `googlesql_base::SourceLocation` even though
+// `Descriptor::GetSourceLocation`'s parameter is in
+// `google::protobuf` scope.
+//
+// This pass closes that gap by approximating the C++
+// unqualified-name lookup rules at parse time:
+//
+//   1. Class scope first -- nested types of the enclosing class.
+//   2. Inside-out walk of the enclosing namespace stack.
+//   3. Global (no-prefix) scope.
+//
+// The first hit wins. The resolved FQDN is written back to both
+// `Name` (so downstream lookups by `Name` match) and `QualType`
+// (so any string-based bridge emit picks up the qualified form).
+func (p *Parser) postProcessQualifyShortNames() {
+	// Build the universe of known qualified names (classes + enums).
+	known := make(map[string]bool, len(p.classes)+len(p.spec.Enums))
+	parents := make(map[string][]string, len(p.classes))
+	for q, c := range p.classes {
+		known[q] = true
+		if len(c.Parents) > 0 {
+			parents[q] = c.Parents
+		}
+	}
+	for _, e := range p.spec.Enums {
+		if e.QualName != "" {
+			known[e.QualName] = true
+		}
+	}
+
+	// Free functions: no enclosing class context, just namespace.
+	for i := range p.spec.Functions {
+		fn := &p.spec.Functions[i]
+		ns := fn.Namespace
+		qualifyTypeRef(&fn.ReturnType, ns, "", known, parents)
+		for j := range fn.Params {
+			qualifyTypeRef(&fn.Params[j].Type, ns, "", known, parents)
+		}
+	}
+
+	// Class methods: enclosing class scope + its namespace.
+	for _, c := range p.classes {
+		ns := c.Namespace
+		classQual := c.QualName
+		for i := range c.Methods {
+			m := &c.Methods[i]
+			qualifyTypeRef(&m.ReturnType, ns, classQual, known, parents)
+			for j := range m.Params {
+				qualifyTypeRef(&m.Params[j].Type, ns, classQual, known, parents)
+			}
+		}
+		for i := range c.Fields {
+			qualifyTypeRef(&c.Fields[i].Type, ns, classQual, known, parents)
+		}
+	}
+}
+
+// PostProcessQualifyShortNames is the exported entry point that
+// re-runs unqualified-name resolution on a merged APISpec. The
+// per-batch pass in ParseStream / ParseStreamMultiWithOptions can
+// only see the classes that landed in its own batch; cross-batch
+// references (e.g. a method declared in batch A whose parameter
+// type is defined in batch B) need a second pass with the full
+// merged class / enum universe in view. Idempotent.
+func PostProcessQualifyShortNames(spec *apispec.APISpec) {
+	if spec == nil {
+		return
+	}
+	known := make(map[string]bool, len(spec.Classes)+len(spec.Enums))
+	parents := make(map[string][]string, len(spec.Classes))
+	for i := range spec.Classes {
+		c := &spec.Classes[i]
+		if c.QualName != "" {
+			known[c.QualName] = true
+			if len(c.Parents) > 0 {
+				parents[c.QualName] = c.Parents
+			}
+		}
+	}
+	for i := range spec.Enums {
+		if q := spec.Enums[i].QualName; q != "" {
+			known[q] = true
+		}
+	}
+	for i := range spec.Functions {
+		fn := &spec.Functions[i]
+		ns := fn.Namespace
+		qualifyTypeRef(&fn.ReturnType, ns, "", known, parents)
+		for j := range fn.Params {
+			qualifyTypeRef(&fn.Params[j].Type, ns, "", known, parents)
+		}
+	}
+	for i := range spec.Classes {
+		c := &spec.Classes[i]
+		ns := c.Namespace
+		classQual := c.QualName
+		for j := range c.Methods {
+			m := &c.Methods[j]
+			qualifyTypeRef(&m.ReturnType, ns, classQual, known, parents)
+			for k := range m.Params {
+				qualifyTypeRef(&m.Params[k].Type, ns, classQual, known, parents)
+			}
+		}
+		for j := range c.Fields {
+			qualifyTypeRef(&c.Fields[j].Type, ns, classQual, known, parents)
+		}
+	}
+}
+
+// qualifyTypeRef rewrites ref.QualType / ref.Name to use the
+// fully-qualified class name when the as-written spelling is
+// unqualified. Recurses into ref.Inner (template args /
+// container element types).
+func qualifyTypeRef(ref *apispec.TypeRef, ns, classQual string, known map[string]bool, parents map[string][]string) {
+	if ref == nil {
+		return
+	}
+	if ref.Inner != nil {
+		qualifyTypeRef(ref.Inner, ns, classQual, known, parents)
+	}
+	if ref.Kind != apispec.TypeHandle && ref.Kind != apispec.TypeValue {
+		return
+	}
+	bare := bareTypeName(ref.QualType)
+	if bare == "" || strings.Contains(bare, "::") {
+		return
+	}
+	fqn := lookupUnqualified(bare, ns, classQual, known, parents)
+	if fqn == "" {
+		// Fallback for type references whose declaration is not in
+		// any parsed batch (typically external library types like
+		// `google::protobuf::SourceLocation` reachable from a
+		// project-public method but never parsed because the
+		// header lives outside the scan set). C++ unqualified-name
+		// lookup in the absence of a `using namespace` directive
+		// always falls back to the enclosing namespace, so prepend
+		// it so downstream code does not have to disambiguate.
+		// Empty namespace (free / extern "C" / global scope) is
+		// left alone.
+		if ns == "" {
+			return
+		}
+		fqn = ns + "::" + bare
+	}
+	if fqn == bare {
+		return
+	}
+	ref.Name = fqn
+	// Replace only the first occurrence of the bare name in
+	// QualType so the cv-qualifiers and pointer/reference markers
+	// surrounding it survive intact.
+	ref.QualType = replaceBareIdent(ref.QualType, bare, fqn)
+}
+
+// lookupUnqualified mirrors C++ unqualified-name lookup at the
+// declaration site of a method or free function. classQual may
+// be empty (free function); ns is the enclosing namespace.
+// parents maps each class's qual_name to its base classes' qual_names
+// so the lookup can resolve nested types inherited from a base.
+func lookupUnqualified(name, ns, classQual string, known map[string]bool, parents map[string][]string) string {
+	// 1. Class scope: nested types of the enclosing class, walking
+	//    the inheritance chain. C++ unqualified-name lookup inside
+	//    a member function searches the class itself, then its base
+	//    classes (depth-first), then the enclosing namespace -- so
+	//    a derived class referencing `Status` resolves to
+	//    `Base::Status` if the derived class doesn't redeclare it.
+	if classQual != "" {
+		visited := map[string]bool{}
+		var walk func(cls string) string
+		walk = func(cls string) string {
+			if visited[cls] {
+				return ""
+			}
+			visited[cls] = true
+			candidate := cls + "::" + name
+			if known[candidate] {
+				return candidate
+			}
+			for _, parent := range parents[cls] {
+				if got := walk(parent); got != "" {
+					return got
+				}
+			}
+			return ""
+		}
+		if got := walk(classQual); got != "" {
+			return got
+		}
+	}
+	// 2. Inside-out walk of the namespace stack.
+	if ns != "" {
+		segments := strings.Split(ns, "::")
+		for i := len(segments); i > 0; i-- {
+			scope := strings.Join(segments[:i], "::")
+			candidate := scope + "::" + name
+			if known[candidate] {
+				return candidate
+			}
+		}
+	}
+	// 3. Global scope.
+	if known[name] {
+		return name
+	}
+	return ""
+}
+
+// bareTypeName strips cv qualifiers, pointer/reference markers,
+// and elaborated-type-specifier keywords from a clang qualType
+// string and returns the bare identifier. Returns "" when the
+// remainder is not a single identifier (e.g. template
+// instantiations -- those keep their existing form because
+// qualification of template arguments would land on
+// ref.Inner).
+func bareTypeName(qt string) string {
+	s := strings.TrimSpace(qt)
+	for {
+		prev := s
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, "*")
+		s = strings.TrimSuffix(s, "&")
+		s = strings.TrimSpace(s)
+		s = strings.TrimPrefix(s, "const ")
+		s = strings.TrimPrefix(s, "volatile ")
+		s = strings.TrimPrefix(s, "class ")
+		s = strings.TrimPrefix(s, "struct ")
+		s = strings.TrimPrefix(s, "union ")
+		s = strings.TrimPrefix(s, "enum ")
+		s = strings.TrimPrefix(s, "::")
+		s = strings.TrimSpace(s)
+		if s == prev {
+			break
+		}
+	}
+	if s == "" || strings.ContainsAny(s, "<>(),") || strings.Contains(s, " ") {
+		return ""
+	}
+	return s
+}
+
+// replaceBareIdent replaces the first whole-identifier occurrence
+// of `from` with `to` inside a qualType string. The simple
+// strings.Replace would also match substrings of longer names
+// (e.g. replacing `Type` inside `MyType`); whole-identifier
+// matching guards by checking the surrounding characters.
+func replaceBareIdent(qt, from, to string) string {
+	idx := strings.Index(qt, from)
+	if idx < 0 {
+		return qt
+	}
+	endsWell := func(c byte) bool {
+		return c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != ':'
+	}
+	startsWell := func(c byte) bool {
+		// Allow `::` as a leading delimiter (for already-qualified
+		// names) but treat the delimiter as ":" only if it is part
+		// of the C++ scope operator.
+		return c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9')
+	}
+	for idx >= 0 {
+		ok := true
+		if idx > 0 && !startsWell(qt[idx-1]) {
+			ok = false
+		}
+		end := idx + len(from)
+		if ok && end < len(qt) && !endsWell(qt[end]) {
+			ok = false
+		}
+		if ok {
+			return qt[:idx] + to + qt[end:]
+		}
+		next := strings.Index(qt[idx+1:], from)
+		if next < 0 {
+			break
+		}
+		idx = idx + 1 + next
+	}
+	return qt
+}
+
 func (p *Parser) postProcessTypedefAliases() {
 	if len(p.globalAliases) == 0 {
 		return
@@ -977,7 +1312,20 @@ func ParseStream(r io.Reader, headerFile string) (*apispec.APISpec, error) {
 // This is used with an umbrella header that includes all public headers:
 // clang processes one compilation, and we match declarations from any target header.
 func ParseStreamMulti(r io.Reader, headerFiles []string) (*apispec.APISpec, error) {
+	return ParseStreamMultiWithOptions(r, headerFiles, nil)
+}
+
+// ParseStreamMultiWithOptions is the option-bearing form of
+// ParseStreamMulti. allowedExternalClasses lists fully-qualified
+// class names (e.g. "google::protobuf::DescriptorPool") that the
+// parser should retain even when their declaration site is
+// outside the project header set. Pass nil to fall back to the
+// project-only filter.
+func ParseStreamMultiWithOptions(r io.Reader, headerFiles []string, allowedExternalClasses []string) (*apispec.APISpec, error) {
 	p := newParser(headerFiles)
+	if len(allowedExternalClasses) > 0 {
+		p.SetAllowedExternalClasses(allowedExternalClasses)
+	}
 
 	dec := json.NewDecoder(r)
 
@@ -1002,6 +1350,15 @@ func ParseStreamMulti(r io.Reader, headerFiles []string) (*apispec.APISpec, erro
 	for _, c := range p.classes {
 		p.spec.Classes = append(p.spec.Classes, *c)
 	}
+	// Re-write unqualified type references with their fully-qualified
+	// form by walking the namespace / class scope. clang's
+	// `qualType` field preserves the as-written spelling so a
+	// parameter declared inside `namespace google::protobuf` as
+	// `SourceLocation*` arrives here as the bare string
+	// `SourceLocation *`. Without this pass, downstream code has to
+	// disambiguate short names against an ambiguous global pool and
+	// can pick the wrong namespace's class.
+	p.postProcessQualifyShortNames()
 	// Per-batch pass: disable short-name promotion. A short name like
 	// "Type" may look unambiguous inside a single batch but collide with
 	// another enum (or a class) once all batches are merged. The merged
@@ -1144,8 +1501,12 @@ func (p *Parser) streamObject(dec *json.Decoder, namespace string, currentFile s
 				return nil, true, nodeFile, nil
 
 			case "FunctionDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
-				// These are interesting if from target file — buffer inner for full decode
-				nodeInTarget := p.matchesTarget(nodeFile)
+				// These are interesting if from target file — or if the
+				// user has listed the class qualified name in
+				// bridge.ExternalTypes (mirrored into
+				// allowedExternalClasses). Buffer inner so the decode
+				// site can re-check after the full qual name resolves.
+				nodeInTarget := p.matchesTarget(nodeFile) || p.qualNameAllowed(namespace, name)
 				if !nodeInTarget {
 					skipValue(dec)
 					skipRemainingFields(dec)
@@ -1190,7 +1551,7 @@ func (p *Parser) streamObject(dec *json.Decoder, namespace string, currentFile s
 
 	switch kind {
 	case "FunctionDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
-		if !p.matchesTarget(nodeFile) {
+		if !p.matchesTarget(nodeFile) && !p.qualNameAllowed(namespace, name) {
 			return nil, true, nodeFile, nil
 		}
 		node, err := reconstructNode(kind, name, loc, rng, pendingFields)
@@ -1402,7 +1763,7 @@ func (p *Parser) walk(node *Node, namespace string, inTargetFile bool, parentFil
 	}
 	nodeInTarget := inTargetFile
 	if nodeFile != "" {
-		nodeInTarget = p.matchesTarget(nodeFile)
+		nodeInTarget = p.matchesTarget(nodeFile) || p.qualNameAllowed(namespace, node.Name)
 	}
 
 	switch node.Kind {
@@ -1955,10 +2316,19 @@ func (p *Parser) parseClass(node *Node, namespace string) {
 			if resolved.Kind == apispec.TypeValue || resolved.Kind == apispec.TypeHandle {
 				// Class-rename alias (e.g. `using Column = TVFSchemaColumn;`).
 				// Strip qualifiers off the underlying spelling so we can
-				// look it up against the known class set.
+				// look it up against the known class set. clang emits the
+				// underlying type with a leading `::` global-scope marker
+				// for qualified using-decls like
+				// `using StructField = ::googlesql::StructField;` --
+				// strip it before the class-set lookup, otherwise the
+				// `p.classes` map (keyed without the leading `::`) misses
+				// and the alias falls through to the
+				// `EnclosingClass::AliasName` fallback path, producing a
+				// bogus FQDN that no class is registered under.
 				underlyingName := strings.TrimSpace(underlying)
 				underlyingName = strings.TrimPrefix(underlyingName, "const ")
 				underlyingName = strings.TrimSpace(strings.TrimRight(underlyingName, "*& "))
+				underlyingName = strings.TrimPrefix(underlyingName, "::")
 				resolvedQual := ""
 				if underlyingName != "" {
 					if _, known := p.classes[underlyingName]; known {

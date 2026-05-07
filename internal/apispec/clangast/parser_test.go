@@ -1178,6 +1178,102 @@ func TestClassScopedTypeAlias(t *testing.T) {
 	}
 }
 
+// TestClassScopedTypeAlias_QualifiedUnderlying verifies that a
+// class-scope `using` alias whose underlying spelling is a
+// fully-qualified name with the C++ global-scope prefix
+// (`using StructField = ::ns::StructField;`) resolves to the
+// real underlying class rather than the bogus
+// `EnclosingClass::AliasName` fallback path.
+//
+// Concrete failure this guards: clang AST emits the alias's
+// underlying qualType with a leading `::` global-scope marker,
+// and the substitute path's class-set lookup is keyed without
+// that marker. Without stripping the leading `::`, every method
+// referencing the alias (e.g. `vector<StructField> StructType.fields()`)
+// got an inner TypeRef named `EnclosingClass::AliasName`
+// (i.e. `googlesql::StructType::StructField`), no class is registered
+// under that FQDN, the bridge filter drops every method that
+// touches it, and downstream Go consumers (go-zetasqlite) lose
+// access to `StructType.Fields()` and `TypeFactory.MakeStructType`.
+func TestClassScopedTypeAlias_QualifiedUnderlying(t *testing.T) {
+	headerFile := "test_alias_q.h"
+	loc := &Loc{File: headerFile, Line: 1}
+	root := &Node{
+		Kind: "TranslationUnitDecl",
+		Inner: []Node{
+			{
+				Kind: "NamespaceDecl",
+				Name: "ns",
+				Inner: []Node{
+					// struct ns::Foo { ... };
+					{
+						Kind:    "CXXRecordDecl",
+						Name:    "Foo",
+						Loc:     loc,
+						TagUsed: "struct",
+						Inner: []Node{
+							{
+								Kind:   "FieldDecl",
+								Name:   "x",
+								Access: "public",
+								Type:   &Type{QualType: "int"},
+							},
+						},
+					},
+					// class ns::Container { ... using Foo = ::ns::Foo; const std::vector<Foo>& items() const; ... }
+					{
+						Kind:    "CXXRecordDecl",
+						Name:    "Container",
+						Loc:     loc,
+						TagUsed: "class",
+						Inner: []Node{
+							// `using Foo = ::ns::Foo;` -- clang reports the
+							// underlying with a leading `::`.
+							{
+								Kind: "TypeAliasDecl",
+								Name: "Foo",
+								Type: &Type{QualType: "::ns::Foo"},
+							},
+							{
+								Kind:   "CXXMethodDecl",
+								Name:   "items",
+								Access: "public",
+								Type:   &Type{QualType: "const std::vector<Foo> &() const"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	spec := Parse(root, headerFile)
+	var container *apispec.Class
+	for i := range spec.Classes {
+		if spec.Classes[i].QualName == "ns::Container" {
+			container = &spec.Classes[i]
+		}
+	}
+	if container == nil {
+		t.Fatalf("ns::Container not found in spec")
+	}
+	if len(container.Methods) != 1 {
+		t.Fatalf("expected 1 method on Container, got %d", len(container.Methods))
+	}
+	ret := container.Methods[0].ReturnType
+	if ret.Inner == nil {
+		t.Fatal("expected vector inner TypeRef on items() return")
+	}
+	want := "ns::Foo"
+	if ret.Inner.Name != want {
+		t.Errorf("inner.Name = %q, want %q (alias must resolve to underlying class, not EnclosingClass::AliasName)",
+			ret.Inner.Name, want)
+	}
+	if ret.Inner.QualType != want {
+		t.Errorf("inner.QualType = %q, want %q", ret.Inner.QualType, want)
+	}
+}
+
 // TestReferenceFieldPromotesHandle verifies that a class with a reference
 // field is promoted to a handle type even if it otherwise looks POD-like.
 // Brace-init `T var{};` is impossible when T has a reference member.
