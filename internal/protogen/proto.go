@@ -3,10 +3,12 @@ package protogen
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bufbuild/protocompile"
@@ -219,6 +221,15 @@ func reclassifyExtraStringTypes(spec *apispec.APISpec, extras []string) {
 func GenerateProtoWithConfig(spec *apispec.APISpec, packageName string, cfg BridgeConfig) string {
 	// Initialize bridge config globals so isBridgeableClass works correctly.
 	bridgeConfig = cfg
+	// Mirror the parser-side transitive parent admission into
+	// bridgeConfig.ExternalTypes: when an admitted external class has a
+	// parent that is also external, the parent must pass
+	// `isBridgeableClass` so its handle service / Go base struct gets
+	// emitted. Without this expansion the parser-level admission stops
+	// at the api-spec entry — proto-gen's filter then drops the parent
+	// because the user-supplied ExternalTypes only lists leaf classes
+	// (e.g. `FileDescriptorProto` → `Message` → `MessageLite` ladder).
+	bridgeConfig.ExternalTypes = expandExternalTypesByParentChain(bridgeConfig.ExternalTypes, spec)
 	// Reclassify TypeRefs whose name is registered as a library-specific
 	// string alias (BridgeConfig.ExtraStringTypes, e.g. absl::string_view
 	// or absl::Cord). The clang parser is library-agnostic and classifies
@@ -871,16 +882,25 @@ func writeRequestField(b *strings.Builder, protoType, fieldName string, fieldNum
 }
 
 // writeRequestFieldOwnershipWhen emits a proto-field line annotated
-// with [(wasmify.wasm_take_ownership_when) = "<selector>"]. The
-// plugin reads this extension and emits a runtime guard
-// `if <selector> { handle.clearPtr() }` after the invoke. Used for
-// the C++ idiom where a method takes both a raw `T*` and a `bool`
-// selector parameter (e.g. `AddColumn(const Column*, bool
-// is_owned)`); the proto schema cannot mark the handle field as
-// unconditionally ownership-transferring because passing the
-// selector as false is a legitimate borrowed-pass-through.
-func writeRequestFieldOwnershipWhen(b *strings.Builder, protoType, fieldName string, fieldNum int, selector string) {
-	fmt.Fprintf(b, "  %s %s = %d [(wasmify.wasm_take_ownership_when) = %q];\n", protoType, fieldName, fieldNum, selector)
+// with the runtime-conditional ownership transfer pair:
+//
+//	[(wasmify.wasm_take_ownership_when) = "<selector_param>",
+//	 (wasmify.wasm_take_ownership_equals) = "<json_literal>"]
+//
+// The plugin reads BOTH options and emits a runtime guard whose
+// shape adapts to the parameter's primitive type:
+//
+//	bool param  + equals=true   → if <param> { handle.clearPtr() }
+//	bool param  + equals=false  → if !<param> { handle.clearPtr() }
+//	int param   + equals=N      → if <param> == N { handle.clearPtr() }
+//	string param + equals="x"   → if <param> == "x" { handle.clearPtr() }
+//
+// `equalsLiteral` is the JSON encoding of the value (see
+// encodeTransferWhenEquals); the plugin parses it back to choose
+// the Go expression form.
+func writeRequestFieldOwnershipWhen(b *strings.Builder, protoType, fieldName string, fieldNum int, selectorParam, equalsLiteral string) {
+	fmt.Fprintf(b, "  %s %s = %d [(wasmify.wasm_take_ownership_when) = %q, (wasmify.wasm_take_ownership_equals) = %q];\n",
+		protoType, fieldName, fieldNum, selectorParam, equalsLiteral)
 }
 
 // paramTakesOwnership reports whether the C++ counterpart of p takes
@@ -932,9 +952,16 @@ func paramTakesOwnership(p apispec.Param) bool {
 // matched method is invoked, handle parameters that are NOT
 // already ownership-transferring through the C++ type system
 // are treated as if they carried `wasm_take_ownership` —
-// PROVIDED the matched overload does not also include a `bool`
-// parameter (which marks the runtime-conditional shape; see
+// PROVIDED the entry does not declare `transfer_when` (which
+// marks the runtime-conditional shape; see
 // conditionalOwnershipSelector).
+//
+// Pre-fix history: this branch previously fell back to
+// `hasBoolParam(m)` to auto-detect Pattern 2. That heuristic was
+// fragile (any random bool param would silently flip the entry
+// into Pattern 2) and never validated which bool the C++ side
+// actually consults. The explicit `transfer_when` schema
+// replaces it.
 func methodParamTakesOwnership(m apispec.Function, p apispec.Param) bool {
 	if paramTakesOwnership(p) {
 		return true
@@ -946,39 +973,150 @@ func methodParamTakesOwnership(m apispec.Function, p apispec.Param) bool {
 	if entry == nil {
 		return false
 	}
-	if hasBoolParam(m) {
+	if entry.TransferWhen != nil {
 		// Runtime-conditional ownership transfer; emitted via
-		// wasm_take_ownership_when by conditionalOwnershipSelector.
+		// wasm_take_ownership_when + wasm_take_ownership_equals
+		// by conditionalOwnershipTransferSpec.
 		return false
 	}
 	return true
 }
 
-// conditionalOwnershipSelector returns the snake_case proto
-// field name of the bool parameter that gates the runtime
-// ownership transfer for the matched overload, or "" when no
-// matched overload requires runtime gating.
+// conditionalOwnershipTransferSpec returns the (param-name, equals)
+// pair driving runtime-conditional ownership transfer for the
+// matched overload, or zero values when no entry applies.
 //
-// The bool is identified by TYPE: the matched overload (per
-// OwnershipTransferMethods) must include exactly one bool
-// parameter, which the generator treats as the selector. Listing
-// a method with multiple bool parameters is an error -- the user
-// must provide a Signature that pins down which overload they
-// mean and that overload must have a single bool.
-func conditionalOwnershipSelector(m apispec.Function) string {
+// The selector is taken VERBATIM from `entry.TransferWhen.Param`
+// — the matched overload must declare a parameter with that name
+// (validated below) and the parameter's primitive type must be
+// compatible with the JSON shape of `entry.TransferWhen.Equals`:
+//   - bool param   ↔ JSON bool
+//   - int  param   ↔ JSON number (any integer literal)
+//   - string param ↔ JSON string
+//
+// On any mismatch (param name not on overload, type/value
+// disagreement, unsupported primitive) the function panics with
+// a diagnostic so the misconfiguration surfaces at gen-proto
+// time rather than as a confusing runtime error after wasm-build.
+//
+// Returns ("", nil) when the matched entry does not declare
+// `transfer_when` (Pattern 1 instead of Pattern 2).
+func conditionalOwnershipTransferSpec(m apispec.Function) (paramSnake string, equalsLiteral string) {
 	entry := matchOwnershipTransferEntry(m)
-	if entry == nil {
-		return ""
+	if entry == nil || entry.TransferWhen == nil {
+		return "", ""
 	}
-	if !hasBoolParam(m) {
-		return ""
+	tw := entry.TransferWhen
+	if tw.Param == "" {
+		panic(fmt.Sprintf("OwnershipTransferMethods[%s].transfer_when.param is empty", entry.Method))
 	}
-	for _, p := range m.Params {
-		if isBoolPrimitive(p.Type) {
-			return toSnakeCase(p.Name)
+	var matchedParam *apispec.Param
+	for i := range m.Params {
+		if m.Params[i].Name == tw.Param {
+			matchedParam = &m.Params[i]
+			break
 		}
 	}
-	return ""
+	if matchedParam == nil {
+		paramNames := make([]string, len(m.Params))
+		for i, p := range m.Params {
+			paramNames[i] = p.Name
+		}
+		panic(fmt.Sprintf("OwnershipTransferMethods[%s].transfer_when.param=%q is not a parameter of the matched overload (have: %v)",
+			entry.Method, tw.Param, paramNames))
+	}
+	literal, err := encodeTransferWhenEquals(matchedParam.Type, tw.Equals)
+	if err != nil {
+		panic(fmt.Sprintf("OwnershipTransferMethods[%s].transfer_when.equals: %v", entry.Method, err))
+	}
+	return toSnakeCase(tw.Param), literal
+}
+
+// encodeTransferWhenEquals validates that `equals` matches the
+// primitive type of `paramType` and returns a string encoding
+// suitable for the `wasm_take_ownership_equals` proto field
+// option. The encoding is the JSON literal:
+//   - bool:   "true" / "false"
+//   - int:    decimal text ("0", "1", "-7")
+//   - string: JSON-quoted ("\"transfer\"")
+//
+// Plugin-side parser inverts this back into the appropriate Go
+// expression (see protoc-gen-wasmify-go).
+func encodeTransferWhenEquals(paramType apispec.TypeRef, equals any) (string, error) {
+	switch {
+	case isBoolPrimitive(paramType):
+		b, ok := equals.(bool)
+		if !ok {
+			return "", fmt.Errorf("expected JSON bool for bool parameter; got %T (%v)", equals, equals)
+		}
+		if b {
+			return "true", nil
+		}
+		return "false", nil
+	case isIntegerPrimitive(paramType):
+		// JSON numbers decode as float64 by default in Go's
+		// encoding/json; accept any numeric and verify it's an
+		// integer in range.
+		switch v := equals.(type) {
+		case float64:
+			if v != float64(int64(v)) {
+				return "", fmt.Errorf("expected integer for int parameter; got non-integer %v", v)
+			}
+			return strconv.FormatInt(int64(v), 10), nil
+		case int:
+			return strconv.FormatInt(int64(v), 10), nil
+		case int64:
+			return strconv.FormatInt(v, 10), nil
+		default:
+			return "", fmt.Errorf("expected JSON number for int parameter; got %T (%v)", equals, equals)
+		}
+	case isStringPrimitive(paramType):
+		s, ok := equals.(string)
+		if !ok {
+			return "", fmt.Errorf("expected JSON string for string parameter; got %T (%v)", equals, equals)
+		}
+		// JSON-quote the string so the plugin can safely embed it.
+		buf, _ := json.Marshal(s)
+		return string(buf), nil
+	}
+	return "", fmt.Errorf("unsupported transfer_when parameter type %q (kind=%s); supported: bool, integer primitive, string-like", paramType.QualType, paramType.Kind)
+}
+
+// isIntegerPrimitive reports whether t is a primitive integer
+// type (signed or unsigned, any width). Used by
+// encodeTransferWhenEquals to validate `transfer_when.equals`.
+func isIntegerPrimitive(t apispec.TypeRef) bool {
+	if t.Kind != apispec.TypePrimitive {
+		return false
+	}
+	switch strings.TrimSpace(t.Name) {
+	case "int", "int8_t", "int16_t", "int32_t", "int64_t",
+		"uint", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+		"short", "long", "long long",
+		"unsigned", "unsigned int", "unsigned short", "unsigned long", "unsigned long long",
+		"signed", "signed int", "signed short", "signed long", "signed long long",
+		"size_t", "ssize_t", "intptr_t", "uintptr_t",
+		"char", "signed char", "unsigned char":
+		return true
+	}
+	return false
+}
+
+// isStringPrimitive reports whether t is a string-like type
+// (`std::string`, `absl::string_view`). The clang parser
+// classifies these as TypeString (or TypeValue with appropriate
+// QualType after `reclassifyExtraStringTypes` runs); accept
+// either.
+func isStringPrimitive(t apispec.TypeRef) bool {
+	if t.Kind == apispec.TypeString {
+		return true
+	}
+	switch strings.TrimSpace(t.QualType) {
+	case "std::string", "const std::string &", "std::string &",
+		"absl::string_view", "const absl::string_view &", "absl::string_view &":
+		return true
+	}
+	return false
 }
 
 // matchOwnershipTransferEntry walks
@@ -1008,14 +1146,63 @@ func matchOwnershipTransferEntry(m apispec.Function) *state.OwnershipTransferEnt
 // signatureMatches reports whether the configured signature
 // matches the actual parameter qual_types in order. Whitespace
 // is collapsed on both sides so user-written and clang-emitted
-// spellings line up.
+// spellings line up. Unqualified user-supplied class names match
+// fully-qualified clang qual_types via trailing-component match
+// (see qualTypeMatches) — required because clang reports
+// `const googlesql::Column *` while users typically write
+// `const Column *` in `bridge.OwnershipTransferMethods` signatures.
 func signatureMatches(sig []string, params []apispec.Param) bool {
 	if len(sig) != len(params) {
 		return false
 	}
 	for i, want := range sig {
 		got := params[i].Type.QualType
-		if normaliseQualType(want) != normaliseQualType(got) {
+		if !qualTypeMatches(want, got) {
+			return false
+		}
+	}
+	return true
+}
+
+// qualTypeMatches reports whether the user-supplied type spec `want`
+// matches the clang-emitted qual_type `got`. Match succeeds when:
+//
+//  1. The two strings are equal after whitespace normalization, OR
+//  2. They agree on every whitespace-separated token except the
+//     class-name token, where `got` carries a longer namespace-
+//     qualified version of `want` — i.e. `got`'s class-name token
+//     ends with `"::"+want`'s class-name token.
+//
+// The second form lets users write unqualified type names in
+// `wasmify.json::OwnershipTransferMethods` signatures without having
+// to reproduce clang's full namespace path. It is otherwise strict:
+// `const`, `volatile`, `*`, `&`, `&&` modifiers must match position-
+// for-position. If the user writes a fully-qualified name, the
+// match is identical to the previous behaviour.
+//
+// Cross-namespace ambiguity (e.g. unqualified `string_view` matching
+// both `absl::string_view` and `std::string_view`) is the caller's
+// responsibility; users with overloads spanning namespaces should
+// list fully-qualified types in `signature` to disambiguate.
+func qualTypeMatches(want, got string) bool {
+	want = normaliseQualType(want)
+	got = normaliseQualType(got)
+	if want == got {
+		return true
+	}
+	wantTok := strings.Fields(want)
+	gotTok := strings.Fields(got)
+	if len(wantTok) != len(gotTok) {
+		return false
+	}
+	for i := range wantTok {
+		if wantTok[i] == gotTok[i] {
+			continue
+		}
+		// The differing token must be the type-name token. Accept
+		// when `gotTok[i]` carries `wantTok[i]` as its trailing
+		// `"::"`-separated component.
+		if !strings.HasSuffix(gotTok[i], "::"+wantTok[i]) {
 			return false
 		}
 	}
@@ -1028,16 +1215,93 @@ func normaliseQualType(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// hasBoolParam reports whether m has at least one parameter of
-// primitive bool type. Used as the type-level signal for the
-// runtime-conditional ownership transfer pattern.
-func hasBoolParam(m apispec.Function) bool {
-	for _, p := range m.Params {
-		if isBoolPrimitive(p.Type) {
-			return true
+// ExpandExternalTypesByParentChain is the exported entry point for the
+// transitive parent-chain expansion of `bridge.ExternalTypes`. Callers
+// (typically `cmd/wasmify gen-proto`) should invoke this once before
+// passing `cfg` to BOTH `GenerateProtoWithConfig` AND
+// `GenerateBridgeWithConfig` so the two generators agree on the
+// admitted class set and emit identical service IDs. Without the
+// pre-expansion the two stages drift: GenerateProtoWithConfig
+// internally expands the global `bridgeConfig`, but
+// GenerateBridgeWithConfig is then called with the un-expanded
+// caller's `cfg`, overwriting the global back — bridge.cc skips the
+// parent classes' services while the .proto includes them, and every
+// downstream service ID after the first parent shifts by one.
+//
+// Pure function — does not mutate `cfg` or `spec`.
+func ExpandExternalTypesByParentChain(cfg BridgeConfig, spec *apispec.APISpec) BridgeConfig {
+	cfg.ExternalTypes = expandExternalTypesByParentChain(cfg.ExternalTypes, spec)
+	return cfg
+}
+
+// expandExternalTypesByParentChain walks the spec's class graph and
+// pulls every transitive parent of an `ExternalTypes`-listed class
+// into a returned superset list. Mirrors
+// `clangast.expandAllowedExternalClassesTransitively` at the gen-proto
+// layer: the parser admits parents into api-spec, and the gen-proto
+// filter (via `isBridgeableClass` → `isAllowedExternalType`) consults
+// `bridgeConfig.ExternalTypes` directly, so the user-facing list also
+// has to grow.
+//
+// User-facing `wasmify.json::ExternalTypes` typically lists only the
+// leaf classes a project cares about
+// (e.g. `google::protobuf::FileDescriptorProto`). The leaf's parent
+// chain (`Message`, `MessageLite` for protobuf descriptor types) is
+// in the same external library and inherits the methods that drive
+// the Go-codegen embedding-promotion machinery. Without this
+// expansion the parents pass api-spec emission but fail
+// `isBridgeableClass`, no service is emitted for them, and the
+// inherited methods never reach `googlesql.go`.
+//
+// Pure function — does not mutate `seed` or `spec`.
+func expandExternalTypesByParentChain(seed []string, spec *apispec.APISpec) []string {
+	if len(seed) == 0 || spec == nil {
+		return seed
+	}
+	classByQual := make(map[string]*apispec.Class, len(spec.Classes))
+	for i := range spec.Classes {
+		classByQual[spec.Classes[i].QualName] = &spec.Classes[i]
+	}
+	allowed := make(map[string]bool, len(seed))
+	for _, e := range seed {
+		allowed[e] = true
+	}
+	for {
+		changed := false
+		for q := range allowed {
+			c, ok := classByQual[q]
+			if !ok {
+				continue
+			}
+			for _, p := range c.Parents {
+				normalised := strings.TrimPrefix(p, "::")
+				if allowed[normalised] {
+					continue
+				}
+				// Only promote external parents — project parents
+				// don't need an admission entry; isBridgeableClass
+				// passes them through `isProjectSource` already.
+				parentCls, ok := classByQual[normalised]
+				if !ok {
+					continue
+				}
+				if isProjectSource(parentCls.SourceFile) {
+					continue
+				}
+				allowed[normalised] = true
+				changed = true
+			}
+		}
+		if !changed {
+			break
 		}
 	}
-	return false
+	out := make([]string, 0, len(allowed))
+	for q := range allowed {
+		out = append(out, q)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // isBoolPrimitive reports whether t is the primitive bool type
@@ -1680,15 +1944,15 @@ func writeHandleService(b *strings.Builder, c *apispec.Class, allHandles map[str
 				fmt.Fprintf(b, "  %s handle = 1;\n", msgName)
 				fieldOffset = 2
 			}
+			selectorParam, selectorEquals := conditionalOwnershipTransferSpec(m)
 			for i, p := range reqParams {
 				protoType := typeRefToProto(p.Type)
 				fieldName := toSnakeCase(p.Name)
 				if fieldName == "" {
 					fieldName = fmt.Sprintf("arg%d", i)
 				}
-				selector := conditionalOwnershipSelector(m)
-				if selector != "" && p.Type.Kind == apispec.TypeHandle && !methodParamTakesOwnership(m, p) {
-					writeRequestFieldOwnershipWhen(b, protoType, fieldName, i+fieldOffset, selector)
+				if selectorParam != "" && p.Type.Kind == apispec.TypeHandle && !methodParamTakesOwnership(m, p) {
+					writeRequestFieldOwnershipWhen(b, protoType, fieldName, i+fieldOffset, selectorParam, selectorEquals)
 				} else {
 					writeRequestField(b, protoType, fieldName, i+fieldOffset, methodParamTakesOwnership(m, p))
 				}

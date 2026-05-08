@@ -2349,6 +2349,17 @@ func cmdGenProto(args []string) error {
 	// Apply export filter if specified
 	filteredSpec := protogen.ApplyExportFilter(spec, bridgeCfg)
 
+	// Mirror the parser-side transitive parent admission into
+	// bridgeCfg.ExternalTypes BEFORE invoking either generator.
+	// Without this single expansion site both generators end up
+	// installing different `bridgeConfig` globals (proto.go expands
+	// in-place, bridge.go overwrites with the un-expanded caller copy),
+	// service IDs drift between the two outputs, and the resulting
+	// .proto/bridge.cc/Go files crash at runtime with `wasm export
+	// "w_X_Y" not found` for every method whose service was
+	// renumbered. The expansion is pure; safe to call once here.
+	bridgeCfg = protogen.ExpandExternalTypesByParentChain(bridgeCfg, filteredSpec)
+
 	// Generate .proto (uses bridgeCfg to ensure service IDs match C++ bridge)
 	protoContent := protogen.GenerateProtoWithConfig(filteredSpec, packageName, bridgeCfg)
 	protoFilename := packageName + ".proto"

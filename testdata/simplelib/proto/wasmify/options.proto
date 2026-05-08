@@ -39,6 +39,27 @@ extend google.protobuf.FieldOptions {
   // Typical symptom is a panic on the next handle accessed through
   // the parent (vtable read against freed memory).
   bool wasm_take_ownership = 50019;
+
+  // Conditional ownership-transfer marker for the C++ idiom where
+  // a method takes both a raw `T*` and a separate runtime selector
+  // parameter (bool/int/string) that decides whether the receiver
+  // adopts ownership (e.g. `SimpleTable::AddColumn(const Column*,
+  // bool is_owned)`). The string value is the snake_case proto
+  // field name of the selector parameter. Always paired with
+  // `wasm_take_ownership_equals`.
+  string wasm_take_ownership_when = 50020;
+
+  // The JSON-encoded value the selector named in
+  // `wasm_take_ownership_when` must take for ownership to
+  // transfer. Format:
+  //   bool   selector → "true" / "false"
+  //   int    selector → decimal text ("0", "1", "-7")
+  //   string selector → JSON-quoted ("\"transfer\"")
+  // Plugin parses this back into the appropriate Go expression
+  // (`if <param>` for bool=true, `if !<param>` for bool=false,
+  // `if <param> == N` for int, `if <param> == "x"` for string).
+  // Required whenever `wasm_take_ownership_when` is set.
+  string wasm_take_ownership_equals = 50021;
 }
 
 extend google.protobuf.ServiceOptions {

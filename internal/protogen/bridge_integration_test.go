@@ -859,6 +859,10 @@ func TestGenerateProto_ConditionalOwnershipTransferConfig(t *testing.T) {
 		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
 			Method:    "mylib::Container::AddItem",
 			Signature: []string{"mylib::Item *", "bool"},
+			TransferWhen: &state.TransferWhenSpec{
+				Param:  "is_owned",
+				Equals: true,
+			},
 		}},
 	}
 	output := GenerateProtoWithConfig(spec, "mylib", cfg)
@@ -866,8 +870,91 @@ func TestGenerateProto_ConditionalOwnershipTransferConfig(t *testing.T) {
 	if !strings.Contains(req, `wasm_take_ownership_when) = "is_owned"`) {
 		t.Errorf("conditional ownership marker missing from request:\n%s", req)
 	}
+	if !strings.Contains(req, `wasm_take_ownership_equals) = "true"`) {
+		t.Errorf("conditional ownership equals literal missing from request:\n%s", req)
+	}
 	if strings.Contains(req, "wasm_take_ownership) = true") {
 		t.Errorf("conditional ownership MUST NOT also emit unconditional take_ownership:\n%s", req)
+	}
+}
+
+// TestGenerateProto_ConditionalOwnershipTransfer_UnqualifiedSignature
+// pins the namespace-tolerant signature match. clang emits qual_types
+// fully-qualified ("mylib::Item *"); users typically list overloads
+// in `wasmify.json::OwnershipTransferMethods` with unqualified type
+// names ("Item *"). Before the fix in `qualTypeMatches`, the byte-
+// for-byte compare in `signatureMatches` rejected the user's entry
+// whenever the namespace prefix was elided, the
+// `wasm_take_ownership_when` annotation never reached the proto, and
+// the Go-side wrapper silently retained `ptr` after `is_owned=true`
+// — surfacing as a double-free at GC time when the parent's
+// destructor reclaimed the same wasm-side memory.
+//
+// This regression test mirrors the
+// `googlesql::SimpleTable::AddColumn(const Column*, bool)` case
+// downstream.
+func TestGenerateProto_ConditionalOwnershipTransfer_UnqualifiedSignature(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name: "Item", QualName: "mylib::Item",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+			},
+			{
+				Name: "Container", QualName: "mylib::Container",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name: "AddItem", QualName: "mylib::Container::AddItem",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{
+								Name: "item",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypeHandle, Name: "mylib::Item",
+									IsPointer: true,
+									QualType:  "const mylib::Item *",
+								},
+							},
+							{
+								Name: "is_owned",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypePrimitive, Name: "bool",
+									QualType: "bool",
+								},
+							},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+					},
+				},
+			},
+		},
+	}
+
+	cfg := BridgeConfig{
+		// Unqualified signature — the user's natural spelling.
+		// Before the namespace-tolerant fix in qualTypeMatches this
+		// failed to match and no annotation was emitted.
+		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
+			Method:    "mylib::Container::AddItem",
+			Signature: []string{"const Item *", "bool"},
+			TransferWhen: &state.TransferWhenSpec{
+				Param:  "is_owned",
+				Equals: true,
+			},
+		}},
+	}
+	output := GenerateProtoWithConfig(spec, "mylib", cfg)
+	req := extractMessage(t, output, "ContainerAddItemRequest")
+	if !strings.Contains(req, `wasm_take_ownership_when) = "is_owned"`) {
+		t.Errorf("unqualified signature must still trigger conditional take_ownership annotation; got:\n%s", req)
+	}
+	if strings.Contains(req, "wasm_take_ownership) = true") {
+		t.Errorf("unqualified signature must NOT degrade to unconditional take_ownership:\n%s", req)
 	}
 }
 
@@ -962,5 +1049,346 @@ func TestGenerateBridge_VectorOfValue(t *testing.T) {
 	// Vector<Item> serializes each item as a submessage
 	if !strings.Contains(output, "_subw") {
 		t.Error("expected sub writer (_subw) in vector<value> path")
+	}
+}
+
+// TestGenerateProto_ExternalParentChain_EmitsServiceForParents pins the
+// gen-proto level mirror of clangast's transitive parent admission.
+//
+// The user's `bridge.ExternalTypes` typically lists only the leaf
+// classes a project cares about (e.g. `google::protobuf::FileDescriptorProto`).
+// The clang-parser stage pulls the leaf's parent chain (`Message`,
+// `MessageLite`) into api-spec via
+// expandAllowedExternalClassesTransitively. But proto-gen's
+// `isBridgeableClass` filter consults `bridgeConfig.ExternalTypes`
+// directly, NOT the api-spec admission flag — so without a matching
+// expansion at this stage, the parents are dropped at gen-proto time
+// and no `service` is emitted for them. The downstream
+// protoc-gen-wasmify-go then has nothing to attach as inherited
+// methods; the Go base struct stays method-less and the embedding
+// chain in the leaf class is decorative only.
+//
+// expandExternalTypesByParentChain re-applies the parser's parent
+// closure at proto-gen entry, so the resulting generated proto file
+// has services for the entire admitted parent chain. This test
+// verifies that contract end-to-end.
+func TestGenerateProto_ExternalParentChain_EmitsServiceForParents(t *testing.T) {
+	src := "external/lib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "myproj",
+		Classes: []apispec.Class{
+			// Project-side class — admitted unconditionally.
+			{
+				Name: "App", QualName: "myproj::App",
+				Namespace: "myproj", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: "myproj/app.h",
+			},
+			// External 3-level inheritance: Leaf : Mid : Root.
+			{
+				Name: "Root", QualName: "lib::Root",
+				Namespace: "lib", IsHandle: true, HasPublicDtor: true,
+				IsAbstract: true, // mirrors protobuf::MessageLite
+				SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name:     "ParseFromString",
+						QualName: "lib::Root::ParseFromString",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{Name: "data", Type: apispec.TypeRef{Kind: apispec.TypeString, Name: "string", QualType: "const std::string &"}},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"},
+						Access:     "public",
+					},
+				},
+			},
+			{
+				Name: "Mid", QualName: "lib::Mid",
+				Namespace: "lib", IsHandle: true, HasPublicDtor: true,
+				IsAbstract: true, // mirrors protobuf::Message
+				SourceFile: src,
+				Parent:     "lib::Root",
+				Parents:    []string{"lib::Root"},
+				Methods: []apispec.Function{
+					{
+						Name:     "Clear",
+						QualName: "lib::Mid::Clear",
+						SourceFile: src,
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+						Access:     "public",
+					},
+				},
+			},
+			{
+				Name: "Leaf", QualName: "lib::Leaf",
+				Namespace: "lib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Parent:     "lib::Mid",
+				Parents:    []string{"lib::Mid"},
+			},
+		},
+	}
+
+	// User's wasmify.json admits ONLY the leaf — the parent chain is
+	// expected to be admitted transitively at gen-proto entry.
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"lib::Leaf"},
+	}
+	output := GenerateProtoWithConfig(spec, "myproj", cfg)
+
+	// All three classes must show up as proto messages and as
+	// services — Leaf via direct admission, Mid+Root via the
+	// expansion.
+	for _, want := range []string{"Leaf", "Mid", "Root"} {
+		if !strings.Contains(output, "message "+want+" {") {
+			t.Errorf("expected `message %s {` in output (transitive parent admission)", want)
+		}
+		if !strings.Contains(output, "service "+want+"Service {") {
+			t.Errorf("expected `service %sService {` in output — without it, protoc-gen-wasmify-go has no inherited methods to promote", want)
+		}
+	}
+	// Sanity: Root's ParseFromString RPC reaches the proto file. The
+	// embedding chain in Go-codegen will surface it on every
+	// transitive subclass.
+	if !strings.Contains(output, "rpc ParseFromString(") {
+		t.Error("Root's ParseFromString RPC must be emitted in the parent service so the embedding chain can promote it")
+	}
+}
+
+// TestGenerateProto_TransferWhenIntSelector pins the int-typed
+// runtime selector path. The bridge should emit
+// `wasm_take_ownership_when = "<param>"` plus
+// `wasm_take_ownership_equals = "<integer>"` so the plugin
+// downstream renders `if <param> == <integer> { clearPtrAny(...) }`.
+//
+// Mirrors the bool-selector test for type coverage; covers
+// hypothetical APIs like `Container::Add(T*, int mode)` where a
+// specific int sentinel value (e.g. mode == 1) flips ownership.
+func TestGenerateProto_TransferWhenIntSelector(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name: "Item", QualName: "mylib::Item",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+			},
+			{
+				Name: "Container", QualName: "mylib::Container",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name: "Add", QualName: "mylib::Container::Add",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{
+								Name: "item",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypeHandle, Name: "mylib::Item",
+									IsPointer: true, QualType: "const mylib::Item *",
+								},
+							},
+							{
+								Name: "mode",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypePrimitive, Name: "int", QualType: "int",
+								},
+							},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+					},
+				},
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
+			Method:    "mylib::Container::Add",
+			Signature: []string{"const Item *", "int"},
+			TransferWhen: &state.TransferWhenSpec{
+				Param:  "mode",
+				Equals: float64(1), // JSON numbers decode as float64
+			},
+		}},
+	}
+	output := GenerateProtoWithConfig(spec, "mylib", cfg)
+	req := extractMessage(t, output, "ContainerAddRequest")
+	if !strings.Contains(req, `wasm_take_ownership_when) = "mode"`) {
+		t.Errorf("expected selector annotation:\n%s", req)
+	}
+	if !strings.Contains(req, `wasm_take_ownership_equals) = "1"`) {
+		t.Errorf("expected int equals=1 annotation:\n%s", req)
+	}
+}
+
+// TestGenerateProto_TransferWhenStringSelector pins the string-typed
+// runtime selector. The equals literal is JSON-quoted so the plugin
+// can safely embed it into a Go `==` comparison.
+func TestGenerateProto_TransferWhenStringSelector(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name: "Item", QualName: "mylib::Item",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+			},
+			{
+				Name: "Container", QualName: "mylib::Container",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name: "Insert", QualName: "mylib::Container::Insert",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{
+								Name: "item",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypeHandle, Name: "mylib::Item",
+									IsPointer: true, QualType: "const mylib::Item *",
+								},
+							},
+							{
+								Name: "policy",
+								Type: apispec.TypeRef{
+									Kind: apispec.TypeString, Name: "string",
+									QualType: "absl::string_view",
+								},
+							},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+					},
+				},
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
+			Method:    "mylib::Container::Insert",
+			Signature: []string{"const Item *", "absl::string_view"},
+			TransferWhen: &state.TransferWhenSpec{
+				Param:  "policy",
+				Equals: "transfer",
+			},
+		}},
+	}
+	output := GenerateProtoWithConfig(spec, "mylib", cfg)
+	req := extractMessage(t, output, "ContainerInsertRequest")
+	if !strings.Contains(req, `wasm_take_ownership_when) = "policy"`) {
+		t.Errorf("expected selector annotation:\n%s", req)
+	}
+	if !strings.Contains(req, `wasm_take_ownership_equals) = "\"transfer\""`) {
+		t.Errorf("expected string equals=\"transfer\" annotation:\n%s", req)
+	}
+}
+
+// TestGenerateProto_TransferWhenBoolFalseEquals pins the
+// `bool + equals=false` combination — useful for APIs whose flag is
+// inverted from the canonical `is_owned` (e.g. `bool no_adopt`).
+// The plugin should render `if !<param>` rather than `if <param>`.
+func TestGenerateProto_TransferWhenBoolFalseEquals(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name: "Item", QualName: "mylib::Item",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+			},
+			{
+				Name: "Container", QualName: "mylib::Container",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name: "Push", QualName: "mylib::Container::Push",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{Name: "item", Type: apispec.TypeRef{Kind: apispec.TypeHandle, Name: "mylib::Item", IsPointer: true, QualType: "const mylib::Item *"}},
+							{Name: "no_adopt", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"}},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+					},
+				},
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
+			Method:    "mylib::Container::Push",
+			Signature: []string{"const Item *", "bool"},
+			TransferWhen: &state.TransferWhenSpec{
+				Param:  "no_adopt",
+				Equals: false,
+			},
+		}},
+	}
+	output := GenerateProtoWithConfig(spec, "mylib", cfg)
+	req := extractMessage(t, output, "ContainerPushRequest")
+	if !strings.Contains(req, `wasm_take_ownership_when) = "no_adopt"`) {
+		t.Errorf("expected selector annotation:\n%s", req)
+	}
+	if !strings.Contains(req, `wasm_take_ownership_equals) = "false"`) {
+		t.Errorf("expected bool equals=false annotation:\n%s", req)
+	}
+}
+
+// TestGenerateProto_TransferWhen_NoEntryMeansPattern1 pins the
+// behaviour when an OwnershipTransferMethods entry omits
+// `transfer_when`. Per the new schema, a missing TransferWhen
+// means Pattern 1 (unconditional adoption) — every handle param
+// gets `wasm_take_ownership = true`. This was the old default
+// before the explicit schema, but used to be flipped by the
+// `hasBoolParam` heuristic; now it requires an explicit choice.
+func TestGenerateProto_TransferWhen_NoEntryMeansPattern1(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name: "Item", QualName: "mylib::Item",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+			},
+			{
+				Name: "Container", QualName: "mylib::Container",
+				Namespace: "mylib", IsHandle: true, HasPublicDtor: true,
+				HasPublicDefaultCtor: true, SourceFile: src,
+				Methods: []apispec.Function{
+					{
+						Name: "Adopt", QualName: "mylib::Container::Adopt",
+						SourceFile: src,
+						Params: []apispec.Param{
+							{Name: "item", Type: apispec.TypeRef{Kind: apispec.TypeHandle, Name: "mylib::Item", IsPointer: true, QualType: "mylib::Item *"}},
+							// Has a bool param but the entry has no TransferWhen.
+							// Old heuristic would have treated this as Pattern 2;
+							// the new explicit schema treats it as Pattern 1.
+							{Name: "force", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"}},
+						},
+						ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+					},
+				},
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		OwnershipTransferMethods: []state.OwnershipTransferEntry{{
+			Method:    "mylib::Container::Adopt",
+			Signature: []string{"Item *", "bool"},
+			// TransferWhen intentionally nil.
+		}},
+	}
+	output := GenerateProtoWithConfig(spec, "mylib", cfg)
+	req := extractMessage(t, output, "ContainerAdoptRequest")
+	if !strings.Contains(req, "wasm_take_ownership) = true") {
+		t.Errorf("expected unconditional take_ownership for Pattern 1 (no transfer_when):\n%s", req)
+	}
+	if strings.Contains(req, "wasm_take_ownership_when") {
+		t.Errorf("must NOT emit conditional annotation when transfer_when is omitted:\n%s", req)
 	}
 }

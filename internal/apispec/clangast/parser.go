@@ -431,6 +431,84 @@ func (p *Parser) qualNameAllowed(namespace, name string) bool {
 	return false
 }
 
+// classQualNameAllowed is the pre-resolved counterpart of
+// qualNameAllowed: it accepts a fully-qualified class name (with or
+// without a leading "::") and reports whether
+// allowedExternalClasses admits it. Used at spec-commit time, where
+// we already know the class's full qual_name and want a single
+// lookup that tolerates both forms.
+func (p *Parser) classQualNameAllowed(qual string) bool {
+	if qual == "" || len(p.allowedExternalClasses) == 0 {
+		return false
+	}
+	if p.allowedExternalClasses[qual] {
+		return true
+	}
+	// `cls.Parents` from clang AST often carries a leading "::"
+	// (e.g. "::google::protobuf::Message"), but user-supplied
+	// `bridge.ExternalTypes` entries are written without it. Strip
+	// the leading "::" before lookup so both spellings agree.
+	if stripped := strings.TrimPrefix(qual, "::"); stripped != qual {
+		return p.allowedExternalClasses[stripped]
+	}
+	return false
+}
+
+// expandAllowedExternalClassesTransitively walks every already-admitted
+// class's `Parents` chain and adds each ancestor to
+// allowedExternalClasses. Iterates to a fixed point so multi-level
+// inheritance (`FileDescriptorProto` → `Message` → `MessageLite`) is
+// fully covered.
+//
+// Without this expansion, `bridge.ExternalTypes` admits only the leaf
+// classes the user listed; the inherited-method chain (e.g.
+// `MessageLite::ParseFromString`) is unreachable because the parent's
+// `CXXRecordDecl` was speculatively retained in `p.classes` but not
+// committed to the spec. After expansion, parent classes are admitted
+// automatically and their methods reach the bridged surface — the Go-
+// codegen embedding then promotes them to every subclass.
+func (p *Parser) expandAllowedExternalClassesTransitively() {
+	if len(p.allowedExternalClasses) == 0 {
+		return
+	}
+	for {
+		changed := false
+		for _, c := range p.classes {
+			// Only walk parents of classes that are themselves admitted.
+			// A class is admitted when its source matches the project
+			// header set, OR its qual_name is listed in
+			// allowedExternalClasses (directly or transitively).
+			if !p.matchesTarget(c.SourceFile) && !p.classQualNameAllowed(c.QualName) {
+				continue
+			}
+			for _, parent := range c.Parents {
+				normalised := strings.TrimPrefix(parent, "::")
+				if p.allowedExternalClasses[normalised] {
+					continue
+				}
+				// Only promote external parents — project parents are
+				// already committed unconditionally and don't need an
+				// admission entry.
+				parentCls, ok := p.classes[normalised]
+				if !ok {
+					// Parent class wasn't seen in the AST at all
+					// (forward-decl only, or filtered for some other
+					// reason). Skip — there's nothing to admit.
+					continue
+				}
+				if p.matchesTarget(parentCls.SourceFile) {
+					continue
+				}
+				p.allowedExternalClasses[normalised] = true
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+}
+
 // matchesTarget checks if a file path matches any of the target header files.
 func (p *Parser) matchesTarget(file string) bool {
 	if p.headerFile != "" {
@@ -460,8 +538,18 @@ func Parse(root *Node, headerFile string) *apispec.APISpec {
 	// class scope universe before downstream code looks them up by
 	// FQDN — see postProcessQualifyShortNames for the rationale.
 	p.postProcessQualifyShortNames()
+	// Mirror the streaming-path logic: admit parents of every
+	// admitted external class transitively, then filter
+	// speculatively-retained externals at commit time. See
+	// `expandAllowedExternalClassesTransitively`.
+	p.expandAllowedExternalClassesTransitively()
 	// Flatten classes map
 	for _, c := range p.classes {
+		if !p.matchesTarget(c.SourceFile) {
+			if !p.classQualNameAllowed(c.QualName) {
+				continue
+			}
+		}
 		p.spec.Classes = append(p.spec.Classes, *c)
 	}
 	// Single-file parse (no multi-batch merging), so short-name promotion
@@ -1347,7 +1435,27 @@ func ParseStreamMultiWithOptions(r io.Reader, headerFiles []string, allowedExter
 	// Expand namespace-scope typedefs now that the full alias map is
 	// known — see postProcessTypedefAliases for the motivation.
 	p.postProcessTypedefAliases()
+	// Expand `allowedExternalClasses` to include the parent chain of
+	// every already-admitted external class. Required because
+	// `bridge.ExternalTypes` typically lists only the leaf classes
+	// (`google::protobuf::FileDescriptorProto`, etc.); the inherited
+	// methods on the leaf's Go base struct (via embedding chain) only
+	// appear if the parent classes also reach api-spec. See
+	// `go-googlesql/issues/proto-wire-binding.md`.
+	p.expandAllowedExternalClassesTransitively()
 	for _, c := range p.classes {
+		// External classes commit only when admitted directly via
+		// `bridge.ExternalTypes` / `IncludeExternalClasses` or
+		// transitively as a parent of one. Project classes always
+		// commit. The CXXRecordDecl handler retains externals
+		// speculatively so the parent chain is visible here; this
+		// filter keeps non-admitted speculative externals out of
+		// the on-disk api-spec.
+		if !p.matchesTarget(c.SourceFile) {
+			if !p.classQualNameAllowed(c.QualName) {
+				continue
+			}
+		}
 		p.spec.Classes = append(p.spec.Classes, *c)
 	}
 	// Re-write unqualified type references with their fully-qualified
@@ -1500,7 +1608,7 @@ func (p *Parser) streamObject(dec *json.Decoder, namespace string, currentFile s
 				skipRemainingFields(dec)
 				return nil, true, nodeFile, nil
 
-			case "FunctionDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
+			case "FunctionDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
 				// These are interesting if from target file — or if the
 				// user has listed the class qualified name in
 				// bridge.ExternalTypes (mirrored into
@@ -1512,6 +1620,29 @@ func (p *Parser) streamObject(dec *json.Decoder, namespace string, currentFile s
 					skipRemainingFields(dec)
 					return nil, true, nodeFile, nil
 				}
+				var raw json.RawMessage
+				if err := dec.Decode(&raw); err != nil {
+					return nil, false, nodeFile, err
+				}
+				pendingFields["inner"] = raw
+
+			case "CXXRecordDecl":
+				// Same as the FunctionDecl/EnumDecl/Typedef case BUT we
+				// additionally RETAIN external CXXRecordDecls
+				// speculatively, so they are available as parent
+				// candidates when expandAllowedExternalClassesTransitively
+				// runs at end of stream. Without this, a class admitted
+				// only as a transitive parent of an `ExternalTypes`-listed
+				// class (e.g. `MessageLite` is the parent of `Message`,
+				// which is the parent of `FileDescriptorProto`) is skipped
+				// here and then unrecoverable — the inherited methods
+				// (e.g. `ParseFromString`) never make it into api-spec
+				// and are never bridged.
+				//
+				// Speculatively-retained external CXXRecordDecls are
+				// filtered out at the spec-commit loop in ParseStream*
+				// when their qualname does not survive the transitive
+				// closure expansion, so the on-disk api-spec stays small.
 				var raw json.RawMessage
 				if err := dec.Decode(&raw); err != nil {
 					return nil, false, nodeFile, err
@@ -1550,10 +1681,24 @@ func (p *Parser) streamObject(dec *json.Decoder, namespace string, currentFile s
 	}
 
 	switch kind {
-	case "FunctionDecl", "CXXRecordDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
+	case "FunctionDecl", "EnumDecl", "TypedefDecl", "TypeAliasDecl":
 		if !p.matchesTarget(nodeFile) && !p.qualNameAllowed(namespace, name) {
 			return nil, true, nodeFile, nil
 		}
+		node, err := reconstructNode(kind, name, loc, rng, pendingFields)
+		if err != nil {
+			return nil, true, nodeFile, nil
+		}
+		return node, false, nodeFile, nil
+
+	case "CXXRecordDecl":
+		// External CXXRecordDecls are retained speculatively here so
+		// expandAllowedExternalClassesTransitively can admit ancestors
+		// of admitted classes at end-of-stream. Filtering of
+		// non-surviving externals happens in the spec-commit loop.
+		// See the matching always-decode change in the inner-handler
+		// switch above and the filter in
+		// `expandAllowedExternalClassesTransitively`.
 		node, err := reconstructNode(kind, name, loc, rng, pendingFields)
 		if err != nil {
 			return nil, true, nodeFile, nil
@@ -1805,9 +1950,15 @@ func (p *Parser) walk(node *Node, namespace string, inTargetFile bool, parentFil
 		if node.IsImplicit || node.Name == "" {
 			break
 		}
-		if !nodeInTarget {
-			break
-		}
+		// Always decode CXXRecordDecls — even external ones not
+		// (yet) admitted via allowedExternalClasses. The post-walk
+		// expandAllowedExternalClassesTransitively pass needs the
+		// parent-chain metadata to admit ancestors of admitted
+		// classes; the spec-commit loop filters out any speculative
+		// retentions that don't survive the closure expansion. See
+		// the equivalent change in streamInnerArray's CXXRecordDecl
+		// branch and `expandAllowedExternalClassesTransitively`.
+		_ = nodeInTarget
 		p.parseClass(node, namespace)
 		qualName := node.Name
 		if namespace != "" {
