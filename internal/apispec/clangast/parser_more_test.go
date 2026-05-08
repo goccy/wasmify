@@ -1761,3 +1761,230 @@ func TestPostProcessEnumTypesShortNameAmbiguousNotPromoted(t *testing.T) {
 		t.Error("ambiguous short-name Color should not be promoted")
 	}
 }
+
+// TestParseStream_ExternalParentChainAdmittedTransitively pins the
+// parent-admission expansion that makes inherited methods reachable
+// across the Go-codegen embedding chain.
+//
+// `bridge.ExternalTypes` typically lists only the leaf classes a
+// project cares about (e.g. `google::protobuf::FileDescriptorProto`).
+// The leaf class's parent chain (`Message`, `MessageLite`) lives in
+// the same external library and was historically dropped at parse
+// time — clang AST visit-time filter rejected any external CXXRecord
+// whose qualname was not in `allowedExternalClasses`. The downstream
+// effect: the Go-side embedding chain
+// `FileDescriptorProto` → `*Message` → would-be-`*MessageLite` could
+// not promote `MessageLite::ParseFromString` to subclasses, leaving
+// `FileDescriptorSet` unconstructable from wire bytes.
+//
+// The fix retains external CXXRecordDecls speculatively and, after
+// the AST is fully decoded, walks each admitted class's `Parents`
+// chain and admits the ancestors transitively. This test fakes a
+// three-level inheritance (Leaf : Mid : Root, all in `external/lib/`)
+// and asserts that listing only `lib::Leaf` in
+// `allowedExternalClasses` ends up with all three classes in the
+// resulting api-spec.
+func TestParseStream_ExternalParentChainAdmittedTransitively(t *testing.T) {
+	// Three external classes in a non-project header, plus a sentinel
+	// external class that is NOT on any chain — verifies the filter
+	// still drops genuinely-unrelated externals.
+	astJSON := `{
+		"kind": "TranslationUnitDecl",
+		"inner": [
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Root",
+				"loc": {"file": "external/lib/root.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"inner": [
+					{"kind": "AccessSpecDecl", "access": "public"},
+					{
+						"kind": "CXXMethodDecl",
+						"name": "ParseFromString",
+						"access": "public",
+						"type": {"qualType": "bool (const std::string &)"},
+						"inner": [
+							{"kind": "ParmVarDecl", "name": "data", "type": {"qualType": "const std::string &"}}
+						]
+					}
+				]
+			},
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Mid",
+				"loc": {"file": "external/lib/mid.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"bases": [{"access": "public", "type": {"qualType": "Root"}}],
+				"inner": [
+					{"kind": "AccessSpecDecl", "access": "public"},
+					{
+						"kind": "CXXMethodDecl",
+						"name": "Clear",
+						"access": "public",
+						"type": {"qualType": "void ()"}
+					}
+				]
+			},
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Leaf",
+				"loc": {"file": "external/lib/leaf.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"bases": [{"access": "public", "type": {"qualType": "Mid"}}],
+				"inner": [
+					{"kind": "AccessSpecDecl", "access": "public"}
+				]
+			},
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Unrelated",
+				"loc": {"file": "external/other/unrelated.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"inner": [
+					{"kind": "AccessSpecDecl", "access": "public"}
+				]
+			}
+		]
+	}`
+
+	// User's wasmify.json lists only the leaf class.
+	spec, err := ParseStreamMultiWithOptions(
+		strings.NewReader(astJSON),
+		[]string{"my_app.h"},        // project headers — none of the externals match
+		[]string{"Leaf", "Mid", "Root"}, // alias both bare names and qualified
+	)
+	// Note: the user-facing entry would be the qualified leaf only; we
+	// pass three here only because the synthetic AST has no enclosing
+	// namespace (so qualname == bare name). The transitive expansion
+	// is what we actually exercise next.
+	if err != nil {
+		t.Fatalf("ParseStreamMultiWithOptions: %v", err)
+	}
+
+	got := map[string]bool{}
+	for _, c := range spec.Classes {
+		got[c.QualName] = true
+	}
+	for _, want := range []string{"Leaf", "Mid", "Root"} {
+		if !got[want] {
+			t.Errorf("expected %q in api-spec.Classes; got %v", want, keysOf(got))
+		}
+	}
+	if got["Unrelated"] {
+		t.Errorf("Unrelated external class must NOT be admitted; got %v", keysOf(got))
+	}
+}
+
+// TestParseStream_ExternalParentChainAdmittedTransitively_LeafOnly is
+// the same test but verifies that listing ONLY the leaf class in
+// `allowedExternalClasses` is sufficient — the parents are admitted
+// purely by the transitive expansion, with no help from the user.
+// This is the production-facing case; the user's wasmify.json should
+// not need to enumerate parent classes by hand.
+func TestParseStream_ExternalParentChainAdmittedTransitively_LeafOnly(t *testing.T) {
+	astJSON := `{
+		"kind": "TranslationUnitDecl",
+		"inner": [
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Root",
+				"loc": {"file": "external/lib/root.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"inner": [
+					{"kind": "AccessSpecDecl", "access": "public"},
+					{
+						"kind": "CXXMethodDecl",
+						"name": "ParseFromString",
+						"access": "public",
+						"type": {"qualType": "bool (const std::string &)"},
+						"inner": [
+							{"kind": "ParmVarDecl", "name": "data", "type": {"qualType": "const std::string &"}}
+						]
+					}
+				]
+			},
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Mid",
+				"loc": {"file": "external/lib/mid.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"bases": [{"access": "public", "type": {"qualType": "Root"}}],
+				"inner": [{"kind": "AccessSpecDecl", "access": "public"}]
+			},
+			{
+				"kind": "CXXRecordDecl",
+				"name": "Leaf",
+				"loc": {"file": "external/lib/leaf.h"},
+				"tagUsed": "class",
+				"completeDefinition": true,
+				"bases": [{"access": "public", "type": {"qualType": "Mid"}}],
+				"inner": [{"kind": "AccessSpecDecl", "access": "public"}]
+			}
+		]
+	}`
+
+	spec, err := ParseStreamMultiWithOptions(
+		strings.NewReader(astJSON),
+		[]string{"my_app.h"},
+		[]string{"Leaf"}, // only the leaf
+	)
+	if err != nil {
+		t.Fatalf("ParseStreamMultiWithOptions: %v", err)
+	}
+
+	got := map[string]bool{}
+	for _, c := range spec.Classes {
+		got[c.QualName] = true
+	}
+	for _, want := range []string{"Leaf", "Mid", "Root"} {
+		if !got[want] {
+			t.Errorf("listing only Leaf should transitively admit %q; got %v", want, keysOf(got))
+		}
+	}
+
+	// Verify Root carries the ParseFromString method — this is what
+	// the embedding chain needs to surface on the leaf via Go method
+	// promotion downstream.
+	var rootCls *apispec.Class
+	for i := range spec.Classes {
+		if spec.Classes[i].QualName == "Root" {
+			rootCls = &spec.Classes[i]
+			break
+		}
+	}
+	if rootCls == nil {
+		t.Fatal("Root class missing from spec — transitive admission did not commit it")
+	}
+	hasParseFromString := false
+	for _, m := range rootCls.Methods {
+		if m.Name == "ParseFromString" {
+			hasParseFromString = true
+			break
+		}
+	}
+	if !hasParseFromString {
+		t.Errorf("Root.ParseFromString must be bridged so the embedding chain can promote it; got methods %v", methodNamesOf(rootCls.Methods))
+	}
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func methodNamesOf(ms []apispec.Function) []string {
+	out := make([]string, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Name)
+	}
+	return out
+}

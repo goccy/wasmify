@@ -25,8 +25,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -96,14 +98,24 @@ type fieldInfo struct {
 	// Go-side method wrapper must clear the arg's ptr after the invoke
 	// so the per-instance finalizer does not double-free.
 	takesOwnership bool
-	// takeOwnershipWhen names a sibling proto field of bool type
-	// whose runtime value selects ownership transfer. When set, the
-	// Go-side method wrapper emits a runtime guard
-	// `if <takeOwnershipWhen> { handle.clearPtr() }` after the
-	// invoke. Carried by `[(wasmify.wasm_take_ownership_when) =
-	// "<field_name>"]` on the proto field; project-specific opt-in
-	// via wasmify.json:bridge.ConditionalOwnershipTransferMethods.
-	takeOwnershipWhen string
+	// takeOwnershipWhen names a sibling proto field whose runtime
+	// value selects ownership transfer. takeOwnershipEquals carries
+	// the JSON-encoded value the selector must take for ownership
+	// to actually transfer (e.g. "true" / "false" for bool, "1"
+	// for int, "\"transfer\"" for string). Together they drive a
+	// runtime guard emitted right after the invoke:
+	//
+	//   bool   selector + equals=true    → if <param> { handle.clearPtr() }
+	//   bool   selector + equals=false   → if !<param> { handle.clearPtr() }
+	//   int    selector + equals=N       → if <param> == N { handle.clearPtr() }
+	//   string selector + equals="x"     → if <param> == "x" { handle.clearPtr() }
+	//
+	// Carried by `[(wasmify.wasm_take_ownership_when) = "<param>",
+	// (wasmify.wasm_take_ownership_equals) = "<json>"]` on the
+	// proto field. Project-specific opt-in via
+	// `wasmify.json:bridge.OwnershipTransferMethods[].transfer_when`.
+	takeOwnershipWhen   string
+	takeOwnershipEquals string
 }
 
 type msgInfo struct {
@@ -601,6 +613,9 @@ func analyzeField(f *protogen.Field, handles map[string]msgInfo) fieldInfo {
 		}
 		if v, _ := proto.GetExtension(opts, wasmifyopts.E_WasmTakeOwnershipWhen).(string); v != "" {
 			fi.takeOwnershipWhen = v
+		}
+		if v, _ := proto.GetExtension(opts, wasmifyopts.E_WasmTakeOwnershipEquals).(string); v != "" {
+			fi.takeOwnershipEquals = v
 		}
 	}
 	return fi
@@ -1666,6 +1681,38 @@ var _ = strings.HasPrefix
 // Interfaces + cppTypeToGoType (port of gengo.go generateInterfaces)
 // -----------------------------------------------------------------------------
 
+// collectInheritedInterfaceMethodNames walks the abstract-ancestor
+// chain starting at `parent` and adds the name of every method that
+// would be emitted as an interface method on an ancestor's interface
+// to `skip`. Used to suppress duplicate declarations when a child
+// abstract class re-declares a method with a covariant return type
+// (the C++ pattern `class Foo : Bar { Foo* New(); }` overriding
+// `Bar::New()` returning `Bar*`). Go interfaces cannot express
+// covariant returns, so the embedded ancestor's signature wins.
+//
+// Recurses through `parent.parent` so multi-level inheritance
+// (Leaf → Mid → Root) is fully covered.
+func collectInheritedInterfaceMethodNames(skip map[string]bool, parent string, messages map[string]msgInfo, servicesByMsg map[string]svcInfo) {
+	for parent != "" {
+		pInfo, ok := messages[parent]
+		if !ok {
+			return
+		}
+		if pInfo.isAbstract {
+			if svc, ok := servicesByMsg[parent]; ok {
+				for _, m := range svc.methods {
+					switch m.methodType {
+					case "constructor", "free", "static_factory", "callback_factory", "downcast":
+						continue
+					}
+					skip[m.name] = true
+				}
+			}
+		}
+		parent = pInfo.parent
+	}
+}
+
 // formatInterfaceMethodSignature renders a svcMethodInfo as a Go
 // interface-method line (no body). Returns "" for methods that don't
 // belong in the interface surface — constructors, the Free RPC,
@@ -1777,6 +1824,15 @@ func generateInterfaces(pkg string, messages map[string]msgInfo, cppNamespace st
 		// inherited accessors directly without a type assertion.
 		if svc, ok := servicesByMsg[name]; ok {
 			skip := collectOverloadedNames(svc)
+			// Also skip methods that are already declared on an
+			// abstract ancestor's interface — Go forbids
+			// re-declaring an embedded interface method even with
+			// the C++ covariant-return pattern (e.g. `Message::New()
+			// returning Message*` overriding `MessageLite::New()
+			// returning MessageLite*`). The embedded ancestor's
+			// signature wins; callers needing the covariant return
+			// type-assert to the concrete handle.
+			collectInheritedInterfaceMethodNames(skip, info.parent, messages, servicesByMsg)
 			for _, m := range svc.methods {
 				sig := formatInterfaceMethodSignature(m, name, skip)
 				if sig == "" {
@@ -3793,18 +3849,64 @@ func emitOwnershipTransfer(b *strings.Builder, params []fieldInfo) {
 			continue
 		}
 		// Runtime-conditional ownership transfer: the field carries
-		// `wasm_take_ownership_when=<sibling_bool_field>`. Gate the
-		// clearPtrAny call on the bool selector — the helper itself
-		// already handles nil and typed-nil so the body collapses to
-		// one line per branch.
+		// `wasm_take_ownership_when=<sibling_param>` plus
+		// `wasm_take_ownership_equals=<json_literal>`. Emit a guard
+		// with a comparison that matches the selector type:
+		//   bool  + true  → if <sel>
+		//   bool  + false → if !<sel>
+		//   int   + N     → if <sel> == N
+		//   string + "x"  → if <sel> == "x"
+		// clearPtrAny is nil-safe so the body stays one-line.
 		if p.isHandle && p.takeOwnershipWhen != "" {
 			selectorGo := goNameOfField(params, p.takeOwnershipWhen)
 			if selectorGo == "" {
 				continue
 			}
-			fmt.Fprintf(b, "\tif %s { clearPtrAny(%s) }\n", selectorGo, p.goName)
+			cond, err := transferWhenGoCondition(selectorGo, p.takeOwnershipEquals)
+			if err != nil {
+				// Should not happen — gen-proto already validated.
+				panic(fmt.Sprintf("protoc-gen-wasmify-go: %s", err))
+			}
+			fmt.Fprintf(b, "\tif %s { clearPtrAny(%s) }\n", cond, p.goName)
 		}
 	}
+}
+
+// transferWhenGoCondition renders the Go-side comparison expression
+// driving the runtime-conditional ownership clear. selectorGo is the
+// camelCase Go variable name of the selector parameter; equalsLiteral
+// is the JSON-encoded value carried by `wasm_take_ownership_equals`
+// (see internal/protogen/proto.go::encodeTransferWhenEquals for the
+// emit side).
+func transferWhenGoCondition(selectorGo, equalsLiteral string) (string, error) {
+	if equalsLiteral == "" {
+		return "", fmt.Errorf("wasm_take_ownership_equals missing for selector %q", selectorGo)
+	}
+	switch equalsLiteral {
+	case "true":
+		return selectorGo, nil
+	case "false":
+		return "!" + selectorGo, nil
+	}
+	// JSON integer or JSON string — both compare-by-equality.
+	// Validate it's parseable JSON, then plug straight into a `==`.
+	// Quoted form (string) → `selectorGo == "x"`.
+	// Bare number form (int) → `selectorGo == 1`.
+	switch equalsLiteral[0] {
+	case '"':
+		// JSON string. Verify it round-trips.
+		var s string
+		if err := json.Unmarshal([]byte(equalsLiteral), &s); err != nil {
+			return "", fmt.Errorf("invalid JSON string in wasm_take_ownership_equals=%q: %v", equalsLiteral, err)
+		}
+		// Re-encode through %q for safe Go literal embedding.
+		return fmt.Sprintf("%s == %q", selectorGo, s), nil
+	}
+	// Treat as integer literal. Verify parseable.
+	if _, err := strconv.ParseInt(equalsLiteral, 10, 64); err != nil {
+		return "", fmt.Errorf("unsupported wasm_take_ownership_equals=%q (not bool/int/string)", equalsLiteral)
+	}
+	return fmt.Sprintf("%s == %s", selectorGo, equalsLiteral), nil
 }
 
 // goNameOfField finds the Go-name (camelCase) of a sibling proto

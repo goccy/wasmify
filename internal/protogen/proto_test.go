@@ -522,3 +522,138 @@ func TestGenerateProtoAbstract(t *testing.T) {
 		t.Error("expected wasm_parent on ConcreteNode")
 	}
 }
+
+// TestQualTypeMatches pins the namespace-tolerant comparison that
+// drives `signatureMatches`. The user lists overload signatures in
+// `wasmify.json::OwnershipTransferMethods` using whatever spelling
+// fits the project; clang on the other side emits fully-qualified
+// qual_types unconditionally. The matcher must accept both.
+//
+// This was the load-bearing root cause of the
+// `SimpleTable::AddColumn(const Column*, bool)` runtime-conditional
+// double-free: user-supplied signature `"const Column *"` failed to
+// match clang's `"const googlesql::Column *"` byte-for-byte, so the
+// gen-proto stage emitted neither `wasm_take_ownership` nor
+// `wasm_take_ownership_when` on the column field, and the Go-side
+// wrapper never cleared `col.ptr` after `is_owned=true` adoption.
+func TestQualTypeMatches(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		got  string
+		ok   bool
+	}{
+		// Exact whitespace-normalised equality continues to match.
+		{"exact-equal", "const googlesql::Column *", "const googlesql::Column *", true},
+		{"whitespace-collapse", "const  googlesql::Column   *", "const googlesql::Column *", true},
+		{"compact-pointer", "googlesql::Item*", "googlesql::Item *", false}, // tokenisation differs; documented behaviour
+
+		// User drops a single namespace prefix → match (the bug fix).
+		{"unqualified-class", "const Column *", "const googlesql::Column *", true},
+		{"unqualified-non-const", "Item *", "mylib::Item *", true},
+		{"unqualified-reference", "Item &", "mylib::Item &", true},
+
+		// Multi-level namespace: user can drop the leading prefix(es).
+		{"unqualified-2-level", "Foo *", "google::protobuf::Foo *", true},
+		{"qualified-1-of-2-level", "protobuf::Foo *", "google::protobuf::Foo *", true},
+
+		// Modifier mismatch must NOT match.
+		{"const-mismatch", "Column *", "const googlesql::Column *", false},
+		{"pointer-vs-reference", "googlesql::Column &", "googlesql::Column *", false},
+		{"arity-mismatch", "Column", "googlesql::Column *", false},
+
+		// Wrong leaf name must NOT match.
+		{"wrong-leaf", "Row *", "googlesql::Column *", false},
+
+		// Primitive bool unchanged.
+		{"bool-exact", "bool", "bool", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := qualTypeMatches(tc.want, tc.got)
+			if got != tc.ok {
+				t.Errorf("qualTypeMatches(%q, %q) = %v; want %v", tc.want, tc.got, got, tc.ok)
+			}
+		})
+	}
+}
+
+// TestSignatureMatches_NamespaceTolerance verifies that the
+// `OwnershipTransferMethods` overload disambiguation works whether
+// the user wrote unqualified or fully-qualified type names — both
+// forms must match the same clang-emitted overload.
+func TestSignatureMatches_NamespaceTolerance(t *testing.T) {
+	params := []apispec.Param{
+		{Name: "column", Type: apispec.TypeRef{
+			Kind: apispec.TypeHandle, Name: "googlesql::Column",
+			IsPointer: true, QualType: "const googlesql::Column *",
+		}},
+		{Name: "is_owned", Type: apispec.TypeRef{
+			Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool",
+		}},
+	}
+
+	cases := []struct {
+		name string
+		sig  []string
+		ok   bool
+	}{
+		{"unqualified", []string{"const Column *", "bool"}, true},
+		{"fully-qualified", []string{"const googlesql::Column *", "bool"}, true},
+		{"arity-mismatch", []string{"const Column *"}, false},
+		{"wrong-modifier", []string{"Column *", "bool"}, false}, // missing const
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := signatureMatches(tc.sig, params)
+			if got != tc.ok {
+				t.Errorf("signatureMatches(%v) = %v; want %v", tc.sig, got, tc.ok)
+			}
+		})
+	}
+}
+
+// TestEncodeTransferWhenEquals validates that the JSON literal
+// emitted on `wasm_take_ownership_equals` round-trips back to the
+// expected Go expression on the plugin side.
+func TestEncodeTransferWhenEquals(t *testing.T) {
+	cases := []struct {
+		name      string
+		paramType apispec.TypeRef
+		equals    any
+		want      string
+		wantErr   bool
+	}{
+		// bool param
+		{"bool-true", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"}, true, "true", false},
+		{"bool-false", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"}, false, "false", false},
+		{"bool-mismatch-int", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool", QualType: "bool"}, 1, "", true},
+
+		// int param
+		{"int-1", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"}, float64(1), "1", false},
+		{"int-zero", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"}, float64(0), "0", false},
+		{"int-negative", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int32_t", QualType: "int32_t"}, float64(-7), "-7", false},
+		{"int-mismatch-bool", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"}, true, "", true},
+		{"int-mismatch-string", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"}, "1", "", true},
+		{"int-fractional-rejected", apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "int", QualType: "int"}, 1.5, "", true},
+
+		// string param
+		{"string-simple", apispec.TypeRef{Kind: apispec.TypeString}, "transfer", `"transfer"`, false},
+		{"string-empty", apispec.TypeRef{Kind: apispec.TypeString}, "", `""`, false},
+		{"string-mismatch-bool", apispec.TypeRef{Kind: apispec.TypeString}, true, "", true},
+
+		// unsupported type
+		{"unsupported-handle", apispec.TypeRef{Kind: apispec.TypeHandle, Name: "Foo", QualType: "Foo *", IsPointer: true}, true, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := encodeTransferWhenEquals(tc.paramType, tc.equals)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("encodeTransferWhenEquals: err=%v, wantErr=%v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != tc.want {
+				t.Errorf("encodeTransferWhenEquals = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}

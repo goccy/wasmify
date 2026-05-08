@@ -369,6 +369,45 @@ type OwnershipTransferEntry struct {
 	// position. When Signature is empty, every overload of
 	// Method matches.
 	Signature []string `json:"signature,omitempty"`
+	// TransferWhen, when set, marks this as runtime-conditional
+	// ownership transfer (Pattern 2). The named parameter on the
+	// matched overload is consulted at runtime; the handle param
+	// is adopted (Go-side `clearPtr` fires) only when the named
+	// parameter equals `Equals` at call time.
+	//
+	// Required when the matched overload includes a parameter that
+	// the C++ implementation consults to decide ownership at
+	// runtime — e.g. `SimpleTable::AddColumn(const Column*, bool
+	// is_owned)` adopts iff `is_owned == true`. Without this
+	// explicit selector, the entry is treated as Pattern 1
+	// (unconditional transfer): every handle param is cleared
+	// regardless of any other parameter values.
+	//
+	// Supported parameter primitive types are bool, integer
+	// (signed / unsigned of any width), and string-like
+	// (`std::string`, `absl::string_view`). For bool params the
+	// generator collapses `Equals=true` into `if <param>` and
+	// `Equals=false` into `if !<param>`; for int and string params
+	// it emits an explicit `==` comparison.
+	TransferWhen *TransferWhenSpec `json:"transfer_when,omitempty"`
+}
+
+// TransferWhenSpec describes the runtime selector for Pattern 2
+// ownership transfer (see OwnershipTransferEntry.TransferWhen).
+type TransferWhenSpec struct {
+	// Param is the C++ parameter name on the matched overload
+	// whose runtime value selects ownership transfer.
+	Param string `json:"param"`
+	// Equals is the value the parameter must take for ownership
+	// to transfer. Type must match the parameter's C++ type:
+	//   - bool param   → JSON bool   (`true` / `false`)
+	//   - int param    → JSON number (any integer literal)
+	//   - string param → JSON string
+	// Loaded as `any` so the wasmify generator can validate the
+	// type against the matched parameter and reject mismatches
+	// at gen-proto time rather than letting them surface as
+	// confusing runtime errors.
+	Equals any `json:"equals"`
 }
 
 // ErrorReturnSpec describes how to reconstruct an error-typed return
