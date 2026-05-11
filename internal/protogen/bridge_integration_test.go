@@ -226,6 +226,146 @@ func TestGenerateBridge_WithErrorType(t *testing.T) {
 	if !strings.Contains(output, ".ok()") {
 		t.Error("expected error-pattern code (.ok()) in bridge output")
 	}
+	// absl::Status carries no payload — no success-branch write_handle
+	// should be emitted for DoWork.
+	if strings.Contains(output, "write_handle(1, reinterpret_cast<uint64_t>(*_result))") {
+		t.Error("absl::Status return should not emit a payload write")
+	}
+}
+
+// TestGenerateBridge_StatusOrPointerReturn exercises the success branch
+// emission for absl::StatusOr<const T*> returns. Regression test for the
+// generator bug where the payload write was omitted, causing Go-side
+// bindings to observe (nil, nil) on success.
+func TestGenerateBridge_StatusOrPointerReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "Make",
+						QualName: "mylib::Widget::Make",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<const Widget *>",
+							QualType: "absl::StatusOr<const Widget *>",
+						},
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	// Error branch
+	if !strings.Contains(output, "if (!_result.ok())") {
+		t.Error("expected error branch (if (!_result.ok())) in StatusOr return")
+	}
+	// Success branch — *_result is the held pointer, written as a handle.
+	if !strings.Contains(output, "else { _pw.write_handle(1, reinterpret_cast<uint64_t>(*_result));") {
+		t.Errorf("expected else-branch write_handle for StatusOr<const T*> payload; output:\n%s",
+			output)
+	}
+}
+
+// TestGenerateBridge_StatusOrUniquePtrReturn exercises the
+// std::unique_ptr<T> payload path of StatusOr returns.
+func TestGenerateBridge_StatusOrUniquePtrReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "Build",
+						QualName: "mylib::Widget::Build",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<std::unique_ptr<Widget>>",
+							QualType: "absl::StatusOr<std::unique_ptr<Widget>>",
+						},
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	if !strings.Contains(output, "(*_result).release()") {
+		t.Errorf("expected unique_ptr release() on success branch; output:\n%s", output)
+	}
+}
+
+// TestGenerateBridge_StatusOrBoolReturn exercises the primitive payload
+// path of StatusOr returns.
+func TestGenerateBridge_StatusOrBoolReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "IsReady",
+						QualName: "mylib::Widget::IsReady",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<bool>",
+							QualType: "absl::StatusOr<bool>",
+						},
+						IsConst:    true,
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	if !strings.Contains(output, "_pw.write_bool(1, *_result);") {
+		t.Errorf("expected write_bool(1, *_result) on success branch; output:\n%s", output)
+	}
 }
 
 // TestGenerateBridge_WithMethodsAndGetters exercises writeCallBody,

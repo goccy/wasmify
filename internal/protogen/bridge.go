@@ -3169,6 +3169,15 @@ func writeReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 		baseName = strings.TrimSpace(baseName)
 		if pattern := matchErrorType(baseName); pattern != "" {
 			code := strings.ReplaceAll(pattern, "{result}", varName)
+			// Templated error wrappers (e.g. absl::StatusOr<T>) carry a
+			// payload on success — emit an else-branch that serialises
+			// *_result to the response. Plain error types (absl::Status)
+			// carry no payload, so the error pattern alone is correct.
+			if inner, ok := statusOrInnerType(ref); ok {
+				if successWrite := writeStatusOrSuccessExpr(inner, fieldNum, varName); successWrite != "" {
+					return code + " else { " + successWrite + " }"
+				}
+			}
 			return code
 		}
 		return writeValueReturnExpr(ref, fieldNum, varName)
@@ -5095,6 +5104,73 @@ func statusOrInnerType(t apispec.TypeRef) (string, bool) {
 		return "", false
 	}
 	return inner, true
+}
+
+// writeStatusOrSuccessExpr emits the C++ statement that writes the
+// payload of a StatusOr-like wrapper to `fieldNum` on the success
+// branch. `inner` is the wrapper's template argument spelling (e.g.
+// "const Type *", "std::unique_ptr<T>", "bool"); `varName` is the
+// local holding the wrapper. The success branch dereferences via
+// `*varName`, mirroring how absl::StatusOr exposes its payload.
+//
+// Returns "" if the inner type isn't recognised, in which case the
+// caller should fall back to emitting only the error branch (the
+// safest degradation — the Go side observes (nil, nil) instead of a
+// crash). Adding a case here unbreaks the corresponding family of
+// bridge exports.
+func writeStatusOrSuccessExpr(inner string, fieldNum int, varName string) string {
+	inner = strings.TrimSpace(inner)
+	if inner == "" {
+		return ""
+	}
+
+	// Pointer-to-handle (`T*`, `const T*`): the most common case for
+	// factory-style StatusOr returns. The wire format is a single
+	// handle field; the Go side reads it as a typed handle pointer.
+	if strings.HasSuffix(inner, "*") {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(*%s));", fieldNum, varName)
+	}
+
+	// Smart pointers — the payload is a unique_ptr / shared_ptr<T>
+	// owning a freshly-constructed object. unique_ptr transfers sole
+	// ownership across the boundary via release(); shared_ptr must
+	// preserve joint ownership, so heap-allocate a copy of the
+	// shared_ptr.
+	if isSharedPointerType(inner) {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(*%s))));", fieldNum, varName)
+	}
+	if isUniquePointerType(inner) {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>((*%s).release()));", fieldNum, varName)
+	}
+
+	// Primitives — the response message uses the matching scalar
+	// field. cppPrimitiveType maps unknown names to "int64_t", so
+	// gate the lookup on a known-primitive set.
+	switch inner {
+	case "bool":
+		return fmt.Sprintf("_pw.write_bool(%d, *%s);", fieldNum, varName)
+	case "float":
+		return fmt.Sprintf("_pw.write_float(%d, *%s);", fieldNum, varName)
+	case "double", "long double":
+		return fmt.Sprintf("_pw.write_double(%d, *%s);", fieldNum, varName)
+	case "int", "int32_t", "short", "int16_t", "char", "int8_t", "signed char":
+		return fmt.Sprintf("_pw.write_int32(%d, static_cast<int32_t>(*%s));", fieldNum, varName)
+	case "unsigned int", "uint32_t", "unsigned short", "uint16_t", "unsigned char", "uint8_t":
+		return fmt.Sprintf("_pw.write_uint32(%d, static_cast<uint32_t>(*%s));", fieldNum, varName)
+	case "long", "long long", "int64_t", "ssize_t", "ptrdiff_t", "intptr_t":
+		return fmt.Sprintf("_pw.write_int64(%d, static_cast<int64_t>(*%s));", fieldNum, varName)
+	case "unsigned long", "unsigned long long", "uint64_t", "size_t", "uintptr_t":
+		return fmt.Sprintf("_pw.write_uint64(%d, static_cast<uint64_t>(*%s));", fieldNum, varName)
+	}
+
+	// std::string payload.
+	if inner == "std::string" || inner == "string" {
+		return fmt.Sprintf("_pw.write_string(%d, std::string(*%s));", fieldNum, varName)
+	}
+
+	// By-value class payload — heap-allocate a copy via move so the
+	// emitted handle outlives the StatusOr local.
+	return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(*%s))));", fieldNum, varName)
 }
 
 // trampolineTypeDecl returns the C++ type used in the override's
