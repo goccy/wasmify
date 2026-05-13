@@ -821,6 +821,106 @@ func TestGenerateBridge_NoSubProtoWriterDoubleFree(t *testing.T) {
 	}
 }
 
+// TestGenerateBridge_NoSubProtoWriterDoubleFreeInValueReturns is the
+// end-to-end counterpart of TestGenerateBridge_NoSubProtoWriterDoubleFree.
+// The preamble-helper test covers the six runtime helpers; this test
+// drives the *generator templates* that emit the dispatch body for
+// methods/functions returning value structs and vectors of value structs.
+//
+// writeValueReturnExpr and writeVectorReturnExpr historically emitted a
+// per-call sub ProtoWriter and then `free(_subw.data_)` immediately after
+// `_pw.write_submessage(...)`. The sub's destructor ran at end of the
+// enclosing block and freed the same pointer a second time. The dlmalloc
+// corruption that followed surfaced — many iterations later — as a
+// `wasm error: out of bounds memory access` from an unrelated wasm_alloc.
+//
+// The fixture uses the same `mylib::Result` POD shape that the simplelib
+// integration test compiles end-to-end, so a regression here lands on
+// the same code paths that the wasi-sdk-built `googlesql.wasm` exercises.
+func TestGenerateBridge_NoSubProtoWriterDoubleFreeInValueReturns(t *testing.T) {
+	src := "mylib/result.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Functions: []apispec.Function{
+			{
+				// Triggers writeValueReturnExpr — POD struct return.
+				Name:     "ComputeSafe",
+				QualName: "mylib::ComputeSafe",
+				ReturnType: apispec.TypeRef{
+					Kind: apispec.TypeValue,
+					Name: "mylib::Result",
+				},
+				SourceFile: src,
+			},
+			{
+				// Triggers writeVectorReturnExpr with a value element —
+				// per-element sub ProtoWriter inside the for-loop body.
+				Name:     "AggregateResults",
+				QualName: "mylib::AggregateResults",
+				ReturnType: apispec.TypeRef{
+					Kind: apispec.TypeVector,
+					Inner: &apispec.TypeRef{
+						Kind: apispec.TypeValue,
+						Name: "mylib::Result",
+					},
+				},
+				SourceFile: src,
+			},
+		},
+		Classes: []apispec.Class{
+			{
+				Name:      "Result",
+				QualName:  "mylib::Result",
+				Namespace: "mylib",
+				Fields: []apispec.Field{
+					{Name: "value", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "double"}},
+					{Name: "ok", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool"}},
+					{Name: "error_message", Type: apispec.TypeRef{Kind: apispec.TypeString}},
+				},
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				SourceFile:           src,
+			},
+		},
+	}
+
+	output := GenerateBridge(spec, "mylib", "")
+
+	// Sanity: both emit paths actually ran. Without these, the
+	// double-free check below is a no-op that always passes.
+	if !strings.Contains(output, "ProtoWriter _subw") {
+		t.Fatalf("expected the generator to emit a per-call sub ProtoWriter; output did not contain `ProtoWriter _subw`:\n%s", output)
+	}
+
+	// Both `free(_subw.data_)` and the shorter `free(_subw.data_)` token
+	// are forbidden. The destructor releases the buffer; an explicit
+	// free is a double-free.
+	for _, forbidden := range []string{"free(_subw.data_)", "free(_subw .data_)"} {
+		if strings.Contains(output, forbidden) {
+			// Locate the offending dispatch body to make the failure
+			// actionable — both ComputeSafe (value return) and
+			// AggregateResults (vector-of-value return) live inside
+			// generated `w_<Name>` exports.
+			for _, marker := range []string{"WASM_EXPORT(w_ComputeSafe)", "WASM_EXPORT(w_AggregateResults)"} {
+				if idx := strings.Index(output, marker); idx >= 0 {
+					end := strings.Index(output[idx:], "WASM_EXPORT(")
+					if end < 0 || end == 0 {
+						end = len(output) - idx
+					}
+					body := output[idx : idx+end]
+					if strings.Contains(body, forbidden) {
+						t.Errorf("dispatch body for %s must not contain %q — the _subw destructor releases _subw.data_, so an explicit free is a double-free.\nbody:\n%s",
+							marker, forbidden, body)
+					}
+				}
+			}
+			// Fall-through error in case neither marker matched (rare —
+			// only if the export naming convention changes).
+			t.Errorf("generated bridge must not contain %q anywhere", forbidden)
+		}
+	}
+}
+
 // extractClassMember returns the source from a member-function
 // header up to and including the next closing brace at column 4
 // (the C++ generator's per-class indentation). Used to bound the

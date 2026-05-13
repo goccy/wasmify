@@ -302,6 +302,26 @@ func TestIntegration_ParseHeadersAndGenProto(t *testing.T) {
 			}
 		}
 
+		// Sub ProtoWriter double-free regression. simplelib's
+		// `compute_safe` returns a Result value (drives
+		// writeValueReturnExpr) and `aggregate_results` returns
+		// `std::vector<Result>` (drives writeVectorReturnExpr) — both
+		// historically emitted `free(_subw.data_)` after the
+		// `_pw.write_submessage(...)` call, double-freeing a buffer
+		// that the destructor was about to release. Verify the
+		// generator no longer emits that pattern anywhere in the
+		// dispatch body, and that the per-call sub ProtoWriter still
+		// appears so the assertion is not a no-op.
+		if !strings.Contains(bridge, "ProtoWriter _subw") {
+			t.Errorf("simplelib bridge unexpectedly contains no per-call sub ProtoWriter — the writeValueReturnExpr / writeVectorReturnExpr emit paths cover Result / vector<Result> in this fixture; if they vanish, the double-free invariant below cannot be regression-tested")
+		}
+		for _, forbidden := range []string{"free(_subw.data_)", "free(_subw .data_)"} {
+			if strings.Contains(bridge, forbidden) {
+				t.Errorf("simplelib bridge must not contain %q — the _subw destructor releases _subw.data_, so an explicit free is a double-free that corrupts dlmalloc's freelist and surfaces as a delayed `wasm error: out of bounds memory access`",
+					forbidden)
+			}
+		}
+
 		bridgeHPath := filepath.Join(dataDir, "wasm-build", "src", "api_bridge.h")
 		if _, err := os.ReadFile(bridgeHPath); err != nil {
 			t.Errorf("missing api_bridge.h: %v", err)
