@@ -801,51 +801,52 @@ public:
 
     void write_handle(uint32_t field, uint64_t ptr) {
         if (ptr == 0) return;
-        // Handle is a submessage with field 1 = uint64 ptr
+        // Handle is a submessage with field 1 = uint64 ptr.
+        // sub's destructor releases sub.data_ when it goes out of
+        // scope; we MUST NOT free it here as well — that double-free
+        // corrupts dlmalloc's free list and surfaces as a delayed
+        // "out of bounds memory access" on a later wasm_alloc.
         ProtoWriter sub;
         sub.write_uint64(1, ptr);
         write_submessage(field, sub);
-        free(sub.data_);
     }
 
     // ---- Repeated primitive helpers (packed encoding) ----
     // Note: this class lives inside extern "C" {}, so we cannot declare
     // member templates. Each packed variant is written out explicitly.
+    // Each helper leaves sub.data_ to its destructor — write_submessage
+    // copies the bytes into *this, so the temporary's buffer must be
+    // freed exactly once.
 
     void write_repeated_int32(uint32_t field, const std::vector<int32_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (int32_t v : vec) sub.write_varint(static_cast<uint64_t>(static_cast<uint32_t>(v)));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_int64(uint32_t field, const std::vector<int64_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (int64_t v : vec) sub.write_varint(static_cast<uint64_t>(v));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_uint32(uint32_t field, const std::vector<uint32_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (uint32_t v : vec) sub.write_varint(static_cast<uint64_t>(v));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_uint64(uint32_t field, const std::vector<uint64_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (uint64_t v : vec) sub.write_varint(v);
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_bool(uint32_t field, const std::vector<bool>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (bool v : vec) sub.write_varint(v ? 1u : 0u);
         write_submessage(field, sub);
-        free(sub.data_);
     }
 
     void write_repeated_double(uint32_t field, const std::vector<double>& vec) {
@@ -3273,7 +3274,10 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 		// ProtoWriter is emitted for each element and flushed with the
 		// parent's write_submessage.
 		perElem := writeValueReturnExprForSub("_elem", inner)
-		return fmt.Sprintf("for (const auto& _elem : %s) {\n    ProtoWriter _subw;\n    %s\n    _pw.write_submessage(%d, _subw);\n    free(_subw.data_);\n}", varName, perElem, fieldNum)
+		// The _subw destructor releases _subw.data_ at end of the
+		// block; calling free() before it is a double-free that
+		// corrupts dlmalloc's freelist.
+		return fmt.Sprintf("for (const auto& _elem : %s) {\n    ProtoWriter _subw;\n    %s\n    _pw.write_submessage(%d, _subw);\n}", varName, perElem, fieldNum)
 	}
 	return fmt.Sprintf("// TODO: serialize vector<%s>", inner.Name)
 }
@@ -3310,7 +3314,9 @@ func writeValueReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) str
 		sb.WriteString(writeValueFieldExpr(f.Type, fieldProtoNum, memberRef, "_subw"))
 		sb.WriteString("\n")
 	}
-	fmt.Fprintf(&sb, "    _pw.write_submessage(%d, _subw);\n    free(_subw.data_);\n}", fieldNum)
+	// _subw's destructor releases its buffer at end of block; an
+	// explicit free() before it double-frees and corrupts dlmalloc.
+	fmt.Fprintf(&sb, "    _pw.write_submessage(%d, _subw);\n}", fieldNum)
 	return sb.String()
 }
 

@@ -778,6 +778,49 @@ func TestGenerateBridge_ProtoWriterFreesData(t *testing.T) {
 	}
 }
 
+// TestGenerateBridge_NoSubProtoWriterDoubleFree pins the invariant
+// that the sub-buffer ProtoWriter created inside write_handle and
+// write_repeated_* helpers is freed exactly once, by the destructor.
+//
+// Prior versions called `free(sub.data_)` directly after
+// `write_submessage(field, sub)` without nullifying sub.data_;
+// the destructor that ran at scope exit then freed the same pointer
+// again. The second free silently corrupted dlmalloc's free list
+// and surfaced — many iterations later, in an unrelated path —
+// as `wasm error: out of bounds memory access` on a subsequent
+// wasm_alloc.
+//
+// write_submessage copies the bytes into *this via write_raw, so
+// it never takes ownership of sub.data_; the destructor is the
+// single correct release site.
+func TestGenerateBridge_NoSubProtoWriterDoubleFree(t *testing.T) {
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Functions: []apispec.Function{
+			{Name: "Noop", QualName: "mylib::Noop",
+				ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+				SourceFile: "mylib/foo.h"},
+		},
+	}
+	output := GenerateBridge(spec, "mylib", "")
+
+	helpers := []string{
+		"void write_handle(uint32_t field, uint64_t ptr)",
+		"void write_repeated_int32(uint32_t field, const std::vector<int32_t>& vec)",
+		"void write_repeated_int64(uint32_t field, const std::vector<int64_t>& vec)",
+		"void write_repeated_uint32(uint32_t field, const std::vector<uint32_t>& vec)",
+		"void write_repeated_uint64(uint32_t field, const std::vector<uint64_t>& vec)",
+		"void write_repeated_bool(uint32_t field, const std::vector<bool>& vec)",
+	}
+	for _, header := range helpers {
+		body := extractClassMember(t, output, header)
+		if strings.Contains(body, "free(sub.data_)") {
+			t.Errorf("%s must not call free(sub.data_) — the sub ProtoWriter destructor releases it; an explicit free is a double-free.\nbody:\n%s",
+				header, body)
+		}
+	}
+}
+
 // extractClassMember returns the source from a member-function
 // header up to and including the next closing brace at column 4
 // (the C++ generator's per-class indentation). Used to bound the
