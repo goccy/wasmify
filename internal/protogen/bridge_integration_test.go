@@ -226,6 +226,146 @@ func TestGenerateBridge_WithErrorType(t *testing.T) {
 	if !strings.Contains(output, ".ok()") {
 		t.Error("expected error-pattern code (.ok()) in bridge output")
 	}
+	// absl::Status carries no payload — no success-branch write_handle
+	// should be emitted for DoWork.
+	if strings.Contains(output, "write_handle(1, reinterpret_cast<uint64_t>(*_result))") {
+		t.Error("absl::Status return should not emit a payload write")
+	}
+}
+
+// TestGenerateBridge_StatusOrPointerReturn exercises the success branch
+// emission for absl::StatusOr<const T*> returns. Regression test for the
+// generator bug where the payload write was omitted, causing Go-side
+// bindings to observe (nil, nil) on success.
+func TestGenerateBridge_StatusOrPointerReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "Make",
+						QualName: "mylib::Widget::Make",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<const Widget *>",
+							QualType: "absl::StatusOr<const Widget *>",
+						},
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	// Error branch
+	if !strings.Contains(output, "if (!_result.ok())") {
+		t.Error("expected error branch (if (!_result.ok())) in StatusOr return")
+	}
+	// Success branch — *_result is the held pointer, written as a handle.
+	if !strings.Contains(output, "else { _pw.write_handle(1, reinterpret_cast<uint64_t>(*_result));") {
+		t.Errorf("expected else-branch write_handle for StatusOr<const T*> payload; output:\n%s",
+			output)
+	}
+}
+
+// TestGenerateBridge_StatusOrUniquePtrReturn exercises the
+// std::unique_ptr<T> payload path of StatusOr returns.
+func TestGenerateBridge_StatusOrUniquePtrReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "Build",
+						QualName: "mylib::Widget::Build",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<std::unique_ptr<Widget>>",
+							QualType: "absl::StatusOr<std::unique_ptr<Widget>>",
+						},
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	if !strings.Contains(output, "(*_result).release()") {
+		t.Errorf("expected unique_ptr release() on success branch; output:\n%s", output)
+	}
+}
+
+// TestGenerateBridge_StatusOrBoolReturn exercises the primitive payload
+// path of StatusOr returns.
+func TestGenerateBridge_StatusOrBoolReturn(t *testing.T) {
+	src := "mylib/foo.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Classes: []apispec.Class{
+			{
+				Name:                 "Widget",
+				QualName:             "mylib::Widget",
+				Namespace:            "mylib",
+				IsHandle:             true,
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				Methods: []apispec.Function{
+					{
+						Name:     "IsReady",
+						QualName: "mylib::Widget::IsReady",
+						ReturnType: apispec.TypeRef{
+							Kind:     apispec.TypeValue,
+							Name:     "absl::StatusOr<bool>",
+							QualType: "absl::StatusOr<bool>",
+						},
+						IsConst:    true,
+						SourceFile: src,
+					},
+				},
+				SourceFile: src,
+			},
+		},
+	}
+	cfg := BridgeConfig{
+		ExternalTypes: []string{"absl::StatusOr"},
+		ErrorTypes: map[string]string{
+			"absl::StatusOr": `if (!{result}.ok()) { _pw.write_error(std::string({result}.status().message())); }`,
+		},
+	}
+	output := GenerateBridgeWithConfig(spec, "mylib", "", cfg)
+	if !strings.Contains(output, "_pw.write_bool(1, *_result);") {
+		t.Errorf("expected write_bool(1, *_result) on success branch; output:\n%s", output)
+	}
 }
 
 // TestGenerateBridge_WithMethodsAndGetters exercises writeCallBody,
@@ -635,6 +775,149 @@ func TestGenerateBridge_ProtoWriterFreesData(t *testing.T) {
 	}
 	if !strings.Contains(finishBody, "encode_result(") {
 		t.Errorf("finish() must still encode the result; got:\n%s", finishBody)
+	}
+}
+
+// TestGenerateBridge_NoSubProtoWriterDoubleFree pins the invariant
+// that the sub-buffer ProtoWriter created inside write_handle and
+// write_repeated_* helpers is freed exactly once, by the destructor.
+//
+// Prior versions called `free(sub.data_)` directly after
+// `write_submessage(field, sub)` without nullifying sub.data_;
+// the destructor that ran at scope exit then freed the same pointer
+// again. The second free silently corrupted dlmalloc's free list
+// and surfaced — many iterations later, in an unrelated path —
+// as `wasm error: out of bounds memory access` on a subsequent
+// wasm_alloc.
+//
+// write_submessage copies the bytes into *this via write_raw, so
+// it never takes ownership of sub.data_; the destructor is the
+// single correct release site.
+func TestGenerateBridge_NoSubProtoWriterDoubleFree(t *testing.T) {
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Functions: []apispec.Function{
+			{Name: "Noop", QualName: "mylib::Noop",
+				ReturnType: apispec.TypeRef{Kind: apispec.TypeVoid},
+				SourceFile: "mylib/foo.h"},
+		},
+	}
+	output := GenerateBridge(spec, "mylib", "")
+
+	helpers := []string{
+		"void write_handle(uint32_t field, uint64_t ptr)",
+		"void write_repeated_int32(uint32_t field, const std::vector<int32_t>& vec)",
+		"void write_repeated_int64(uint32_t field, const std::vector<int64_t>& vec)",
+		"void write_repeated_uint32(uint32_t field, const std::vector<uint32_t>& vec)",
+		"void write_repeated_uint64(uint32_t field, const std::vector<uint64_t>& vec)",
+		"void write_repeated_bool(uint32_t field, const std::vector<bool>& vec)",
+	}
+	for _, header := range helpers {
+		body := extractClassMember(t, output, header)
+		if strings.Contains(body, "free(sub.data_)") {
+			t.Errorf("%s must not call free(sub.data_) — the sub ProtoWriter destructor releases it; an explicit free is a double-free.\nbody:\n%s",
+				header, body)
+		}
+	}
+}
+
+// TestGenerateBridge_NoSubProtoWriterDoubleFreeInValueReturns is the
+// end-to-end counterpart of TestGenerateBridge_NoSubProtoWriterDoubleFree.
+// The preamble-helper test covers the six runtime helpers; this test
+// drives the *generator templates* that emit the dispatch body for
+// methods/functions returning value structs and vectors of value structs.
+//
+// writeValueReturnExpr and writeVectorReturnExpr historically emitted a
+// per-call sub ProtoWriter and then `free(_subw.data_)` immediately after
+// `_pw.write_submessage(...)`. The sub's destructor ran at end of the
+// enclosing block and freed the same pointer a second time. The dlmalloc
+// corruption that followed surfaced — many iterations later — as a
+// `wasm error: out of bounds memory access` from an unrelated wasm_alloc.
+//
+// The fixture uses the same `mylib::Result` POD shape that the simplelib
+// integration test compiles end-to-end, so a regression here lands on
+// the same code paths that the wasi-sdk-built `googlesql.wasm` exercises.
+func TestGenerateBridge_NoSubProtoWriterDoubleFreeInValueReturns(t *testing.T) {
+	src := "mylib/result.h"
+	spec := &apispec.APISpec{
+		Namespace: "mylib",
+		Functions: []apispec.Function{
+			{
+				// Triggers writeValueReturnExpr — POD struct return.
+				Name:     "ComputeSafe",
+				QualName: "mylib::ComputeSafe",
+				ReturnType: apispec.TypeRef{
+					Kind: apispec.TypeValue,
+					Name: "mylib::Result",
+				},
+				SourceFile: src,
+			},
+			{
+				// Triggers writeVectorReturnExpr with a value element —
+				// per-element sub ProtoWriter inside the for-loop body.
+				Name:     "AggregateResults",
+				QualName: "mylib::AggregateResults",
+				ReturnType: apispec.TypeRef{
+					Kind: apispec.TypeVector,
+					Inner: &apispec.TypeRef{
+						Kind: apispec.TypeValue,
+						Name: "mylib::Result",
+					},
+				},
+				SourceFile: src,
+			},
+		},
+		Classes: []apispec.Class{
+			{
+				Name:      "Result",
+				QualName:  "mylib::Result",
+				Namespace: "mylib",
+				Fields: []apispec.Field{
+					{Name: "value", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "double"}},
+					{Name: "ok", Type: apispec.TypeRef{Kind: apispec.TypePrimitive, Name: "bool"}},
+					{Name: "error_message", Type: apispec.TypeRef{Kind: apispec.TypeString}},
+				},
+				HasPublicDefaultCtor: true,
+				HasPublicDtor:        true,
+				SourceFile:           src,
+			},
+		},
+	}
+
+	output := GenerateBridge(spec, "mylib", "")
+
+	// Sanity: both emit paths actually ran. Without these, the
+	// double-free check below is a no-op that always passes.
+	if !strings.Contains(output, "ProtoWriter _subw") {
+		t.Fatalf("expected the generator to emit a per-call sub ProtoWriter; output did not contain `ProtoWriter _subw`:\n%s", output)
+	}
+
+	// Both `free(_subw.data_)` and the shorter `free(_subw.data_)` token
+	// are forbidden. The destructor releases the buffer; an explicit
+	// free is a double-free.
+	for _, forbidden := range []string{"free(_subw.data_)", "free(_subw .data_)"} {
+		if strings.Contains(output, forbidden) {
+			// Locate the offending dispatch body to make the failure
+			// actionable — both ComputeSafe (value return) and
+			// AggregateResults (vector-of-value return) live inside
+			// generated `w_<Name>` exports.
+			for _, marker := range []string{"WASM_EXPORT(w_ComputeSafe)", "WASM_EXPORT(w_AggregateResults)"} {
+				if idx := strings.Index(output, marker); idx >= 0 {
+					end := strings.Index(output[idx:], "WASM_EXPORT(")
+					if end < 0 || end == 0 {
+						end = len(output) - idx
+					}
+					body := output[idx : idx+end]
+					if strings.Contains(body, forbidden) {
+						t.Errorf("dispatch body for %s must not contain %q — the _subw destructor releases _subw.data_, so an explicit free is a double-free.\nbody:\n%s",
+							marker, forbidden, body)
+					}
+				}
+			}
+			// Fall-through error in case neither marker matched (rare —
+			// only if the export naming convention changes).
+			t.Errorf("generated bridge must not contain %q anywhere", forbidden)
+		}
 	}
 }
 

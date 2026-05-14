@@ -801,51 +801,52 @@ public:
 
     void write_handle(uint32_t field, uint64_t ptr) {
         if (ptr == 0) return;
-        // Handle is a submessage with field 1 = uint64 ptr
+        // Handle is a submessage with field 1 = uint64 ptr.
+        // sub's destructor releases sub.data_ when it goes out of
+        // scope; we MUST NOT free it here as well — that double-free
+        // corrupts dlmalloc's free list and surfaces as a delayed
+        // "out of bounds memory access" on a later wasm_alloc.
         ProtoWriter sub;
         sub.write_uint64(1, ptr);
         write_submessage(field, sub);
-        free(sub.data_);
     }
 
     // ---- Repeated primitive helpers (packed encoding) ----
     // Note: this class lives inside extern "C" {}, so we cannot declare
     // member templates. Each packed variant is written out explicitly.
+    // Each helper leaves sub.data_ to its destructor — write_submessage
+    // copies the bytes into *this, so the temporary's buffer must be
+    // freed exactly once.
 
     void write_repeated_int32(uint32_t field, const std::vector<int32_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (int32_t v : vec) sub.write_varint(static_cast<uint64_t>(static_cast<uint32_t>(v)));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_int64(uint32_t field, const std::vector<int64_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (int64_t v : vec) sub.write_varint(static_cast<uint64_t>(v));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_uint32(uint32_t field, const std::vector<uint32_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (uint32_t v : vec) sub.write_varint(static_cast<uint64_t>(v));
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_uint64(uint32_t field, const std::vector<uint64_t>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (uint64_t v : vec) sub.write_varint(v);
         write_submessage(field, sub);
-        free(sub.data_);
     }
     void write_repeated_bool(uint32_t field, const std::vector<bool>& vec) {
         if (vec.empty()) return;
         ProtoWriter sub;
         for (bool v : vec) sub.write_varint(v ? 1u : 0u);
         write_submessage(field, sub);
-        free(sub.data_);
     }
 
     void write_repeated_double(uint32_t field, const std::vector<double>& vec) {
@@ -3169,6 +3170,15 @@ func writeReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 		baseName = strings.TrimSpace(baseName)
 		if pattern := matchErrorType(baseName); pattern != "" {
 			code := strings.ReplaceAll(pattern, "{result}", varName)
+			// Templated error wrappers (e.g. absl::StatusOr<T>) carry a
+			// payload on success — emit an else-branch that serialises
+			// *_result to the response. Plain error types (absl::Status)
+			// carry no payload, so the error pattern alone is correct.
+			if inner, ok := statusOrInnerType(ref); ok {
+				if successWrite := writeStatusOrSuccessExpr(inner, fieldNum, varName); successWrite != "" {
+					return code + " else { " + successWrite + " }"
+				}
+			}
 			return code
 		}
 		return writeValueReturnExpr(ref, fieldNum, varName)
@@ -3264,7 +3274,10 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 		// ProtoWriter is emitted for each element and flushed with the
 		// parent's write_submessage.
 		perElem := writeValueReturnExprForSub("_elem", inner)
-		return fmt.Sprintf("for (const auto& _elem : %s) {\n    ProtoWriter _subw;\n    %s\n    _pw.write_submessage(%d, _subw);\n    free(_subw.data_);\n}", varName, perElem, fieldNum)
+		// The _subw destructor releases _subw.data_ at end of the
+		// block; calling free() before it is a double-free that
+		// corrupts dlmalloc's freelist.
+		return fmt.Sprintf("for (const auto& _elem : %s) {\n    ProtoWriter _subw;\n    %s\n    _pw.write_submessage(%d, _subw);\n}", varName, perElem, fieldNum)
 	}
 	return fmt.Sprintf("// TODO: serialize vector<%s>", inner.Name)
 }
@@ -3301,7 +3314,9 @@ func writeValueReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) str
 		sb.WriteString(writeValueFieldExpr(f.Type, fieldProtoNum, memberRef, "_subw"))
 		sb.WriteString("\n")
 	}
-	fmt.Fprintf(&sb, "    _pw.write_submessage(%d, _subw);\n    free(_subw.data_);\n}", fieldNum)
+	// _subw's destructor releases its buffer at end of block; an
+	// explicit free() before it double-frees and corrupts dlmalloc.
+	fmt.Fprintf(&sb, "    _pw.write_submessage(%d, _subw);\n}", fieldNum)
 	return sb.String()
 }
 
@@ -5095,6 +5110,73 @@ func statusOrInnerType(t apispec.TypeRef) (string, bool) {
 		return "", false
 	}
 	return inner, true
+}
+
+// writeStatusOrSuccessExpr emits the C++ statement that writes the
+// payload of a StatusOr-like wrapper to `fieldNum` on the success
+// branch. `inner` is the wrapper's template argument spelling (e.g.
+// "const Type *", "std::unique_ptr<T>", "bool"); `varName` is the
+// local holding the wrapper. The success branch dereferences via
+// `*varName`, mirroring how absl::StatusOr exposes its payload.
+//
+// Returns "" if the inner type isn't recognised, in which case the
+// caller should fall back to emitting only the error branch (the
+// safest degradation — the Go side observes (nil, nil) instead of a
+// crash). Adding a case here unbreaks the corresponding family of
+// bridge exports.
+func writeStatusOrSuccessExpr(inner string, fieldNum int, varName string) string {
+	inner = strings.TrimSpace(inner)
+	if inner == "" {
+		return ""
+	}
+
+	// Pointer-to-handle (`T*`, `const T*`): the most common case for
+	// factory-style StatusOr returns. The wire format is a single
+	// handle field; the Go side reads it as a typed handle pointer.
+	if strings.HasSuffix(inner, "*") {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(*%s));", fieldNum, varName)
+	}
+
+	// Smart pointers — the payload is a unique_ptr / shared_ptr<T>
+	// owning a freshly-constructed object. unique_ptr transfers sole
+	// ownership across the boundary via release(); shared_ptr must
+	// preserve joint ownership, so heap-allocate a copy of the
+	// shared_ptr.
+	if isSharedPointerType(inner) {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(*%s))));", fieldNum, varName)
+	}
+	if isUniquePointerType(inner) {
+		return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>((*%s).release()));", fieldNum, varName)
+	}
+
+	// Primitives — the response message uses the matching scalar
+	// field. cppPrimitiveType maps unknown names to "int64_t", so
+	// gate the lookup on a known-primitive set.
+	switch inner {
+	case "bool":
+		return fmt.Sprintf("_pw.write_bool(%d, *%s);", fieldNum, varName)
+	case "float":
+		return fmt.Sprintf("_pw.write_float(%d, *%s);", fieldNum, varName)
+	case "double", "long double":
+		return fmt.Sprintf("_pw.write_double(%d, *%s);", fieldNum, varName)
+	case "int", "int32_t", "short", "int16_t", "char", "int8_t", "signed char":
+		return fmt.Sprintf("_pw.write_int32(%d, static_cast<int32_t>(*%s));", fieldNum, varName)
+	case "unsigned int", "uint32_t", "unsigned short", "uint16_t", "unsigned char", "uint8_t":
+		return fmt.Sprintf("_pw.write_uint32(%d, static_cast<uint32_t>(*%s));", fieldNum, varName)
+	case "long", "long long", "int64_t", "ssize_t", "ptrdiff_t", "intptr_t":
+		return fmt.Sprintf("_pw.write_int64(%d, static_cast<int64_t>(*%s));", fieldNum, varName)
+	case "unsigned long", "unsigned long long", "uint64_t", "size_t", "uintptr_t":
+		return fmt.Sprintf("_pw.write_uint64(%d, static_cast<uint64_t>(*%s));", fieldNum, varName)
+	}
+
+	// std::string payload.
+	if inner == "std::string" || inner == "string" {
+		return fmt.Sprintf("_pw.write_string(%d, std::string(*%s));", fieldNum, varName)
+	}
+
+	// By-value class payload — heap-allocate a copy via move so the
+	// emitted handle outlives the StatusOr local.
+	return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(*%s))));", fieldNum, varName)
 }
 
 // trampolineTypeDecl returns the C++ type used in the override's
