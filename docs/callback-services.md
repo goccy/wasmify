@@ -1,7 +1,7 @@
 # Callback services: when wasmify generates them
 
 `wasmify` emits a *callback service* for a C++ class when the class is
-intended to be **subclassed by a Go user**. The generated artefacts —
+intended to be **subclassed by a Go user**. The generated artifacts —
 a `<Class>Callback` Go interface, a `<Class>CallbackDefaults` zero-impl
 struct, a `New<Class>FromImpl(impl, …)` Go constructor, and a C++
 trampoline subclass — let a user supply Go code that the C++ side calls

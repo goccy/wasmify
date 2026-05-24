@@ -35,6 +35,10 @@ type State struct {
 	Deps        []Dependency      `json:"dependencies,omitempty"`
 	Tools       []Tool            `json:"required_tools,omitempty"`
 	Commands    BuildCommands     `json:"build_commands,omitempty"`
+	// Output configures where wasmify's user-facing artifacts are
+	// written. Each per-artifact path is independently optional;
+	// relative paths resolve against the directory holding wasmify.json.
+	Output      *Output           `json:"output,omitempty"`
 	Selection   *Selection        `json:"user_selection,omitempty"`
 	Bridge      *BridgeConfig     `json:"bridge,omitempty"`
 	Skip        *SkipConfig       `json:"skip,omitempty"`
@@ -64,7 +68,7 @@ type BuildSystem struct {
 	Files   []string `json:"files,omitempty"`
 }
 
-// Target is one buildable artefact discovered in the upstream project.
+// Target is one buildable artifact discovered in the upstream project.
 type Target struct {
 	Name          string   `json:"name"`
 	Type          string   `json:"type"`
@@ -103,6 +107,18 @@ type ToolInstallCmd struct {
 type BuildCommands struct {
 	Configure *string `json:"configure"`
 	Build     string  `json:"build"`
+}
+
+// Output declares user-facing destination paths for wasmify's
+// artifacts. Each field is independently optional. A relative path
+// resolves against the directory holding wasmify.json; an absolute
+// path is used unchanged. Without a path set for an artifact, the
+// internal `.wasmify/` build-tree copy is the only output.
+type Output struct {
+	// Wasm is where `wasmify wasm-build` writes the final linked
+	// (and optionally optimised) wasm artifact, in addition to the
+	// internal build-tree copy.
+	Wasm string `json:"wasm,omitempty"`
 }
 
 // Selection records the user's choice of which target(s) to expose.

@@ -8,7 +8,7 @@ import (
 )
 
 // OptimizeOptions tunes the wasm-opt invocation. The defaults are
-// "size at all costs" — appropriate for the wasmify ship-it artefact
+// "size at all costs" — appropriate for the wasmify ship-it artifact
 // where any speed regression at runtime is dwarfed by the wasm-load
 // cost.
 type OptimizeOptions struct {
@@ -46,7 +46,7 @@ func (r Result) SavedFraction() float64 {
 // inputPath, writing to outputPath. When inputPath == outputPath the
 // file is rewritten atomically (tmp file → rename) and only when the
 // optimised binary is strictly smaller than the original — never
-// regress the artefact silently.
+// regress the artifact silently.
 func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error) {
 	res := Result{InputPath: inputPath, OutputPath: outputPath}
 

@@ -1,0 +1,12 @@
+version: v2
+inputs:
+  - directory: .
+    paths:
+      - simplelib.proto
+plugins:
+  - local: protoc-gen-wasmify-go
+    out: .
+    opt:
+      - module=github.com/goccy/wasmify/testdata/simplelib_proto_wasm2go
+      - runtime=wasm2go
+      - wasm=simplelib_proto.wasm

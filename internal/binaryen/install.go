@@ -1,6 +1,6 @@
 // Package binaryen wraps the install + invocation of Binaryen tools
 // (wasm-opt, wasm-strip-like passes) used by `wasmify optimize` to
-// shrink a built wasm artefact post-link. The pattern mirrors the
+// shrink a built wasm artifact post-link. The pattern mirrors the
 // wasi-sdk auto-install in internal/wasmbuild/install.go: download a
 // pinned release tarball into ~/.config/wasmify/bin/binaryen/ on
 // first use, then reuse it forever.

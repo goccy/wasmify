@@ -201,7 +201,7 @@ Commands:
                                    Shrink the project's wasm via Binaryen
                                    wasm-opt -Oz + strip passes. Auto-installs
                                    Binaryen on first use; rewrites the
-                                   artefact in-place by default.
+                                   artifact in-place by default.
   update                           Detect upstream changes + re-run affected phases
   help                             Show this help message
 `)
@@ -278,7 +278,7 @@ func upstreamPathFor(absProject, outDir string) string {
 //   - outDir = --output-dir flag value, or the current working directory
 //     when the flag is absent. Holds arch.json, build.json, proto/, bridge/,
 //     and anything else meant to be committed to git.
-//   - dataDir = <outDir>/.wasmify. Holds per-project build artefacts: the
+//   - dataDir = <outDir>/.wasmify. Holds per-project build artifacts: the
 //     .o/.a cache, cache.json, wasm-build intermediate state. Listed in
 //     .gitignore by the init scaffold.
 //   - wasi-sdk stays at the shared XDG path (~/.config/wasmify/bin/wasi-sdk)
@@ -634,7 +634,7 @@ func cmdClassify(args []string) error {
 		// Interactive mode: show targets and prompt. Accepts a single
 		// index or a comma-separated list of indices (e.g. "1,4") so
 		// the user can co-select multiple libraries that share one
-		// wasm artefact.
+		// wasm artifact.
 		fmt.Fprintf(os.Stderr, "Available targets:\n\n")
 		for i, t := range a.Targets {
 			fmt.Fprintf(os.Stderr, "  [%d] %s (%s)\n", i+1, t.Name, t.Type)
@@ -1238,7 +1238,7 @@ func cmdWasmBuild(args []string) error {
 		case "--optimize":
 			// Convenience: chain `wasmify optimize` after a
 			// successful link so users don't have to run two
-			// commands when shipping a release artefact.
+			// commands when shipping a release artifact.
 			runOptimize = true
 		}
 	}
@@ -1249,7 +1249,7 @@ func cmdWasmBuild(args []string) error {
 	}
 
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
-	// build artefacts (under .wasmify/), the SDK is a toolchain installed
+	// build artifacts (under .wasmify/), the SDK is a toolchain installed
 	// once per machine and reused across every project wasmify builds.
 	sdkPath, err := wasmbuild.DetectOrInstallWasiSDK(explicitSDK)
 	if err != nil {
@@ -1422,19 +1422,19 @@ func cmdWasmBuild(args []string) error {
 	// arch.json lives at <outDir>/arch.json (committed), not in dataDir.
 	a, _ := arch.Load(outDir)
 	if a != nil && a.Selection != nil && a.Selection.BuildType == "library" {
-		// The wasm artefact name is derived from the project name
+		// The wasm artifact name is derived from the project name
 		// (arch.json's project.name) rather than the build target.
 		// One project ↔ one wasm ↔ one Go package, so the produced
 		// `<project>.wasm` drops directly into the matching
 		// protoc-gen-wasmify-go //go:embed slot. Multi-target
 		// selections (analyzer + sql_formatter) all merge into the
-		// same artefact.
-		artefactName := a.Project.Name
-		if artefactName == "" {
+		// same artifact.
+		artifactName := a.Project.Name
+		if artifactName == "" {
 			// Fall back to whichever target was selected. Single-target
 			// projects without a project name still produce `<target>.wasm`.
 			if names := a.Selection.Names(); len(names) > 0 {
-				artefactName = names[0]
+				artifactName = names[0]
 			}
 		}
 		// Bridge objects feed into the final library link so host callers
@@ -1447,7 +1447,7 @@ func cmdWasmBuild(args []string) error {
 				extraObjects = append(extraObjects, obj)
 			}
 		}
-		wasmPath, linkErr := wasmbuild.LinkLibrary(artefactName, cfg, extraObjects)
+		wasmPath, linkErr := wasmbuild.LinkLibrary(artifactName, cfg, extraObjects)
 		if linkErr != nil {
 			return fmt.Errorf("library link failed: %w", linkErr)
 		}
@@ -1457,13 +1457,26 @@ func cmdWasmBuild(args []string) error {
 			// Inline post-link size pass — same code path as the
 			// standalone `wasmify optimize` subcommand. Auto-installs
 			// Binaryen on first use; failure here is fatal because
-			// the user explicitly asked for the optimised artefact.
+			// the user explicitly asked for the optimised artifact.
 			res, err := binaryen.Optimize(wasmPath, wasmPath, binaryen.OptimizeOptions{})
 			if err != nil {
 				return fmt.Errorf("--optimize failed: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "[wasm-build] optimize: %d → %d bytes (%.1f%% saved)\n",
 				res.BeforeSize, res.AfterSize, res.SavedFraction()*100)
+		}
+
+		// Copy the artifact to wasmify.json's output.wasm, if set, so
+		// downstream tooling (e.g. buf generate running
+		// protoc-gen-wasmify-go in runtime=wasm2go mode) can read the
+		// wasm from a stable declared path instead of the .wasmify/
+		// internal build tree.
+		if stateForSkip != nil && stateForSkip.Output != nil && stateForSkip.Output.Wasm != "" {
+			dst, err := wasmbuild.WriteOutput(wasmPath, stateForSkip.Output.Wasm, outDir)
+			if err != nil {
+				return fmt.Errorf("write output.wasm: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "[wasm-build] wrote output.wasm → %s\n", dst)
 		}
 	}
 
@@ -2538,7 +2551,7 @@ func classifyChanges(changedFiles []string) map[string]bool {
 
 // cmdOptimize runs the Binaryen wasm-opt pipeline against the
 // project's built wasm to drive size down further. By default it
-// rewrites the artefact in place (matching the "the wasm you build
+// rewrites the artifact in place (matching the "the wasm you build
 // is the wasm you ship" model); --input / --output override that
 // for one-off use. Binaryen is auto-installed under
 // ~/.config/wasmify/bin/binaryen on first invocation, the same way
@@ -2567,7 +2580,7 @@ func cmdOptimize(args []string) error {
 	}
 
 	if inputPath == "" {
-		// Derive the project's wasm artefact path from
+		// Derive the project's wasm artifact path from
 		// arch.json (project.name) + data dir conventions.
 		absPath, dataDir, outDir, err := loadProjectFromConfig()
 		_ = absPath

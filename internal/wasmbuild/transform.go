@@ -112,7 +112,7 @@ func dropPICDuplicateSteps(steps []buildjson.BuildStep) []buildjson.BuildStep {
 }
 
 // isCcLibrarySharedOutput reports whether a link step's output is a
-// cc_library shared-library artefact (`lib<name>.so` or
+// cc_library shared-library artifact (`lib<name>.so` or
 // `lib<name>.so.<n>`). cc_binary executables don't carry the `lib`
 // prefix, so they fall through and get processed normally.
 func isCcLibrarySharedOutput(base string) bool {
