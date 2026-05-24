@@ -39,7 +39,7 @@ import (
 // passed in a single bazel build invocation and a single aquery
 // expression (`deps(t1) union deps(t2) ...`) so the resulting log is
 // the union — which is exactly what downstream parse-headers /
-// wasm-build want when several libraries fold into one wasm artefact.
+// wasm-build want when several libraries fold into one wasm artifact.
 func Capture(workDir, outDir string, targets []string, extraBazelArgs []string) ([]wrapper.LogEntry, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("bazelcapture: at least one target is required")

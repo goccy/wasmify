@@ -8,7 +8,7 @@ import (
 )
 
 // EnsureWasiSDK detects or installs the wasi-sdk at the shared XDG location
-// (~/.config/wasmify/bin/wasi-sdk). Unlike other build artefacts which live
+// (~/.config/wasmify/bin/wasi-sdk). Unlike other build artifacts which live
 // inside the project's .wasmify/ dir, the SDK is installed once per machine
 // and shared across every project that wasmify builds — it is a ~500MB
 // toolchain that does not change between projects.

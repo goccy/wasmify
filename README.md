@@ -5,7 +5,7 @@ Convert a C/C++ project into a self-contained Go (or other language) package by 
 ```
 C/C++ project
     ↓ wasmify (analyze, build, parse headers, generate proto & bridge)
-Intermediate artefacts (wasmify.json, proto, bridge.cc) + wasm binary
+Intermediate artifacts (wasmify.json, proto, bridge.cc) + wasm binary
     ↓ protoc-gen-wasmify-go / protoc-gen-wasmify-ts / ...
 Language-native package (e.g., "go-mylib")
     ↓ import
@@ -95,7 +95,7 @@ wasmify wasm-build --optimize --non-interactive
 buf generate
 ```
 
-After this, `.wasmify/wasm-build/output/<project>.wasm` and `<package>.go` (next to the proto) are the artefacts to ship.
+After this, `.wasmify/wasm-build/output/<project>.wasm` and `<package>.go` (next to the proto) are the artifacts to ship.
 
 ### `wasmify.json` — the only committed file
 
@@ -131,7 +131,7 @@ Project decisions live under typed sections:
 }
 ```
 
-Generated artefacts (`build.json`, `api-spec.json`, `proto/`, `bridge/`, the `.wasm` file, the `.go` file) all go in `.gitignore` and are reproduced by re-running the pipeline.
+Generated artifacts (`build.json`, `api-spec.json`, `proto/`, `bridge/`, the `.wasm` file, the `.go` file) all go in `.gitignore` and are reproduced by re-running the pipeline.
 
 ## Using the generated Go package
 
@@ -184,7 +184,7 @@ For a library that will be distributed:
 ```
 upstream-project/             # C/C++ source (unchanged)
 
-mylib-wasm/                   # Intermediate artefacts (git-managed)
+mylib-wasm/                   # Intermediate artifacts (git-managed)
 ├── wasmify.json              # ← the only committed config
 ├── buf.yaml / buf.gen.yaml   # buf wiring for protoc-gen-wasmify-go
 ├── Makefile                  # `make wasm` runs the container pipeline
