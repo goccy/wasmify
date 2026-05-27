@@ -74,10 +74,36 @@ const moduleBodyWasm2go = `import (
 )
 
 // Module is the bridge handle. It wraps the wasm2go-transpiled module
-// (*base.Module) and serialises every wasm call on m.mu.
+// (*base.Module) and serialises every entry on m.mu.
+//
+// Reentrant callbacks — a host-import callback whose handler needs
+// to make further calls back into the transpiled module — are
+// supported by releasing m.mu around the user handler in
+// handleCallback.
+//
+// Safety rests on a single structural property: every path that
+// touches transpiled module state goes through m.invoke, and
+// m.invoke holds m.mu for the entire duration of its call. The
+// release window in handleCallback simply lets another m.invoke
+// grab the mutex and run as a fully nested top-level call — same
+// goroutine via the user handler, different goroutine via an
+// unrelated caller, it doesn't matter. Either way the nested call
+// enters, balances its own state changes, and exits before the
+// outer call resumes, so the outer call never observes a mid-flight
+// inner call.
 type Module struct {
-	mu        sync.Mutex
-	g         *base.Module
+	// mu serialises every entry into the transpiled module (invoke +
+	// nested re-entry from inside a callback handler).
+	mu sync.Mutex
+	g  *base.Module
+	// cbMu guards callbacks and nextCBID. RWMutex because lookup in
+	// handleCallback is hot (every host-import dispatch) while
+	// Register/Unregister are rare (typically once per lifetime of a
+	// registered Go-side handler). Held only for the brief map op;
+	// never held while running user code or the transpiled module,
+	// so it never participates in the m.mu -> transpiled-module ->
+	// handleCallback chain and cannot deadlock against it.
+	cbMu      sync.RWMutex
 	callbacks map[int32]CallbackHandler
 	nextCBID  int32
 }
@@ -96,8 +122,12 @@ type CallbackHandler interface {
 }
 
 // RegisterCallback registers a Go callback handler and returns its ID.
+// Safe to call concurrently with other Register/Unregister/callback
+// dispatch calls.
 func RegisterCallback(handler CallbackHandler) int32 {
 	m := module()
+	m.cbMu.Lock()
+	defer m.cbMu.Unlock()
 	if m.callbacks == nil {
 		m.callbacks = make(map[int32]CallbackHandler)
 	}
@@ -108,12 +138,19 @@ func RegisterCallback(handler CallbackHandler) int32 {
 }
 
 // UnregisterCallback removes a previously registered callback handler.
+// Safe to call concurrently with other Register/Unregister/callback
+// dispatch calls.
 func UnregisterCallback(id int32) {
-	delete(module().callbacks, id)
+	m := module()
+	m.cbMu.Lock()
+	delete(m.callbacks, id)
+	m.cbMu.Unlock()
 }
 
 func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+	m.cbMu.RLock()
 	handler, ok := m.callbacks[callbackID]
+	m.cbMu.RUnlock()
 	if !ok {
 		return 0
 	}
@@ -124,7 +161,18 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 		copy(buf, mem[reqPtr:reqPtr+reqLen])
 		req = buf
 	}
-	resp, err := handler.HandleCallback(methodID, req)
+	// Release m.mu around the user handler so that nested calls
+	// back into the transpiled module can re-acquire it without
+	// deadlocking. The IIFE + defer guarantees Lock is retaken even
+	// if the handler panics, so the outer invoke's defer
+	// m.mu.Unlock() always sees a held mutex.
+	var resp []byte
+	var err error
+	func() {
+		m.mu.Unlock()
+		defer m.mu.Lock()
+		resp, err = handler.HandleCallback(methodID, req)
+	}()
 	if err != nil {
 		resp = pbAppendString(nil, 15, err.Error())
 	}
