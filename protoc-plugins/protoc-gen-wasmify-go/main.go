@@ -27,6 +27,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -244,7 +245,19 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File) error {
 	// source so the env stubs can be derived from it.
 	var wasm2goBaseSrc []byte
 	if cfg.wasm2goRuntime() {
-		wasm2goImportPath = string(importPath) + "/internal/wasm2go"
+		// Allow the wasm2go output's Go import path to be overridden
+		// from the environment so an integrator can host the chunks
+		// at a path that the asm-side cross-chunk JMP construction
+		// (plan 9 asm operand scanner: src/cmd/asm/internal/lex/
+		// tokenizer.go:isIdentRune) can syntactically express —
+		// hyphens, plus signs, and other punctuation that may appear
+		// in a Go module name have no identifier-rune substitute.
+		// The disk layout is unchanged; only the Go import path that
+		// the generated files use changes.
+		wasm2goImportPath = os.Getenv("WASM2GO_IMPORT_PATH")
+		if wasm2goImportPath == "" {
+			wasm2goImportPath = string(importPath) + "/internal/wasm2go"
+		}
 		src, err := emitWasm2go(plugin, importPath)
 		if err != nil {
 			return err
