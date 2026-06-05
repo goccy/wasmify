@@ -267,10 +267,17 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File) error {
 		// following precedence:
 		//
 		//   1. `wasm2go_import_path=<...>` buf option (in
-		//      buf.gen.yaml's opt: list). Project-controlled.
+		//      buf.gen.yaml's opt: list). For one-off / per-buf-run
+		//      overrides.
 		//   2. WASM2GO_IMPORT_PATH environment variable. Useful for
-		//      one-off overrides or shell-driven flows.
-		//   3. The historical default,
+		//      shell-driven flows.
+		//   3. The `(wasmify.wasm2go_package)` file-level option on
+		//      the .proto. This is the canonical source — wasmify
+		//      writes it from BridgeConfig.Wasm2GoImportPath at
+		//      gen-proto time, so the integrator declares the value
+		//      once in wasmify.json and the plugin picks it up
+		//      automatically without any buf.gen.yaml change.
+		//   4. The historical default,
 		//      `<bridge-module-path>/internal/wasm2go`.
 		//
 		// Hosting the chunks at a hyphen-free path is what unlocks
@@ -285,6 +292,13 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File) error {
 		wasm2goImportPath = cfg.wasm2goImportPath
 		if wasm2goImportPath == "" {
 			wasm2goImportPath = os.Getenv("WASM2GO_IMPORT_PATH")
+		}
+		if wasm2goImportPath == "" {
+			if fileOpts, ok := file.Desc.Options().(*descriptorpb.FileOptions); ok && fileOpts != nil {
+				if v, _ := proto.GetExtension(fileOpts, wasmifyopts.E_Wasm2GoPackage).(string); v != "" {
+					wasm2goImportPath = v
+				}
+			}
 		}
 		if wasm2goImportPath == "" {
 			wasm2goImportPath = string(importPath) + "/internal/wasm2go"

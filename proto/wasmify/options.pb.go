@@ -198,6 +198,14 @@ var file_wasmify_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Tag:           "bytes,50013,opt,name=wasm_cpp_namespace",
 		Filename:      "wasmify/options.proto",
 	},
+	{
+		ExtendedType:  (*descriptorpb.FileOptions)(nil),
+		ExtensionType: (*string)(nil),
+		Field:         50022,
+		Name:          "wasmify.wasm2go_package",
+		Tag:           "bytes,50022,opt,name=wasm2go_package",
+		Filename:      "wasmify/options.proto",
+	},
 }
 
 // Extension fields to descriptorpb.MessageOptions.
@@ -326,6 +334,26 @@ var (
 	//
 	// optional string wasm_cpp_namespace = 50013;
 	E_WasmCppNamespace = &file_wasmify_options_proto_extTypes[21]
+	// Go import path the wasm2go-transpiled output should embed into
+	// its `import` / `//go:linkname` / asm cross-package JMP target
+	// sites when runtime=wasm2go is in effect. Mirrors the standard
+	// `go_package` option's role for the bridge package: the integrator
+	// sets it once on the .proto and protoc-gen-wasmify-go reads it
+	// back instead of taking it via a buf opt or env var. The disk
+	// layout under `<bridge>/internal/wasm2go/` is unchanged either
+	// way; only the embedded import path shifts. Set this to a
+	// hyphen-free module path (e.g.
+	// `github.com/goccy/googlesqlwasm2go`) to unlock the wasm2go
+	// codegen's asm-only cross-chunk trampoline mode — plan 9 asm's
+	// operand scanner has no rune substitute for "-" / "+" / etc.,
+	// so the bridge's own hyphenated module path is not eligible.
+	// Leave unset to keep the default `<bridge>/internal/wasm2go`
+	// layout. The `wasm2go_import_path=<...>` buf option and
+	// WASM2GO_IMPORT_PATH env var both override this when present, in
+	// that order, for one-off / shell-driven flows.
+	//
+	// optional string wasm2go_package = 50022;
+	E_Wasm2GoPackage = &file_wasmify_options_proto_extTypes[22]
 )
 
 var File_wasmify_options_proto protoreflect.FileDescriptor
@@ -356,7 +384,8 @@ const file_wasmify_options_proto_rawDesc = "" +
 	"\x13wasm_method_comment\x12\x1e.google.protobuf.MethodOptions\x18\xe0\x86\x03 \x01(\tR\x11wasmMethodComment:J\n" +
 	"\x11wasm_enum_comment\x12\x1c.google.protobuf.EnumOptions\x18\xe1\x86\x03 \x01(\tR\x0fwasmEnumComment:Z\n" +
 	"\x17wasm_enum_value_comment\x12!.google.protobuf.EnumValueOptions\x18\xe2\x86\x03 \x01(\tR\x14wasmEnumValueComment:L\n" +
-	"\x12wasm_cpp_namespace\x12\x1c.google.protobuf.FileOptions\x18݆\x03 \x01(\tR\x10wasmCppNamespaceB(Z&github.com/goccy/wasmify/proto/wasmifyb\x06proto3"
+	"\x12wasm_cpp_namespace\x12\x1c.google.protobuf.FileOptions\x18݆\x03 \x01(\tR\x10wasmCppNamespace:G\n" +
+	"\x0fwasm2go_package\x12\x1c.google.protobuf.FileOptions\x18\xe6\x86\x03 \x01(\tR\x0ewasm2goPackageB(Z&github.com/goccy/wasmify/proto/wasmifyb\x06proto3"
 
 var file_wasmify_options_proto_goTypes = []any{
 	(*descriptorpb.MessageOptions)(nil),   // 0: google.protobuf.MessageOptions
@@ -390,10 +419,11 @@ var file_wasmify_options_proto_depIdxs = []int32{
 	4,  // 19: wasmify.wasm_enum_comment:extendee -> google.protobuf.EnumOptions
 	5,  // 20: wasmify.wasm_enum_value_comment:extendee -> google.protobuf.EnumValueOptions
 	6,  // 21: wasmify.wasm_cpp_namespace:extendee -> google.protobuf.FileOptions
-	22, // [22:22] is the sub-list for method output_type
-	22, // [22:22] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	0,  // [0:22] is the sub-list for extension extendee
+	6,  // 22: wasmify.wasm2go_package:extendee -> google.protobuf.FileOptions
+	23, // [23:23] is the sub-list for method output_type
+	23, // [23:23] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	0,  // [0:23] is the sub-list for extension extendee
 	0,  // [0:0] is the sub-list for field type_name
 }
 
@@ -409,7 +439,7 @@ func file_wasmify_options_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_wasmify_options_proto_rawDesc), len(file_wasmify_options_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   0,
-			NumExtensions: 22,
+			NumExtensions: 23,
 			NumServices:   0,
 		},
 		GoTypes:           file_wasmify_options_proto_goTypes,

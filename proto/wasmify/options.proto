@@ -92,4 +92,23 @@ extend google.protobuf.FileOptions {
   // back to Go concrete factories. Without it, the plugin would have
   // to guess based on the proto package, which is arbitrary.
   string wasm_cpp_namespace = 50013;
+
+  // Go import path the wasm2go-transpiled output should embed into
+  // its `import` / `//go:linkname` / asm cross-package JMP target
+  // sites when runtime=wasm2go is in effect. Mirrors the standard
+  // `go_package` option's role for the bridge package: the integrator
+  // sets it once on the .proto and protoc-gen-wasmify-go reads it
+  // back instead of taking it via a buf opt or env var. The disk
+  // layout under `<bridge>/internal/wasm2go/` is unchanged either
+  // way; only the embedded import path shifts. Set this to a
+  // hyphen-free module path (e.g.
+  // `github.com/goccy/googlesqlwasm2go`) to unlock the wasm2go
+  // codegen's asm-only cross-chunk trampoline mode — plan 9 asm's
+  // operand scanner has no rune substitute for "-" / "+" / etc.,
+  // so the bridge's own hyphenated module path is not eligible.
+  // Leave unset to keep the default `<bridge>/internal/wasm2go`
+  // layout. The `wasm2go_import_path=<...>` buf option and
+  // WASM2GO_IMPORT_PATH env var both override this when present, in
+  // that order, for one-off / shell-driven flows.
+  string wasm2go_package = 50022;
 }
