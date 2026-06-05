@@ -83,6 +83,22 @@ type pluginConfig struct {
 	// wasm is the filesystem path to the .wasm binary. Required when
 	// runtime=wasm2go, where the plugin transpiles it.
 	wasm string
+	// wasm2goImportPath overrides the Go import path the wasm2go output
+	// uses for its chunks / alias / linkname targets. Unset (default)
+	// keeps the historical behaviour — the wasm2go output is hosted at
+	// <bridge>/internal/wasm2go and the bridge's own module path is
+	// the prefix. Setting this points the generated `import` /
+	// `//go:linkname` directives at a separate module so the chunks
+	// can live there instead (typically published as a hyphen-free
+	// module like github.com/goccy/googlesqlwasm2go, which makes the
+	// wasm2go codegen's asm-only cross-chunk trampoline optimization
+	// eligible — see wasm2go's internal/codegen/asm_bundle.go:
+	// isPlan9AsmSafe for the asm-side rune restriction that drives the
+	// "use a hyphen-free path" workflow). The disk layout is
+	// unchanged; only the import path inside the generated files
+	// shifts. WASM2GO_IMPORT_PATH (env-var) is used as a fallback when
+	// the buf option is absent, so callers can pick either knob.
+	wasm2goImportPath string
 }
 
 // set records one plugin parameter. It is the protogen ParamFunc, so it
@@ -98,6 +114,8 @@ func (c *pluginConfig) set(name, value string) error {
 		}
 	case "wasm":
 		c.wasm = value
+	case "wasm2go_import_path":
+		c.wasm2goImportPath = value
 	default:
 		return fmt.Errorf("unknown plugin parameter %q", name)
 	}
@@ -245,16 +263,29 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File) error {
 	// source so the env stubs can be derived from it.
 	var wasm2goBaseSrc []byte
 	if cfg.wasm2goRuntime() {
-		// Allow the wasm2go output's Go import path to be overridden
-		// from the environment so an integrator can host the chunks
-		// at a path that the asm-side cross-chunk JMP construction
-		// (plan 9 asm operand scanner: src/cmd/asm/internal/lex/
-		// tokenizer.go:isIdentRune) can syntactically express —
-		// hyphens, plus signs, and other punctuation that may appear
-		// in a Go module name have no identifier-rune substitute.
-		// The disk layout is unchanged; only the Go import path that
-		// the generated files use changes.
-		wasm2goImportPath = os.Getenv("WASM2GO_IMPORT_PATH")
+		// Resolve the wasm2go output's Go import path with the
+		// following precedence:
+		//
+		//   1. `wasm2go_import_path=<...>` buf option (in
+		//      buf.gen.yaml's opt: list). Project-controlled.
+		//   2. WASM2GO_IMPORT_PATH environment variable. Useful for
+		//      one-off overrides or shell-driven flows.
+		//   3. The historical default,
+		//      `<bridge-module-path>/internal/wasm2go`.
+		//
+		// Hosting the chunks at a hyphen-free path is what unlocks
+		// the wasm2go codegen's asm-only cross-chunk trampoline
+		// mode (see wasm2go internal/codegen/asm_bundle.go:
+		// isPlan9AsmSafe — plan 9 asm operand scanner has no
+		// substitute for "-", "+", etc.). The disk layout under
+		// <bridge>/internal/wasm2go/ is unchanged either way; only
+		// the embedded import path inside the generated files
+		// differs. Integrators move the on-disk tree to the
+		// publishable module after generation.
+		wasm2goImportPath = cfg.wasm2goImportPath
+		if wasm2goImportPath == "" {
+			wasm2goImportPath = os.Getenv("WASM2GO_IMPORT_PATH")
+		}
 		if wasm2goImportPath == "" {
 			wasm2goImportPath = string(importPath) + "/internal/wasm2go"
 		}

@@ -251,6 +251,28 @@ type BridgeConfig struct {
 	// "github.com/goccy/wasmify/gen/<pkg>" when unset.
 	GoPackage string `json:"GoPackage,omitempty"`
 
+	// Wasm2GoImportPath overrides the Go import path embedded into
+	// the wasm2go-transpiled output (chunks, alias.go,
+	// //go:linkname directives, asm cross-chunk JMP targets) when
+	// runtime=wasm2go is in effect. The disk layout on
+	// `<bridge>/internal/wasm2go/...` is unchanged; only the
+	// embedded import path that lets the bridge import the package
+	// shifts. Integrators set this to a hyphen-free module path
+	// (e.g. `github.com/goccy/googlesqlwasm2go`) to publish the
+	// wasm2go output as a separate module and unlock the wasm2go
+	// codegen's asm-only cross-chunk trampoline mode, which trades
+	// one Go-body frame for an asm tail-JMP per cross-chunk hop —
+	// the optimization is path-gated because plan 9 asm's operand
+	// scanner only accepts identifier-rune-safe characters
+	// (letters, digits, "_", U+00B7, U+2215) in cross-package
+	// symbol references, so hyphens / plus / etc. in the bridge's
+	// own module path break it. Unset (default) keeps the bridge's
+	// `internal/wasm2go` subpath; the wasm2go codegen then falls
+	// back to the Go-body wrapper-pair trampoline. Wired through to
+	// protoc-gen-wasmify-go via the `wasm2go_import_path=<...>`
+	// buf option.
+	Wasm2GoImportPath string `json:"Wasm2GoImportPath,omitempty"`
+
 	// ExportFunctions lists fully-qualified function names to export.
 	// When set, only these functions and their transitive type
 	// dependencies are included in the proto and bridge. When empty,
