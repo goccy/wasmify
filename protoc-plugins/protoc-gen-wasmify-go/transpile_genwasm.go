@@ -17,10 +17,13 @@ import (
 // packages will live under; for multi-package output the chunk
 // packages land at <baseImport>/base, <baseImport>/p0, ...
 func transpileGenwasm(wasmBin []byte, pkg, baseImport string) (files map[string][]byte, singlePkg bool, err error) {
-	// In single-file mode the main Go source is written to w and
-	// res.Files is nil; in multi-package mode w is unused and res.Files
-	// holds the per-file output. Capture w so the caller gets one map
-	// either way.
+	// In single-file mode the main Go source is written to mainBuf
+	// (everything else — asm bundle, pure-Go fallback, alias.go —
+	// arrives in res.Files alongside it). In multi-package mode
+	// mainBuf is left empty and the entire output (main file
+	// included) is in res.Files. So the writer-vs-Files split, not
+	// the size of res.Files, is the reliable signal for which
+	// layout wasm2go picked.
 	var mainBuf bytes.Buffer
 	res, err := transpile.Transpile(bytes.NewReader(wasmBin), &mainBuf, transpile.Options{
 		Package:          pkg,
@@ -30,7 +33,7 @@ func transpileGenwasm(wasmBin []byte, pkg, baseImport string) (files map[string]
 	if err != nil {
 		return nil, false, fmt.Errorf("transpile wasm: %w", err)
 	}
-	singlePkg = len(res.Files) == 0
+	singlePkg = mainBuf.Len() > 0
 	files = make(map[string][]byte, len(res.Files)+len(res.Sidecars)+len(res.AuxFiles)+1)
 	for k, v := range res.Files {
 		files[k] = v
