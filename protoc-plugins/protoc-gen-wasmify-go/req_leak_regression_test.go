@@ -57,7 +57,7 @@ func TestInvokeReqFreeOnErrorPath(t *testing.T) {
 				t.Skipf("template missing one of the expected anchors (alloc=%d call=%d defer=%d) — adjust this test if the invoke shape was redesigned", allocIdx, callIdx, deferIdx)
 				return
 			}
-			if !(allocIdx < deferIdx && deferIdx < callIdx) {
+			if allocIdx >= deferIdx || deferIdx >= callIdx {
 				t.Errorf("%s: defer-free of reqPtr must be installed between the WasmAlloc and the wasm call so the alloc is freed even when the call traps. Got allocIdx=%d deferIdx=%d callIdx=%d",
 					tc.name, allocIdx, deferIdx, callIdx)
 			}
