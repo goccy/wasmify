@@ -340,6 +340,17 @@ func GenerateProtoWithConfig(spec *apispec.APISpec, packageName string, cfg Brid
 	if cppNS != "" {
 		fmt.Fprintf(&b, "option (wasmify.wasm_cpp_namespace) = %q;\n\n", cppNS)
 	}
+	// Wasm2GoImportPath, when configured in wasmify.json, is embedded
+	// as a file-level option so protoc-gen-wasmify-go reads it back
+	// without the integrator needing to thread the same value through
+	// buf.gen.yaml's opt list. Mirrors the `go_package` flow above.
+	// The bridge config field is the single source of truth; the
+	// `wasm2go_import_path=<...>` buf option and the
+	// WASM2GO_IMPORT_PATH env var remain as overrides for one-off /
+	// shell-driven workflows.
+	if cfg.Wasm2GoImportPath != "" {
+		fmt.Fprintf(&b, "option (wasmify.wasm2go_package) = %q;\n\n", cfg.Wasm2GoImportPath)
+	}
 
 	// Build a disambiguated qualName → proto message name mapping.
 	// When multiple C++ classes map to the same proto name (e.g.,

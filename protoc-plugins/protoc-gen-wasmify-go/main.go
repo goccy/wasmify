@@ -27,6 +27,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,6 +83,22 @@ type pluginConfig struct {
 	// wasm is the filesystem path to the .wasm binary. Required when
 	// runtime=wasm2go, where the plugin transpiles it.
 	wasm string
+	// wasm2goImportPath overrides the Go import path the wasm2go output
+	// uses for its chunks / alias / linkname targets. Unset (default)
+	// keeps the historical behaviour — the wasm2go output is hosted at
+	// <bridge>/internal/wasm2go and the bridge's own module path is
+	// the prefix. Setting this points the generated `import` /
+	// `//go:linkname` directives at a separate module so the chunks
+	// can live there instead (typically published as a hyphen-free
+	// module like github.com/goccy/googlesqlwasm2go, which makes the
+	// wasm2go codegen's asm-only cross-chunk trampoline optimization
+	// eligible — see wasm2go's internal/codegen/asm_bundle.go:
+	// isPlan9AsmSafe for the asm-side rune restriction that drives the
+	// "use a hyphen-free path" workflow). The disk layout is
+	// unchanged; only the import path inside the generated files
+	// shifts. WASM2GO_IMPORT_PATH (env-var) is used as a fallback when
+	// the buf option is absent, so callers can pick either knob.
+	wasm2goImportPath string
 }
 
 // set records one plugin parameter. It is the protogen ParamFunc, so it
@@ -97,6 +114,8 @@ func (c *pluginConfig) set(name, value string) error {
 		}
 	case "wasm":
 		c.wasm = value
+	case "wasm2go_import_path":
+		c.wasm2goImportPath = value
 	default:
 		return fmt.Errorf("unknown plugin parameter %q", name)
 	}
@@ -244,7 +263,46 @@ func generateFile(plugin *protogen.Plugin, file *protogen.File) error {
 	// source so the env stubs can be derived from it.
 	var wasm2goBaseSrc []byte
 	if cfg.wasm2goRuntime() {
-		wasm2goImportPath = string(importPath) + "/internal/wasm2go"
+		// Resolve the wasm2go output's Go import path with the
+		// following precedence:
+		//
+		//   1. `wasm2go_import_path=<...>` buf option (in
+		//      buf.gen.yaml's opt: list). For one-off / per-buf-run
+		//      overrides.
+		//   2. WASM2GO_IMPORT_PATH environment variable. Useful for
+		//      shell-driven flows.
+		//   3. The `(wasmify.wasm2go_package)` file-level option on
+		//      the .proto. This is the canonical source — wasmify
+		//      writes it from BridgeConfig.Wasm2GoImportPath at
+		//      gen-proto time, so the integrator declares the value
+		//      once in wasmify.json and the plugin picks it up
+		//      automatically without any buf.gen.yaml change.
+		//   4. The historical default,
+		//      `<bridge-module-path>/internal/wasm2go`.
+		//
+		// Hosting the chunks at a hyphen-free path is what unlocks
+		// the wasm2go codegen's asm-only cross-chunk trampoline
+		// mode (see wasm2go internal/codegen/asm_bundle.go:
+		// isPlan9AsmSafe — plan 9 asm operand scanner has no
+		// substitute for "-", "+", etc.). The disk layout under
+		// <bridge>/internal/wasm2go/ is unchanged either way; only
+		// the embedded import path inside the generated files
+		// differs. Integrators move the on-disk tree to the
+		// publishable module after generation.
+		wasm2goImportPath = cfg.wasm2goImportPath
+		if wasm2goImportPath == "" {
+			wasm2goImportPath = os.Getenv("WASM2GO_IMPORT_PATH")
+		}
+		if wasm2goImportPath == "" {
+			if fileOpts, ok := file.Desc.Options().(*descriptorpb.FileOptions); ok && fileOpts != nil {
+				if v, _ := proto.GetExtension(fileOpts, wasmifyopts.E_Wasm2GoPackage).(string); v != "" {
+					wasm2goImportPath = v
+				}
+			}
+		}
+		if wasm2goImportPath == "" {
+			wasm2goImportPath = string(importPath) + "/internal/wasm2go"
+		}
 		src, err := emitWasm2go(plugin, importPath)
 		if err != nil {
 			return err
@@ -1691,6 +1749,10 @@ func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
 		if reqPtr == 0 {
 			return nil, fmt.Errorf("wasm_alloc returned NULL (out of memory)")
 		}
+		// Free reqPtr unconditionally on return so the request
+		// buffer never lingers in wasm memory when fn.Call
+		// errors, Memory().Read fails, or respLen == 0.
+		defer m.freeFn.Call(ctx, reqPtr)
 		reqLen = uint64(len(req))
 		if !m.mod.Memory().Write(uint32(reqPtr), req) {
 			return nil, fmt.Errorf("failed to write request to wasm memory")
@@ -1706,16 +1768,15 @@ func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
 	if respLen == 0 {
 		return nil, nil
 	}
+	// respPtr was allocated by the wasm-side handler; free it
+	// regardless of whether the Memory().Read below succeeds.
+	defer m.freeFn.Call(ctx, uint64(respPtr))
 	resp, ok := m.mod.Memory().Read(respPtr, respLen)
 	if !ok {
 		return nil, fmt.Errorf("failed to read response from wasm memory")
 	}
 	out := make([]byte, len(resp))
 	copy(out, resp)
-	m.freeFn.Call(ctx, uint64(respPtr))
-	if reqPtr != 0 {
-		m.freeFn.Call(ctx, reqPtr)
-	}
 	return out, nil
 }
 

@@ -232,6 +232,14 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 	if len(req) > 0 {
 		reqPtr = wasm2go.WasmAlloc(m.g, int32(len(req)))
 		reqLen = int32(len(req))
+		// Free reqPtr unconditionally on return so the request
+		// buffer never lingers in wasm memory when the call traps
+		// or the early-exit branches below fire. Guard against
+		// the WasmAlloc-returned-zero case: free(NULL) is a
+		// dlmalloc no-op but C++ allocators are less consistent.
+		if reqPtr != 0 {
+			defer wasm2go.WasmFree(m.g, reqPtr)
+		}
 		copy(wasm2go.Memory(m.g)[reqPtr:], req)
 	}
 	packed, err := call(m.g, reqPtr, reqLen)
@@ -241,18 +249,12 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 	respPtr := uint32(packed >> 32)
 	respLen := uint32(packed & 0xFFFFFFFF)
 	if respLen == 0 {
-		if reqPtr != 0 {
-			wasm2go.WasmFree(m.g, reqPtr)
-		}
 		return nil, nil
 	}
 	mem := wasm2go.Memory(m.g)
 	out := make([]byte, respLen)
 	copy(out, mem[respPtr:respPtr+respLen])
 	wasm2go.WasmFree(m.g, int32(respPtr))
-	if reqPtr != 0 {
-		wasm2go.WasmFree(m.g, reqPtr)
-	}
 	return out, nil
 }
 
