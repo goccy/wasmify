@@ -10,7 +10,14 @@ import (
 
 // InjectBridgeSteps adds a compile step for api_bridge.cc and links it into all link steps.
 // If api_bridge.cc does not exist in bridgeDir, the steps are returned unchanged.
-func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string) []WasmBuildStep {
+//
+// shimSrcs are absolute paths to wasmify's generic host-capability shim
+// translation units (see DeployHostShims). They are deployed only when the
+// corresponding host capability is opted in, so each one present here is
+// compiled with the same flags as the bridge (which carry the matching
+// -DWASMIFY_HOST_* define) and linked into every link step. With host
+// capabilities off, shimSrcs is empty and no extra object or import is added.
+func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, shimSrcs []string) []WasmBuildStep {
 	bridgeSrc := filepath.Join(bridgeDir, "api_bridge.cc")
 	if _, err := os.Stat(bridgeSrc); err != nil {
 		return steps
@@ -67,6 +74,28 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string) 
 		}
 		steps = addBridgeToLink(steps, customOutput)
 		steps = append(steps, customStep)
+	}
+
+	// Compile and link wasmify's generic host-capability shims. These are
+	// deployed by DeployHostShims only when the matching capability is opted
+	// in, so every entry here belongs in the build. Each shim TU is compiled
+	// with the same flags as the bridge (carrying the -DWASMIFY_HOST_* define
+	// that the shim body is gated on) and its object linked into every link
+	// step, so the host-backed socket()/posix_spawn()/... definitions resolve
+	// in the final wasm.
+	for _, shimSrc := range shimSrcs {
+		base := strings.TrimSuffix(filepath.Base(shimSrc), filepath.Ext(shimSrc))
+		shimOutput := filepath.Join(cfg.BuildDir, "obj", base+".o")
+		shimStep := WasmBuildStep{
+			Type:       buildjson.StepCompile,
+			Executable: filepath.Join(cfg.WasiSDKPath, "bin", "clang++"),
+			Args:       buildBridgeCompileArgs(shimSrc, shimOutput, cfg, includeFlags),
+			WorkDir:    workDir,
+			OutputFile: shimOutput,
+			InputFiles: []string{shimSrc},
+		}
+		steps = addBridgeToLink(steps, shimOutput)
+		steps = append(steps, shimStep)
 	}
 
 	// Append any extra linker flags (e.g. -Wl,--wrap=connect for host-provided
@@ -135,6 +164,17 @@ func extractIncludeFlags(steps []WasmBuildStep) []string {
 	return flags
 }
 
+// hostShimFlags resolves the effective host-capability opt-ins for the bridge
+// build, honouring both wasmify.json (via cfg) and the env overrides. It is the
+// single source of truth shared by buildBridgeCompileArgs (which defines the
+// -DWASMIFY_HOST_* macros) and the shim deployment in cmd/wasmify, so the macro
+// is defined exactly when the corresponding shim TU is compiled.
+func hostShimFlags(cfg WasmConfig) (hostSockets, hostSubprocess bool) {
+	hostSockets = cfg.HostSockets || os.Getenv("WASMIFY_HOST_SOCKETS") != ""
+	hostSubprocess = cfg.HostSubprocess || os.Getenv("WASMIFY_HOST_SUBPROCESS") != ""
+	return hostSockets, hostSubprocess
+}
+
 func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeFlags []string) []string {
 	args := []string{
 		"-c",
@@ -168,17 +208,16 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 	for _, dir := range extraBridgeIncludes() {
 		args = append(args, "-I", dir)
 	}
-	// Opt-in host-provided sockets: define the macro the project's bridge
-	// socket shim is gated on. Off by default so the wasm imports only
-	// standard wasi and stays portable. Honoured via cfg (from wasmify.json
-	// bridge.HostSockets) or the WASMIFY_HOST_SOCKETS env override.
-	if cfg.HostSockets || os.Getenv("WASMIFY_HOST_SOCKETS") != "" {
+	// Opt-in host-provided capabilities: define the macros the host-capability
+	// shims (and any project bridge code) are gated on. Off by default so the
+	// wasm imports only standard wasi and stays portable. Honoured via cfg
+	// (from wasmify.json bridge.HostSockets / bridge.HostSubprocess) or the
+	// WASMIFY_HOST_* env overrides — see hostShimFlags.
+	hostSockets, hostSubprocess := hostShimFlags(cfg)
+	if hostSockets {
 		args = append(args, "-DWASMIFY_HOST_SOCKETS")
 	}
-	// Opt-in host-provided subprocess: define the macro the project's bridge
-	// posix_spawn/waitpid shim is gated on. Off by default (wasm stays
-	// portable). From wasmify.json bridge.HostSubprocess or the env override.
-	if cfg.HostSubprocess || os.Getenv("WASMIFY_HOST_SUBPROCESS") != "" {
+	if hostSubprocess {
 		args = append(args, "-DWASMIFY_HOST_SUBPROCESS")
 	}
 	args = append(args, "-o", outputFile, srcFile)

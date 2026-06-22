@@ -23,7 +23,7 @@ func TestInjectBridgeSteps_NoBridge(t *testing.T) {
 	}
 
 	// No api_bridge.cc → steps unchanged
-	result := InjectBridgeSteps(steps, cfg, filepath.Join(tmpDir, "src"))
+	result := InjectBridgeSteps(steps, cfg, filepath.Join(tmpDir, "src"), nil)
 	if len(result) != 2 {
 		t.Fatalf("expected 2 steps, got %d", len(result))
 	}
@@ -46,7 +46,7 @@ func TestInjectBridgeSteps_WithBridge(t *testing.T) {
 		{ID: 2, Type: buildjson.StepLink, Args: []string{"-o", filepath.Join(tmpDir, "output", "out.wasm")}, OutputFile: filepath.Join(tmpDir, "output", "out.wasm")},
 	}
 
-	result := InjectBridgeSteps(steps, cfg, srcDir)
+	result := InjectBridgeSteps(steps, cfg, srcDir, nil)
 
 	// Should have 3 steps: original compile + bridge compile + link
 	if len(result) != 3 {
@@ -88,6 +88,79 @@ func TestInjectBridgeSteps_WithBridge(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("bridge object not added to link step args")
+	}
+}
+
+func TestInjectBridgeSteps_HostShims(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcDir := filepath.Join(tmpDir, "src")
+	_ = os.MkdirAll(srcDir, 0o755)
+	_ = os.WriteFile(filepath.Join(srcDir, "api_bridge.cc"), []byte("// bridge"), 0o644)
+
+	cfg := WasmConfig{
+		WasiSDKPath: "/opt/wasi-sdk",
+		Target:      "wasm32-wasi",
+		BuildDir:    tmpDir,
+	}
+
+	baseSteps := func() []WasmBuildStep {
+		return []WasmBuildStep{
+			{ID: 1, Type: buildjson.StepCompile, Args: []string{"-c", "test.cc"}, OutputFile: filepath.Join(tmpDir, "obj", "test.o")},
+			{ID: 2, Type: buildjson.StepLink, Args: []string{"-o", filepath.Join(tmpDir, "output", "out.wasm")}, OutputFile: filepath.Join(tmpDir, "output", "out.wasm")},
+		}
+	}
+
+	socketsObj := filepath.Join(tmpDir, "obj", "host_sockets.o")
+	subprocessObj := filepath.Join(tmpDir, "obj", "host_subprocess.o")
+
+	linkHasObj := func(steps []WasmBuildStep, obj string) bool {
+		for _, step := range steps {
+			if step.Type != buildjson.StepLink {
+				continue
+			}
+			for _, arg := range step.Args {
+				if arg == obj {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	hasCompileFor := func(steps []WasmBuildStep, obj string) bool {
+		for _, step := range steps {
+			if step.Type == buildjson.StepCompile && step.OutputFile == obj {
+				return true
+			}
+		}
+		return false
+	}
+
+	// No shim sources → no shim compile/link.
+	off := InjectBridgeSteps(baseSteps(), cfg, srcDir, nil)
+	if hasCompileFor(off, socketsObj) || hasCompileFor(off, subprocessObj) {
+		t.Fatalf("shim compile step present with no shim sources")
+	}
+	if linkHasObj(off, socketsObj) || linkHasObj(off, subprocessObj) {
+		t.Fatalf("shim object linked with no shim sources")
+	}
+
+	// Both shim sources → both compiled and linked.
+	shimSrcs := []string{
+		filepath.Join(tmpDir, "host-shims", "host_sockets.cc"),
+		filepath.Join(tmpDir, "host-shims", "host_subprocess.cc"),
+	}
+	on := InjectBridgeSteps(baseSteps(), cfg, srcDir, shimSrcs)
+	if !hasCompileFor(on, socketsObj) {
+		t.Fatalf("sockets shim compile step missing")
+	}
+	if !hasCompileFor(on, subprocessObj) {
+		t.Fatalf("subprocess shim compile step missing")
+	}
+	if !linkHasObj(on, socketsObj) {
+		t.Fatalf("sockets shim object not linked")
+	}
+	if !linkHasObj(on, subprocessObj) {
+		t.Fatalf("subprocess shim object not linked")
 	}
 }
 
