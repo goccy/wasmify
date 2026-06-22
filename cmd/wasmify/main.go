@@ -1326,7 +1326,37 @@ func cmdWasmBuild(args []string) error {
 	if _, err := os.Stat(filepath.Join(bridgeDir, "api_bridge.cc")); err != nil {
 		return fmt.Errorf("bridge source not found at %s. Run 'wasmify gen-proto --package <name> --bridge-config <file>' before wasm-build", bridgeDir)
 	}
-	wasmSteps = wasmbuild.InjectBridgeSteps(wasmSteps, cfg, bridgeDir)
+	// Deploy wasmify's generic host-capability shims (socket / subprocess
+	// libc->import definitions) when the matching capability is opted in. The
+	// shim sources are then compiled and linked alongside the bridge so the
+	// host-backed socket()/posix_spawn()/... symbols resolve in the final wasm.
+	// With both capabilities off, nothing is deployed and the wasm stays
+	// portable (standard wasi imports only).
+	hostSockets, hostSubprocess := wasmbuild.HostShimFlags(cfg)
+	var shimSrcs []string
+	if hostSockets || hostSubprocess {
+		// The subprocess shim includes <spawn.h>/<sys/wait.h>, which the wasip1
+		// sysroot lacks; deploy their stubs into the posix-compat include dir
+		// (already on the bridge's -isystem path) before compiling the shim.
+		if hostSubprocess && cfg.PosixCompatDir != "" {
+			for _, header := range wasmbuild.HostSubprocessStubHeaders {
+				stub, ok := wasmbuild.LookupHeaderStub(header)
+				if !ok {
+					return fmt.Errorf("missing stub for host subprocess header <%s>", header)
+				}
+				if err := wasmbuild.DeployStubHeader(cfg.PosixCompatDir, header, stub.Content); err != nil {
+					return fmt.Errorf("failed to deploy stub <%s> for host subprocess shim: %w", header, err)
+				}
+			}
+		}
+		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, hostSockets, hostSubprocess)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability shims deployed (sockets=%v subprocess=%v)\n", hostSockets, hostSubprocess)
+	}
+
+	wasmSteps = wasmbuild.InjectBridgeSteps(wasmSteps, cfg, bridgeDir, shimSrcs)
 	fmt.Fprintf(os.Stderr, "[wasm-build] Bridge injected from %s\n", bridgeDir)
 
 	// Skip decisions live in build.json (wasm_skip/wasm_skip_reason) and
