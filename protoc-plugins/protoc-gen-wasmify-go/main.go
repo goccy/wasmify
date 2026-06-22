@@ -1201,6 +1201,19 @@ func generateModule(pkg string) string {
 	var body string
 	if cfg.wasm2goRuntime() {
 		body = strings.ReplaceAll(moduleBodyWasm2go, "__WASM2GO_IMPORT__", wasm2goImportPath)
+		// Emit the wasm2go.New(...) call and the callback machinery to match
+		// the engine's actual import set. When the wasm imports
+		// wasmify.callback_invoke the engine's New takes a wasmify stub and the
+		// callback infrastructure links; when no callback service exists the
+		// optimizer drops that import, so New takes only env and the callback
+		// code (which references the absent WasmifyImports) must be omitted.
+		if wasm2goHasWasmify {
+			body = strings.ReplaceAll(body, "__WASM2GO_NEW__",
+				"\twm := wasmifyStubs{m: m}\n\tm.g = wasm2go.New(env, wm)")
+			body += callbackInfraWasm2go
+		} else {
+			body = strings.ReplaceAll(body, "__WASM2GO_NEW__", "\tm.g = wasm2go.New(env)")
+		}
 	} else {
 		body = strings.ReplaceAll(moduleBody, "__WASM_FILE__", pkg+".wasm")
 	}

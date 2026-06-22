@@ -696,6 +696,13 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 }
 
 // wasmCompileFlags returns the flags to add for wasm compilation.
+// emscriptenDefineDisabled reports whether the build opted out of the
+// implicit -D__EMSCRIPTEN__ (set by wasi-native projects that have real
+// __EMSCRIPTEN__ code paths). Controlled by WASMIFY_NO_EMSCRIPTEN_DEFINE=1.
+func emscriptenDefineDisabled() bool {
+	return os.Getenv("WASMIFY_NO_EMSCRIPTEN_DEFINE") == "1"
+}
+
 func wasmCompileFlags(cfg WasmConfig) []string {
 	var flags []string
 	if cfg.PosixCompatDir != "" {
@@ -705,10 +712,18 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	flags = append(flags,
 		"--target="+cfg.Target,
 		"--sysroot="+Sysroot(cfg.WasiSDKPath),
-		// __EMSCRIPTEN__ bypasses sizeof(void*)==8 static_asserts, POSIX
-		// socket checks, and other host-only code paths in C/C++ projects
-		// that guard wasm compatibility behind this macro.
-		"-D__EMSCRIPTEN__",
+	)
+	// __EMSCRIPTEN__ bypasses sizeof(void*)==8 static_asserts, POSIX
+	// socket checks, and other host-only code paths in C/C++ projects
+	// that guard wasm compatibility behind this macro. It is HARMFUL for
+	// projects that natively support wasm32-wasi and have real
+	// `#ifdef __EMSCRIPTEN__` branches (e.g. a source file includes
+	// <emscripten/stack.h> under it). Such wasi-native projects set
+	// WASMIFY_NO_EMSCRIPTEN_DEFINE=1 to keep their wasi code paths.
+	if !emscriptenDefineDisabled() {
+		flags = append(flags, "-D__EMSCRIPTEN__")
+	}
+	flags = append(flags,
 		"-D_WASI_EMULATED_SIGNAL",
 		"-D_WASI_EMULATED_PROCESS_CLOCKS",
 		"-D_WASI_EMULATED_MMAN",
