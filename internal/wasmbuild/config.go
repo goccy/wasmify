@@ -15,9 +15,10 @@ type WasmConfig struct {
 	DryRun         bool   // Only generate wasm-build.json without executing
 	NoCache        bool   // Disable build cache
 	PosixCompatDir string // Path to POSIX compatibility headers (injected via -isystem)
+	HostIncludeDir string // Path to build-local host-capability stub headers (spawn.h/sys/wait.h), injected via -I on every compile when HostSubprocess is on
 	StackSize      int    // Wasm stack size in bytes (default: DefaultStackSize)
-	HostSockets    bool   // Opt-in: define WASMIFY_HOST_SOCKETS for the bridge compile (host-provided outbound sockets)
-	HostSubprocess bool   // Opt-in: define WASMIFY_HOST_SUBPROCESS for the bridge compile (host-provided process spawn)
+	HostSockets    bool   // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
+	HostSubprocess bool   // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
 }
 
 // DefaultConfig returns a WasmConfig with sensible defaults.
