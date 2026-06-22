@@ -709,6 +709,22 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		// Must come before --sysroot so our headers override wasi-sdk's
 		flags = append(flags, "-isystem", cfg.PosixCompatDir)
 	}
+	// Host-capability opt-ins applied to EVERY wasm-build compile (not just the
+	// bridge), so the upstream's own sources enable the matching feature at
+	// wasm-build only. The upstream's separate (host-arch-equivalent) make phase
+	// never sees these, so it stays plain and needs none of the extra headers.
+	hostSockets, hostSubprocess := hostShimFlags(cfg)
+	if hostSockets {
+		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
+	}
+	if hostSubprocess {
+		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
+		if cfg.HostIncludeDir != "" {
+			// Carries spawn.h/sys/wait.h that wasi-libc omits; gated behind the
+			// macro above so its presence is inert when the feature is off.
+			flags = append(flags, "-I", cfg.HostIncludeDir)
+		}
+	}
 	flags = append(flags,
 		"--target="+cfg.Target,
 		"--sysroot="+Sysroot(cfg.WasiSDKPath),

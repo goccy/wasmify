@@ -1315,6 +1315,26 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 	}
 
+	// Resolve host-capability opt-ins up front: the subprocess capability adds
+	// stub headers + a -D macro to EVERY wasm-build compile (via
+	// wasmCompileFlags), so cfg must carry the include dir before TransformSteps
+	// runs.
+	hostSockets, hostSubprocess := wasmbuild.HostShimFlags(cfg)
+	if hostSubprocess {
+		// Materialize spawn.h/sys/wait.h into a build-local include dir and put
+		// it on every compile's -I (see wasmCompileFlags). Paired with the
+		// -DWASMIFY_HOST_SUBPROCESS macro wasmify defines only here, the upstream
+		// sources enable their posix_spawn path and resolve these headers WITHOUT
+		// touching the shared wasi-sdk sysroot. The upstream's own build phase
+		// never sees the macro, so it stays unmodified and needs neither.
+		incDir, herr := wasmbuild.DeployHostSubprocessHeaders(cfg.BuildDir)
+		if herr != nil {
+			return herr
+		}
+		cfg.HostIncludeDir = incDir
+		fmt.Fprintf(os.Stderr, "[wasm-build] Host-subprocess headers: %s\n", incDir)
+	}
+
 	// Transform steps
 	wasmSteps := wasmbuild.TransformSteps(b.Steps, cfg)
 
@@ -1332,23 +1352,11 @@ func cmdWasmBuild(args []string) error {
 	// host-backed socket()/posix_spawn()/... symbols resolve in the final wasm.
 	// With both capabilities off, nothing is deployed and the wasm stays
 	// portable (standard wasi imports only).
-	hostSockets, hostSubprocess := wasmbuild.HostShimFlags(cfg)
 	var shimSrcs []string
 	if hostSockets || hostSubprocess {
-		// The subprocess shim includes <spawn.h>/<sys/wait.h>, which the wasip1
-		// sysroot lacks; deploy their stubs into the posix-compat include dir
-		// (already on the bridge's -isystem path) before compiling the shim.
-		if hostSubprocess && cfg.PosixCompatDir != "" {
-			for _, header := range wasmbuild.HostSubprocessStubHeaders {
-				stub, ok := wasmbuild.LookupHeaderStub(header)
-				if !ok {
-					return fmt.Errorf("missing stub for host subprocess header <%s>", header)
-				}
-				if err := wasmbuild.DeployStubHeader(cfg.PosixCompatDir, header, stub.Content); err != nil {
-					return fmt.Errorf("failed to deploy stub <%s> for host subprocess shim: %w", header, err)
-				}
-			}
-		}
+		// The subprocess shim #includes <spawn.h>/<sys/wait.h>; it resolves them
+		// from the build-local host-include dir already on every compile's -I
+		// (deployed above, before TransformSteps). No sysroot mutation.
 		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, hostSockets, hostSubprocess)
 		if err != nil {
 			return err

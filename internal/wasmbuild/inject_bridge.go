@@ -208,18 +208,10 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 	for _, dir := range extraBridgeIncludes() {
 		args = append(args, "-I", dir)
 	}
-	// Opt-in host-provided capabilities: define the macros the host-capability
-	// shims (and any project bridge code) are gated on. Off by default so the
-	// wasm imports only standard wasi and stays portable. Honoured via cfg
-	// (from wasmify.json bridge.HostSockets / bridge.HostSubprocess) or the
-	// WASMIFY_HOST_* env overrides — see hostShimFlags.
-	hostSockets, hostSubprocess := hostShimFlags(cfg)
-	if hostSockets {
-		args = append(args, "-DWASMIFY_HOST_SOCKETS")
-	}
-	if hostSubprocess {
-		args = append(args, "-DWASMIFY_HOST_SUBPROCESS")
-	}
+	// The host-capability -D macros (WASMIFY_HOST_SOCKETS / _SUBPROCESS) and the
+	// -I for the host-include stubs are applied by wasmCompileFlags above, which
+	// runs for every wasm-build compile (bridge, shims, and upstream sources
+	// alike), so they are not repeated here.
 	args = append(args, "-o", outputFile, srcFile)
 	return args
 }
