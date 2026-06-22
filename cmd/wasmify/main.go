@@ -1248,6 +1248,25 @@ func cmdWasmBuild(args []string) error {
 		return err
 	}
 
+	// Opt-in host-provided sockets, declared in wasmify.json's bridge config.
+	// When set, the bridge compile gets -DWASMIFY_HOST_SOCKETS so the project's
+	// socket shim is included; otherwise the wasm stays portable (standard wasi
+	// imports only).
+	if s, serr := state.Load(outDir); serr == nil && s != nil && s.Bridge != nil {
+		if s.Bridge.HostSockets {
+			cfg.HostSockets = true
+		}
+		if s.Bridge.HostSubprocess {
+			cfg.HostSubprocess = true
+		}
+		// Optional wasm linker stack-size override (bytes). Shrinks the initial
+		// linear memory baked into the module when the guest needs less stack
+		// than the generous default; see BridgeConfig.StackSize.
+		if s.Bridge.StackSize > 0 {
+			cfg.StackSize = s.Bridge.StackSize
+		}
+	}
+
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
 	// once per machine and reused across every project wasmify builds.
@@ -1279,13 +1298,22 @@ func cmdWasmBuild(args []string) error {
 		return fmt.Errorf("build.json not found in %s. Run 'wasmify generate-build' first", outDir)
 	}
 
-	// Deploy POSIX compatibility headers
-	compatDir, err := wasmbuild.DeployPosixCompat(cfg.BuildDir)
-	if err != nil {
-		return fmt.Errorf("failed to deploy POSIX compat headers: %w", err)
+	// Deploy POSIX compatibility headers. Skipped for wasi-native projects
+	// (WASMIFY_NO_POSIX_COMPAT=1): the stubs define feature macros (e.g.
+	// CMSG_*) that the bare wasi sysroot leaves undefined, which enables code
+	// paths the sysroot can't back. A wasi-native project's socket code
+	// compiles fine against the bare sysroot but breaks when the stubs are
+	// -isystem'd in.
+	if os.Getenv("WASMIFY_NO_POSIX_COMPAT") == "1" {
+		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: disabled (WASMIFY_NO_POSIX_COMPAT=1)\n")
+	} else {
+		compatDir, err := wasmbuild.DeployPosixCompat(cfg.BuildDir)
+		if err != nil {
+			return fmt.Errorf("failed to deploy POSIX compat headers: %w", err)
+		}
+		cfg.PosixCompatDir = compatDir
+		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 	}
-	cfg.PosixCompatDir = compatDir
-	fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 
 	// Transform steps
 	wasmSteps := wasmbuild.TransformSteps(b.Steps, cfg)
@@ -1598,6 +1626,22 @@ func cmdParseHeaders(args []string) error {
 	var compileFlags []string
 	if b != nil {
 		compileFlags = collectCompileFlagsFromBuild(b)
+	}
+
+	// The clang AST parser forces `-x c++` (it parses every header as C++ so
+	// it can capture classes/templates). A C project's captured flags carry a
+	// C language standard (e.g. -std=c11 / -std=gnu11) which clang rejects when
+	// the input language is C++ ("invalid argument '-std=c11' not allowed with
+	// 'C++'"). Drop C-only -std flags here; keep any -std=c++NN.
+	{
+		filtered := compileFlags[:0]
+		for _, f := range compileFlags {
+			if strings.HasPrefix(f, "-std=") && !strings.Contains(f, "++") {
+				continue
+			}
+			filtered = append(filtered, f)
+		}
+		compileFlags = filtered
 	}
 
 	fmt.Fprintf(os.Stderr, "[parse-headers] Using clang: %s\n", clangPath)

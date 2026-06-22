@@ -273,6 +273,36 @@ type BridgeConfig struct {
 	// buf option.
 	Wasm2GoImportPath string `json:"Wasm2GoImportPath,omitempty"`
 
+	// HostSockets opts into host-provided outbound sockets. WASI preview1
+	// has no socket()/connect()/getaddrinfo(), so by default the generated
+	// wasm imports only standard wasi_snapshot_preview1 and is portable to
+	// any wasi runtime. When this is true, the bridge compile is given
+	// -DWASMIFY_HOST_SOCKETS, which activates the project's socket shim
+	// (libc socket()/connect()/getaddrinfo() backed by sock_socket/
+	// sock_connect/sock_getaddrinfo host imports). The resulting wasm then
+	// requires a host that implements those imports (e.g. the wasm2go
+	// runtime). Off by default to keep the wasm portable.
+	HostSockets bool `json:"HostSockets,omitempty"`
+
+	// HostSubprocess opts into host-provided process spawning. WASI preview1
+	// cannot spawn processes; when this is true the bridge compile is given
+	// -DWASMIFY_HOST_SUBPROCESS, activating the project's posix_spawn/waitpid
+	// shim (backed by proc_spawn/proc_wait host imports). The resulting wasm
+	// then requires a host that implements those imports and EXECUTES HOST
+	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
+	HostSubprocess bool `json:"HostSubprocess,omitempty"`
+
+	// StackSize overrides the wasm linker stack size (bytes) for the final
+	// link, i.e. the `-Wl,-z,stack-size=` value. The wasi-sdk default (64 KB)
+	// is too small for C++ with deeply-nested template instantiations, so
+	// wasmify links with a generous default (DefaultStackSize, 32 MB). That is
+	// far larger than some interpreters need; setting a smaller value here
+	// shrinks the initial linear memory baked into the module (the stack region
+	// precedes the data segment under --stack-first). Keep it well above the
+	// guest runtime's real C-stack high-water mark plus its overflow-guard
+	// reservation. 0 (unset) keeps DefaultStackSize.
+	StackSize int `json:"StackSize,omitempty"`
+
 	// ExportFunctions lists fully-qualified function names to export.
 	// When set, only these functions and their transitive type
 	// dependencies are included in the proto and bridge. When empty,

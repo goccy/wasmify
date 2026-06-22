@@ -19,6 +19,14 @@ import (
 // into the templates' __WASM2GO_IMPORT__ placeholder.
 var wasm2goImportPath string
 
+// wasm2goHasWasmify records whether the transpiled engine actually imports
+// wasmify.callback_invoke (i.e. the project declares callback services). It is
+// set by emitWasm2go and read by the bridge-body generation to decide whether
+// to wire the callback machinery and pass a wasmify stub to wasm2go.New.
+// When no callback service exists the optimizer drops the import, so the
+// engine's New takes only env and the WasmifyImports interface is absent.
+var wasm2goHasWasmify bool
+
 // unifiedImportsWasm2go is the import block of the consolidated bridge
 // file in runtime=wasm2go mode. It drops the wazero imports of the
 // default block and pulls in the transpiled wasm2go package instead.
@@ -114,74 +122,12 @@ var (
 	initErr      error
 )
 
-// CallbackHandler is implemented by Go types that need to be called
-// from C++. The C++ bridge calls callback_invoke(callbackID, methodID,
-// reqPtr, reqLen), which dispatches to the registered handler.
+// CallbackHandler is implemented by Go types that need to be called from C++.
+// The type is always defined (the Module struct references it); the
+// registration/dispatch machinery is only emitted when the wasm imports
+// wasmify.callback_invoke.
 type CallbackHandler interface {
 	HandleCallback(methodID int32, req []byte) ([]byte, error)
-}
-
-// RegisterCallback registers a Go callback handler and returns its ID.
-// Safe to call concurrently with other Register/Unregister/callback
-// dispatch calls.
-func RegisterCallback(handler CallbackHandler) int32 {
-	m := module()
-	m.cbMu.Lock()
-	defer m.cbMu.Unlock()
-	if m.callbacks == nil {
-		m.callbacks = make(map[int32]CallbackHandler)
-	}
-	m.nextCBID++
-	id := m.nextCBID
-	m.callbacks[id] = handler
-	return id
-}
-
-// UnregisterCallback removes a previously registered callback handler.
-// Safe to call concurrently with other Register/Unregister/callback
-// dispatch calls.
-func UnregisterCallback(id int32) {
-	m := module()
-	m.cbMu.Lock()
-	delete(m.callbacks, id)
-	m.cbMu.Unlock()
-}
-
-func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
-	m.cbMu.RLock()
-	handler, ok := m.callbacks[callbackID]
-	m.cbMu.RUnlock()
-	if !ok {
-		return 0
-	}
-	mem := wasm2go.Memory(m.g)
-	var req []byte
-	if reqLen > 0 {
-		buf := make([]byte, reqLen)
-		copy(buf, mem[reqPtr:reqPtr+reqLen])
-		req = buf
-	}
-	// Release m.mu around the user handler so that nested calls
-	// back into the transpiled module can re-acquire it without
-	// deadlocking. The IIFE + defer guarantees Lock is retaken even
-	// if the handler panics, so the outer invoke's defer
-	// m.mu.Unlock() always sees a held mutex.
-	var resp []byte
-	var err error
-	func() {
-		m.mu.Unlock()
-		defer m.mu.Lock()
-		resp, err = handler.HandleCallback(methodID, req)
-	}()
-	if err != nil {
-		resp = pbAppendString(nil, 15, err.Error())
-	}
-	if len(resp) == 0 {
-		return 0
-	}
-	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
-	return int64(ptr)<<32 | int64(len(resp))
 }
 
 // Init initializes the global module. Must be called before any API
@@ -205,8 +151,7 @@ func module() *Module {
 func initModule() (retErr error) {
 	m := &Module{}
 	env := envStubs{m: m}
-	wm := wasmifyStubs{m: m}
-	m.g = wasm2go.New(env, wm)
+__WASM2GO_NEW__
 	// Set globalModule eagerly so the rest of the API can run even if
 	// _initialize panics partway through C++ static-initializer code.
 	globalModule = m
@@ -307,6 +252,77 @@ func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int
 // wasm "env" imports. The per-method definitions are emitted by the
 // generator (generateEnvStubs) since the import set is module-specific.
 type envStubs struct{ m *Module }
+`
+
+// callbackInfraWasm2go holds the host-side callback (C++→Go) machinery. It is
+// appended to the bridge ONLY when the wasm actually imports
+// wasmify.callback_invoke (i.e. the project declares callback services). When
+// no callback service exists the optimizer drops that import from the wasm, so
+// the transpiled engine's New takes only env, the WasmifyImports interface is
+// absent, and emitting this code would not compile — hence it is gated.
+const callbackInfraWasm2go = `
+// RegisterCallback registers a Go callback handler and returns its ID.
+// Safe to call concurrently with other Register/Unregister/callback
+// dispatch calls.
+func RegisterCallback(handler CallbackHandler) int32 {
+	m := module()
+	m.cbMu.Lock()
+	defer m.cbMu.Unlock()
+	if m.callbacks == nil {
+		m.callbacks = make(map[int32]CallbackHandler)
+	}
+	m.nextCBID++
+	id := m.nextCBID
+	m.callbacks[id] = handler
+	return id
+}
+
+// UnregisterCallback removes a previously registered callback handler.
+// Safe to call concurrently with other Register/Unregister/callback
+// dispatch calls.
+func UnregisterCallback(id int32) {
+	m := module()
+	m.cbMu.Lock()
+	delete(m.callbacks, id)
+	m.cbMu.Unlock()
+}
+
+func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+	m.cbMu.RLock()
+	handler, ok := m.callbacks[callbackID]
+	m.cbMu.RUnlock()
+	if !ok {
+		return 0
+	}
+	mem := wasm2go.Memory(m.g)
+	var req []byte
+	if reqLen > 0 {
+		buf := make([]byte, reqLen)
+		copy(buf, mem[reqPtr:reqPtr+reqLen])
+		req = buf
+	}
+	// Release m.mu around the user handler so that nested calls
+	// back into the transpiled module can re-acquire it without
+	// deadlocking. The IIFE + defer guarantees Lock is retaken even
+	// if the handler panics, so the outer invoke's defer
+	// m.mu.Unlock() always sees a held mutex.
+	var resp []byte
+	var err error
+	func() {
+		m.mu.Unlock()
+		defer m.mu.Lock()
+		resp, err = handler.HandleCallback(methodID, req)
+	}()
+	if err != nil {
+		resp = pbAppendString(nil, 15, err.Error())
+	}
+	if len(resp) == 0 {
+		return 0
+	}
+	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
+	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	return int64(ptr)<<32 | int64(len(resp))
+}
 
 // wasmifyStubs implements wasm2go/base.WasmifyImports: the single
 // callback_invoke entry point that the C++ bridge calls back into.
@@ -336,11 +352,22 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 	if err != nil {
 		return nil, err
 	}
+	// Detect whether the engine kept the wasmify callback import. The
+	// transpiler only emits a WasmifyImports interface (and a New that takes
+	// it) when the wasm imports wasmify.callback_invoke; absent callbacks,
+	// the optimizer drops that import, so we must not reference it.
+	wasm2goHasWasmify = strings.Contains(string(files["wasm2go.go"]), "WasmifyImports") ||
+		strings.Contains(string(files["base/base.go"]), "WasmifyImports")
+
 	var envImportsSrc []byte
 	if singlePkg {
 		envImportsSrc = files["wasm2go.go"]
 		files["wasm2go_compat.go"] = []byte(wasm2goSinglePkgCompatGo)
-		files["base/base.go"] = []byte(fmt.Sprintf(wasm2goSinglePkgBaseAliasGoFmt, wasm2goImportPath))
+		aliasFmt := wasm2goSinglePkgBaseAliasGoFmt
+		if !wasm2goHasWasmify {
+			aliasFmt = wasm2goSinglePkgBaseAliasNoCbGoFmt
+		}
+		files["base/base.go"] = []byte(fmt.Sprintf(aliasFmt, wasm2goImportPath))
 	} else {
 		envImportsSrc = files["base/base.go"]
 	}
@@ -391,6 +418,17 @@ import wasm2go %q
 type Module = wasm2go.Module
 type EnvImports = wasm2go.EnvImports
 type WasmifyImports = wasm2go.WasmifyImports
+`
+
+// wasm2goSinglePkgBaseAliasNoCbGoFmt is the callback-free variant used when
+// the wasm has no wasmify.callback_invoke import (no callback services). It
+// omits the WasmifyImports alias, which would reference an undefined symbol.
+const wasm2goSinglePkgBaseAliasNoCbGoFmt = `package base
+
+import wasm2go %q
+
+type Module = wasm2go.Module
+type EnvImports = wasm2go.EnvImports
 `
 
 // invokeArgs returns the trailing argument that a generated

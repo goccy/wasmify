@@ -162,3 +162,103 @@ func TestWasmLinkFlagsIncludesStackSize(t *testing.T) {
 		t.Error("wasmLinkFlags should include stack-size")
 	}
 }
+
+func TestAppendExtraLDFlags(t *testing.T) {
+	t.Setenv("WASMIFY_EXTRA_LDFLAGS", "-Wl,--wrap=socket -Wl,--wrap=connect")
+	steps := []WasmBuildStep{
+		{ID: 1, Type: buildjson.StepCompile, Args: []string{"-c", "a.c"}},
+		{ID: 2, Type: buildjson.StepLink, Args: []string{"-o", "out.wasm", "a.o"}},
+		{ID: 3, Type: buildjson.StepLink, Args: []string{"-o", "skip.wasm"}, Skipped: true},
+	}
+	got := appendExtraLDFlags(steps)
+	// Compile step untouched.
+	if len(got[0].Args) != 2 {
+		t.Errorf("compile step args changed: %v", got[0].Args)
+	}
+	// Active link step gets both flags.
+	joined := strings.Join(got[1].Args, " ")
+	if !strings.Contains(joined, "-Wl,--wrap=socket") || !strings.Contains(joined, "-Wl,--wrap=connect") {
+		t.Errorf("link step missing wrap flags: %v", got[1].Args)
+	}
+	// Skipped link step untouched.
+	if len(got[2].Args) != 2 {
+		t.Errorf("skipped link step changed: %v", got[2].Args)
+	}
+}
+
+func TestBuildBridgeCompileArgsHostSockets(t *testing.T) {
+	base := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1"}
+
+	// Opt-in OFF (default): no -DWASMIFY_HOST_SOCKETS → portable wasm.
+	off := buildBridgeCompileArgs("b.cc", "b.o", base, nil)
+	for _, a := range off {
+		if a == "-DWASMIFY_HOST_SOCKETS" {
+			t.Fatalf("HostSockets off but -DWASMIFY_HOST_SOCKETS present: %v", off)
+		}
+	}
+	// Opt-in ON: the macro is defined so the project's socket shim compiles.
+	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", HostSockets: true}
+	args := buildBridgeCompileArgs("b.cc", "b.o", on, nil)
+	found := false
+	for _, a := range args {
+		if a == "-DWASMIFY_HOST_SOCKETS" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("HostSockets on but -DWASMIFY_HOST_SOCKETS missing: %v", args)
+	}
+}
+
+func TestBuildBridgeCompileArgsHostSubprocess(t *testing.T) {
+	base := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1"}
+
+	// Opt-in OFF (default): no -DWASMIFY_HOST_SUBPROCESS → portable wasm.
+	off := buildBridgeCompileArgs("b.cc", "b.o", base, nil)
+	for _, a := range off {
+		if a == "-DWASMIFY_HOST_SUBPROCESS" {
+			t.Fatalf("HostSubprocess off but -DWASMIFY_HOST_SUBPROCESS present: %v", off)
+		}
+	}
+	// Opt-in ON: the macro is defined so the project's posix_spawn shim compiles.
+	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", HostSubprocess: true}
+	args := buildBridgeCompileArgs("b.cc", "b.o", on, nil)
+	found := false
+	for _, a := range args {
+		if a == "-DWASMIFY_HOST_SUBPROCESS" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("HostSubprocess on but -DWASMIFY_HOST_SUBPROCESS missing: %v", args)
+	}
+}
+
+func TestExtraBridgeIncludes(t *testing.T) {
+	t.Setenv("WASMIFY_BRIDGE_EXTRA_INCLUDES", "/work:/work/embed::/x")
+	got := extraBridgeIncludes()
+	want := []string{"/work", "/work/embed", "/x"} // empty segments dropped
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%q, want %q", i, got[i], want[i])
+		}
+	}
+	t.Setenv("WASMIFY_BRIDGE_EXTRA_INCLUDES", "")
+	if got := extraBridgeIncludes(); got != nil {
+		t.Fatalf("empty env should yield nil, got %v", got)
+	}
+}
+
+func TestEmscriptenDefineDisabled(t *testing.T) {
+	t.Setenv("WASMIFY_NO_EMSCRIPTEN_DEFINE", "1")
+	if !emscriptenDefineDisabled() {
+		t.Fatal("expected true when WASMIFY_NO_EMSCRIPTEN_DEFINE=1")
+	}
+	t.Setenv("WASMIFY_NO_EMSCRIPTEN_DEFINE", "")
+	if emscriptenDefineDisabled() {
+		t.Fatal("expected false when unset")
+	}
+}

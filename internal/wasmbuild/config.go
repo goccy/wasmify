@@ -16,6 +16,8 @@ type WasmConfig struct {
 	NoCache        bool   // Disable build cache
 	PosixCompatDir string // Path to POSIX compatibility headers (injected via -isystem)
 	StackSize      int    // Wasm stack size in bytes (default: DefaultStackSize)
+	HostSockets    bool   // Opt-in: define WASMIFY_HOST_SOCKETS for the bridge compile (host-provided outbound sockets)
+	HostSubprocess bool   // Opt-in: define WASMIFY_HOST_SUBPROCESS for the bridge compile (host-provided process spawn)
 }
 
 // DefaultConfig returns a WasmConfig with sensible defaults.

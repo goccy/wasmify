@@ -50,6 +50,11 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 		"-Wl,--allow-multiple-definition",
 		"-o", outputFile,
 	)
+	// Extra linker flags (e.g. -Wl,--wrap=connect to route libc socket calls
+	// to host-provided shims in the bridge sources) from WASMIFY_EXTRA_LDFLAGS.
+	if v := strings.TrimSpace(os.Getenv("WASMIFY_EXTRA_LDFLAGS")); v != "" {
+		args = append(args, strings.Fields(v)...)
+	}
 
 	// Add extra objects (e.g., bridge code) before archives. These
 	// objects carry the per-method `w_<svc>_<mid>` and

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -60,6 +61,42 @@ func TestSaveLoad(t *testing.T) {
 	}
 	if len(phase.OutputFiles) != 1 || phase.OutputFiles[0] != "proto/api.proto" {
 		t.Errorf("Phase.OutputFiles = %v, want [proto/api.proto]", phase.OutputFiles)
+	}
+}
+
+// TestBridgeStackSizeRoundTrip verifies the optional wasm linker stack-size
+// override survives Save/Load (it feeds cfg.StackSize at link time).
+func TestBridgeStackSizeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := New("/path/to/project")
+	s.Bridge = &BridgeConfig{StackSize: 8 * 1024 * 1024}
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Bridge == nil {
+		t.Fatal("Bridge config lost on round-trip")
+	}
+	if loaded.Bridge.StackSize != 8*1024*1024 {
+		t.Errorf("Bridge.StackSize = %d, want %d", loaded.Bridge.StackSize, 8*1024*1024)
+	}
+
+	// Unset StackSize must be omitted (omitempty) and load back as 0 so the
+	// link falls through to DefaultStackSize.
+	s2 := New("/p")
+	s2.Bridge = &BridgeConfig{HostSockets: true}
+	if err := Save(dir, s2); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded2, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded2.Bridge.StackSize != 0 {
+		t.Errorf("unset Bridge.StackSize = %d, want 0", loaded2.Bridge.StackSize)
 	}
 }
 
@@ -180,5 +217,44 @@ func TestUpdateUpstream(t *testing.T) {
 	// Path should be preserved
 	if s.Upstream.Path != "/path" {
 		t.Errorf("Path lost: %q", s.Upstream.Path)
+	}
+}
+
+func TestBridgeConfigHostSocketsJSON(t *testing.T) {
+	// Opt-in flag round-trips through the wasmify.json bridge config.
+	var s State
+	if err := json.Unmarshal([]byte(`{"bridge":{"HostSockets":true}}`), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Bridge == nil || !s.Bridge.HostSockets {
+		t.Fatalf("HostSockets did not parse as true: %+v", s.Bridge)
+	}
+	// Absent → false (omitempty default), keeping the wasm portable by default.
+	var s2 State
+	if err := json.Unmarshal([]byte(`{"bridge":{}}`), &s2); err != nil {
+		t.Fatal(err)
+	}
+	if s2.Bridge == nil || s2.Bridge.HostSockets {
+		t.Fatalf("HostSockets should default to false, got %+v", s2.Bridge)
+	}
+}
+
+func TestBridgeConfigHostSubprocessJSON(t *testing.T) {
+	// Opt-in flag round-trips through the wasmify.json bridge config.
+	var s State
+	if err := json.Unmarshal([]byte(`{"bridge":{"HostSubprocess":true}}`), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Bridge == nil || !s.Bridge.HostSubprocess {
+		t.Fatalf("HostSubprocess did not parse as true: %+v", s.Bridge)
+	}
+	// Absent → false (omitempty default), keeping the wasm portable and
+	// sandboxed by default.
+	var s2 State
+	if err := json.Unmarshal([]byte(`{"bridge":{}}`), &s2); err != nil {
+		t.Fatal(err)
+	}
+	if s2.Bridge == nil || s2.Bridge.HostSubprocess {
+		t.Fatalf("HostSubprocess should default to false, got %+v", s2.Bridge)
 	}
 }

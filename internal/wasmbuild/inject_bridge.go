@@ -69,10 +69,33 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string) 
 		steps = append(steps, customStep)
 	}
 
+	// Append any extra linker flags (e.g. -Wl,--wrap=connect for host-provided
+	// socket shims) from WASMIFY_EXTRA_LDFLAGS to every link step.
+	steps = appendExtraLDFlags(steps)
+
 	for i := range steps {
 		steps[i].ID = i + 1
 	}
 
+	return steps
+}
+
+// appendExtraLDFlags appends space-separated flags from WASMIFY_EXTRA_LDFLAGS
+// to every (non-skipped) link step. Used to pass --wrap and similar linker
+// options the captured upstream build doesn't include — e.g. routing libc
+// socket()/connect() to host-provided shims in the bridge sources.
+func appendExtraLDFlags(steps []WasmBuildStep) []WasmBuildStep {
+	v := strings.TrimSpace(os.Getenv("WASMIFY_EXTRA_LDFLAGS"))
+	if v == "" {
+		return steps
+	}
+	flags := strings.Fields(v)
+	for i := range steps {
+		if steps[i].Type != buildjson.StepLink || steps[i].Skipped {
+			continue
+		}
+		steps[i].Args = append(steps[i].Args, flags...)
+	}
 	return steps
 }
 
@@ -128,17 +151,55 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 		// the same. If your build truly wants debug mode, set
 		// WASMIFY_BRIDGE_DEBUG=1 in the env.
 		"-DNDEBUG",
-		// Define __EMSCRIPTEN__ to bypass sizeof(void*)==8 static_asserts in
-		// project headers that guard their 8-byte-pointer assumptions behind
-		// this macro. A stub <emscripten/version.h> is deployed to satisfy
-		// include checks when this macro is set.
-		"-D__EMSCRIPTEN__",
+		// __EMSCRIPTEN__ (to bypass sizeof(void*)==8 static_asserts in project
+		// headers) is added by wasmCompileFlags below, unless the build opted
+		// out via WASMIFY_NO_EMSCRIPTEN_DEFINE=1 (wasi-native projects whose
+		// headers have real __EMSCRIPTEN__ branches). A stub
+		// <emscripten/version.h> satisfies include checks when it IS set.
 	}
 	// Add the same wasm compile flags used for all other source files
 	args = append(args, wasmCompileFlags(cfg)...)
 	args = append(args, includeFlags...)
+	// Extra include dirs for hand-written bridge / wrapper sources that live
+	// OUTSIDE the captured upstream build (e.g. a project's own embedding
+	// header that the generated api_bridge.cc includes). Colon-separated, via
+	// WASMIFY_BRIDGE_EXTRA_INCLUDES. Without this the bridge cannot resolve a
+	// wrapper header that is not on any captured -I path.
+	for _, dir := range extraBridgeIncludes() {
+		args = append(args, "-I", dir)
+	}
+	// Opt-in host-provided sockets: define the macro the project's bridge
+	// socket shim is gated on. Off by default so the wasm imports only
+	// standard wasi and stays portable. Honoured via cfg (from wasmify.json
+	// bridge.HostSockets) or the WASMIFY_HOST_SOCKETS env override.
+	if cfg.HostSockets || os.Getenv("WASMIFY_HOST_SOCKETS") != "" {
+		args = append(args, "-DWASMIFY_HOST_SOCKETS")
+	}
+	// Opt-in host-provided subprocess: define the macro the project's bridge
+	// posix_spawn/waitpid shim is gated on. Off by default (wasm stays
+	// portable). From wasmify.json bridge.HostSubprocess or the env override.
+	if cfg.HostSubprocess || os.Getenv("WASMIFY_HOST_SUBPROCESS") != "" {
+		args = append(args, "-DWASMIFY_HOST_SUBPROCESS")
+	}
 	args = append(args, "-o", outputFile, srcFile)
 	return args
+}
+
+// extraBridgeIncludes returns additional -I directories for compiling the
+// generated bridge and any custom_bridge.cc, from the colon-separated
+// WASMIFY_BRIDGE_EXTRA_INCLUDES env var.
+func extraBridgeIncludes() []string {
+	v := os.Getenv("WASMIFY_BRIDGE_EXTRA_INCLUDES")
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ":") {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // extractWorkDir returns the work directory from the first non-skipped compile step.
