@@ -164,6 +164,103 @@ func TestInjectBridgeSteps_HostShims(t *testing.T) {
 	}
 }
 
+func TestInjectBridgeSteps_CustomBridgeSources(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcDir := filepath.Join(tmpDir, "src")
+	_ = os.MkdirAll(srcDir, 0o755)
+	_ = os.WriteFile(filepath.Join(srcDir, "api_bridge.cc"), []byte("// bridge"), 0o644)
+
+	projectRoot := filepath.Join(tmpDir, "project")
+	embedDir := filepath.Join(projectRoot, "embed")
+	_ = os.MkdirAll(embedDir, 0o755)
+	customSrc := filepath.Join(embedDir, "py.c") // a .c name with C++ content
+	_ = os.WriteFile(customSrc, []byte("// custom bridge"), 0o644)
+
+	cfg := WasmConfig{
+		WasiSDKPath:         "/opt/wasi-sdk",
+		Target:              "wasm32-wasi",
+		BuildDir:            tmpDir,
+		ProjectRoot:         projectRoot,
+		CustomBridgeSources: []string{customSrc},
+	}
+
+	steps := []WasmBuildStep{
+		{ID: 1, Type: buildjson.StepCompile, Args: []string{"-c", "-I/usr/include", "test.cc"}, OutputFile: filepath.Join(tmpDir, "obj", "test.o")},
+		{ID: 2, Type: buildjson.StepLink, Args: []string{"-o", filepath.Join(tmpDir, "output", "out.wasm")}, OutputFile: filepath.Join(tmpDir, "output", "out.wasm")},
+	}
+
+	result := InjectBridgeSteps(steps, cfg, srcDir, nil)
+
+	customObj := filepath.Join(tmpDir, "obj", "py.o")
+
+	// The api_bridge compile must carry the project root on its include path so
+	// the generated dispatcher's project-relative includes resolve.
+	var apiBridgeStep *WasmBuildStep
+	for i := range result {
+		if result[i].OutputFile == filepath.Join(tmpDir, "obj", "api_bridge.o") {
+			apiBridgeStep = &result[i]
+			break
+		}
+	}
+	if apiBridgeStep == nil {
+		t.Fatal("api_bridge compile step not found")
+	}
+	if !argsContainPair(apiBridgeStep.Args, "-I", projectRoot) {
+		t.Fatalf("api_bridge compile missing -I %s: %v", projectRoot, apiBridgeStep.Args)
+	}
+
+	// The custom source gets its own compile step, forced to C++ (clang++ -x
+	// c++), with -I of its own directory so sibling-relative includes resolve.
+	var customStep *WasmBuildStep
+	for i := range result {
+		if result[i].OutputFile == customObj {
+			customStep = &result[i]
+			break
+		}
+	}
+	if customStep == nil {
+		t.Fatalf("custom bridge compile step (%s) not found", customObj)
+	}
+	if filepath.Base(customStep.Executable) != "clang++" {
+		t.Fatalf("custom bridge must compile with clang++, got %s", customStep.Executable)
+	}
+	if !argsContainPair(customStep.Args, "-x", "c++") {
+		t.Fatalf("custom bridge compile missing -x c++: %v", customStep.Args)
+	}
+	if !argsContainPair(customStep.Args, "-I", embedDir) {
+		t.Fatalf("custom bridge compile missing -I %s: %v", embedDir, customStep.Args)
+	}
+	if len(customStep.InputFiles) != 1 || customStep.InputFiles[0] != customSrc {
+		t.Fatalf("custom bridge compile InputFiles wrong: %v", customStep.InputFiles)
+	}
+
+	// The custom object must reach the link step.
+	var linked bool
+	for i := range result {
+		if result[i].Type != buildjson.StepLink {
+			continue
+		}
+		for _, arg := range result[i].Args {
+			if arg == customObj {
+				linked = true
+			}
+		}
+	}
+	if !linked {
+		t.Fatalf("custom bridge object %s not added to link step", customObj)
+	}
+}
+
+// argsContainPair reports whether args contains a, immediately followed by b.
+func argsContainPair(args []string, a, b string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == a && args[i+1] == b {
+			return true
+		}
+	}
+	return false
+}
+
 func TestExtractIncludeFlags(t *testing.T) {
 	steps := []WasmBuildStep{
 		{

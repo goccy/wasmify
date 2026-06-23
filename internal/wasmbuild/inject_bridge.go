@@ -41,6 +41,15 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 		includeFlags = append([]string{"-iquote", "."}, includeFlags...)
 	}
 
+	// Project root on the include path so the generated api_bridge.cc's
+	// project-relative includes (e.g. `#include "py.h"`) resolve. The bridge
+	// compiles run with the upstream build's workdir (not the repo root), so
+	// this is what lets a hand-written embedding header be found without the
+	// caller passing extra -I flags.
+	if cfg.ProjectRoot != "" {
+		includeFlags = append(includeFlags, "-I", cfg.ProjectRoot)
+	}
+
 	bridgeOutput := filepath.Join(cfg.BuildDir, "obj", "api_bridge.o")
 	compileStep := WasmBuildStep{
 		Type:       buildjson.StepCompile,
@@ -74,6 +83,29 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 		}
 		steps = addBridgeToLink(steps, customOutput)
 		steps = append(steps, customStep)
+	}
+
+	// Compile and link the project's declared custom bridge implementation
+	// sources (wasmify.json bridge.CustomBridgeSources), each from its committed
+	// location — no copying into the generated bridge dir. -I the source's own
+	// directory so its sibling-relative includes (e.g. py.c's `#include "py.h"`)
+	// resolve.
+	for _, src := range cfg.CustomBridgeSources {
+		base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+		out := filepath.Join(cfg.BuildDir, "obj", base+".o")
+		// Force C++ regardless of the source extension: a custom bridge is the
+		// C++ counterpart of api_bridge.cc (it bridges the same C++ API), and a
+		// project may name it `.c` while it uses C++ constructs.
+		srcFlags := append(append([]string(nil), includeFlags...), "-x", "c++", "-I", filepath.Dir(src))
+		steps = append(steps, WasmBuildStep{
+			Type:       buildjson.StepCompile,
+			Executable: filepath.Join(cfg.WasiSDKPath, "bin", "clang++"),
+			Args:       buildBridgeCompileArgs(src, out, cfg, srcFlags),
+			WorkDir:    workDir,
+			OutputFile: out,
+			InputFiles: []string{src},
+		})
+		steps = addBridgeToLink(steps, out)
 	}
 
 	// Compile and link wasmify's generic host-capability shims. These are

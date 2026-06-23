@@ -124,6 +124,46 @@ func TestEnvForBuild_OverridesAndResolves(t *testing.T) {
 	// Tools not present on PATH are silently skipped (e.g. ranlib won't be found).
 }
 
+func TestEnvForBuild_ResolvesAgainstPassedPATH(t *testing.T) {
+	tmp := t.TempDir()
+	wrapperDir := filepath.Join(tmp, "wrap")
+	if err := os.MkdirAll(wrapperDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logFile := filepath.Join(tmp, "build.log")
+
+	// Two distinct `cc` binaries. The process PATH exposes the "host" one; the
+	// PATH inside the *passed* env exposes the "sdk" one. EnvForBuild must bind
+	// WASMIFY_REAL_CC to the passed-env (sdk) cc — this is what lets a caller
+	// steer the captured Makefile's bare `cc`/`clang` to wasi-sdk's compiler
+	// instead of whatever the host happens to expose.
+	hostBin := filepath.Join(tmp, "host")
+	sdkBin := filepath.Join(tmp, "sdk")
+	for _, d := range []string{hostBin, sdkBin} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "cc"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", hostBin) // process PATH = host
+
+	input := []string{
+		"CC=/should/be/replaced",
+		"PATH=" + sdkBin, // passed-env PATH = sdk
+	}
+	env, err := EnvForBuild(wrapperDir, logFile, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := envToMap(env)
+	want := filepath.Join(sdkBin, "cc")
+	if m["WASMIFY_REAL_CC"] != want {
+		t.Errorf("WASMIFY_REAL_CC = %q, want %q (must resolve against passed PATH, not process PATH)", m["WASMIFY_REAL_CC"], want)
+	}
+}
+
 func TestEnvForBuild_SkipsUnavailableTools(t *testing.T) {
 	tmp := t.TempDir()
 	// PATH contains only an empty directory, so no tools will be found.

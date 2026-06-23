@@ -27,23 +27,23 @@ const SchemaVersion = "1"
 // optional so partially-initialised projects (mid-init, mid-analyze)
 // round-trip cleanly through Load/Save.
 type State struct {
-	Version     string            `json:"version"`
-	Upstream    UpstreamInfo      `json:"upstream,omitempty"`
-	Project     Project           `json:"project,omitempty"`
-	BuildSystem BuildSystem       `json:"build_system,omitempty"`
-	Targets     []Target          `json:"targets,omitempty"`
-	Deps        []Dependency      `json:"dependencies,omitempty"`
-	Tools       []Tool            `json:"required_tools,omitempty"`
-	Commands    BuildCommands     `json:"build_commands,omitempty"`
+	Version     string        `json:"version"`
+	Upstream    UpstreamInfo  `json:"upstream,omitempty"`
+	Project     Project       `json:"project,omitempty"`
+	BuildSystem BuildSystem   `json:"build_system,omitempty"`
+	Targets     []Target      `json:"targets,omitempty"`
+	Deps        []Dependency  `json:"dependencies,omitempty"`
+	Tools       []Tool        `json:"required_tools,omitempty"`
+	Commands    BuildCommands `json:"build_commands,omitempty"`
 	// Output configures where wasmify's user-facing artifacts are
 	// written. Each per-artifact path is independently optional;
 	// relative paths resolve against the directory holding wasmify.json.
-	Output      *Output           `json:"output,omitempty"`
-	Selection   *Selection        `json:"user_selection,omitempty"`
-	Bridge      *BridgeConfig     `json:"bridge,omitempty"`
-	Skip        *SkipConfig       `json:"skip,omitempty"`
-	Phases      map[string]*Phase `json:"phases,omitempty"`
-	AnalyzedAt  string            `json:"analyzed_at,omitempty"`
+	Output     *Output           `json:"output,omitempty"`
+	Selection  *Selection        `json:"user_selection,omitempty"`
+	Bridge     *BridgeConfig     `json:"bridge,omitempty"`
+	Skip       *SkipConfig       `json:"skip,omitempty"`
+	Phases     map[string]*Phase `json:"phases,omitempty"`
+	AnalyzedAt string            `json:"analyzed_at,omitempty"`
 }
 
 // UpstreamInfo records the upstream project location and last known commit.
@@ -227,6 +227,18 @@ type BridgeConfig struct {
 	// SkipHeaders lists header file paths to exclude from bridge
 	// includes.
 	SkipHeaders []string `json:"SkipHeaders,omitempty"`
+
+	// CustomBridgeSources lists the project's hand-written bridge
+	// implementation source files (paths relative to the project root),
+	// for projects whose exported API is a thin embedding layer rather
+	// than the upstream library itself (e.g. a py.c defining
+	// py_new/py_eval on top of libpython). wasm-build compiles and links
+	// each one — with -I of its own directory so its sibling-relative
+	// includes resolve — so the project never copies sources into the
+	// generated bridge dir. Each is compiled as C++ (clang++ -x c++): a
+	// custom bridge is the C++ counterpart of api_bridge.cc, and a project
+	// may name it `.c` while it uses C++ constructs. Example: ["py.c"].
+	CustomBridgeSources []string `json:"CustomBridgeSources,omitempty"`
 
 	// IncludeExternalHeaders lists header files outside the project
 	// root that the parser should still walk. Used when the project
