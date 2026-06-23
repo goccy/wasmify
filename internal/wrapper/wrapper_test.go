@@ -2,10 +2,12 @@ package wrapper
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -175,6 +177,91 @@ func TestEnvForBuild_SkipsUnavailableTools(t *testing.T) {
 	for _, e := range env {
 		if strings.HasPrefix(e, "WASMIFY_REAL_") {
 			t.Errorf("unexpected resolved real tool: %s", e)
+		}
+	}
+}
+
+// TestAppendLogEntry_ConcurrentNoInterleave reproduces the parallel-build log
+// race. Many goroutines append to one log file concurrently, exactly as the
+// wrapped compilers do under `make --jobs N`. With the buggy two-write append
+// (JSON record and newline written separately) the records interleave, two JSON
+// objects land on one line, ParseLog drops that malformed line, and entries go
+// missing — which in the real pipeline drops a compile step from build.json and
+// breaks wasm-build's archive on a clean tree. With the single-write
+// appendLogEntry every record is on its own line and ParseLog reads all of
+// them.
+//
+// The long Args make each JSON line ~1 KB (like a real CPython compile command),
+// widening the interleave window so the two-write regression fails reliably.
+func TestAppendLogEntry_ConcurrentNoInterleave(t *testing.T) {
+	const (
+		writers = 64
+		rounds  = 64
+	)
+	total := writers * rounds
+
+	logFile := filepath.Join(t.TempDir(), "build.log")
+
+	// ~1 KB of realistic include flags so each record is large.
+	longArgs := make([]string, 0, 60)
+	longArgs = append(longArgs, "-c", "-O3", "-DNDEBUG")
+	for i := 0; i < 50; i++ {
+		longArgs = append(longArgs, fmt.Sprintf("-I/work/cpython/cross-build/wasm32-wasip1/Include/internal/segment-%02d", i))
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				// Encode a unique id in WorkDir so we can verify nothing is lost.
+				entry := LogEntry{
+					Timestamp:  "2026-01-01T00:00:00Z",
+					Tool:       "clang",
+					Executable: "/opt/wasi-sdk/bin/clang",
+					Args:       append([]string{fmt.Sprintf("-o/work/obj/file_%03d_%03d.o", w, r)}, longArgs...),
+					WorkDir:    fmt.Sprintf("/work/id/%03d/%03d", w, r),
+				}
+				if err := appendLogEntry(logFile, entry); err != nil {
+					t.Errorf("appendLogEntry: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Raw line count must equal total — a dropped/merged line means the race
+	// corrupted the log.
+	raw, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawLines := strings.Count(strings.TrimRight(string(raw), "\n"), "\n") + 1
+	if rawLines != total {
+		t.Errorf("raw line count = %d, want %d (records interleaved on shared lines)", rawLines, total)
+	}
+
+	// Every record must round-trip through ParseLog with no drops, and every
+	// unique id must be present exactly once.
+	entries, err := ParseLog(logFile)
+	if err != nil {
+		t.Fatalf("ParseLog: %v", err)
+	}
+	if len(entries) != total {
+		t.Fatalf("ParseLog returned %d entries, want %d (malformed lines dropped)", len(entries), total)
+	}
+	seen := make(map[string]int, total)
+	for _, e := range entries {
+		seen[e.WorkDir]++
+	}
+	if len(seen) != total {
+		t.Errorf("distinct ids = %d, want %d", len(seen), total)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("id %s appeared %d times, want 1", id, n)
 		}
 	}
 }

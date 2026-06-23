@@ -173,15 +173,7 @@ func RunAsWrapper() error {
 		WorkDir:    wd,
 	}
 
-	line, err := json.Marshal(entry)
-	if err == nil {
-		f, ferr := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if ferr == nil {
-			_, _ = f.Write(line)
-			_, _ = f.Write([]byte("\n"))
-			_ = f.Close()
-		}
-	}
+	_ = appendLogEntry(logFile, entry)
 
 	// Exec the real tool
 	cmd := exec.Command(realPath, os.Args[1:]...)
@@ -189,6 +181,34 @@ func RunAsWrapper() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// appendLogEntry appends one JSON-encoded LogEntry, followed by a newline, to
+// logFile. The record and its newline are written with a SINGLE write() to a
+// file opened O_APPEND, which is atomic on Linux even when many wrapped
+// compilers (separate processes under `make --jobs N`) append concurrently — so
+// records never interleave. Writing the record and the newline as two separate
+// writes is the bug this guards against: the pair is not atomic, so a race
+// concatenates two JSON objects onto one line, ParseLog drops the malformed
+// line, and build.json silently loses a compile step (breaking wasm-build's
+// archive on a clean tree). Best-effort: a marshal or open error is dropped, as
+// the original logging was.
+func appendLogEntry(logFile string, entry LogEntry) error {
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	line = append(line, '\n')
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, werr := f.Write(line)
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	return cerr
 }
 
 func normalizeEnvKey(name string) string {
