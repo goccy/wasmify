@@ -19,6 +19,11 @@ func DetectWasiSDK(explicit string) (string, error) {
 	if env := os.Getenv("WASI_SDK_PATH"); env != "" {
 		candidates = append(candidates, env)
 	}
+	// The shared XDG location wasmify installs the SDK to (ensure-tools /
+	// install-sdk). wasmify manages it, so callers never have to pass a path.
+	if def, err := defaultInstallDir(); err == nil {
+		candidates = append(candidates, def)
+	}
 	candidates = append(candidates,
 		"/opt/wasi-sdk",
 		"/usr/local/wasi-sdk",

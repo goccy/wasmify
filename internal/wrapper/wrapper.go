@@ -101,10 +101,20 @@ func EnvForBuild(wrapperDir, logFile string, env []string) ([]string, error) {
 		fmt.Sprintf("WASMIFY_LOG_FILE=%s", logFile),
 	)
 
-	// Resolve real tool paths
+	// Resolve real tool paths against the PASSED env's PATH (not the process
+	// PATH), so a caller can steer resolution by prepending e.g. wasi-sdk/bin —
+	// the captured Makefile invokes the compiler by bare name (CC=clang) and we
+	// must bind WASMIFY_REAL_clang to the wasi-sdk clang, not whatever clang the
+	// host happens to expose.
+	searchPath := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			searchPath = strings.TrimPrefix(e, "PATH=")
+		}
+	}
 	for _, name := range toolNames {
-		realPath, err := exec.LookPath(name)
-		if err != nil {
+		realPath := lookPathIn(name, searchPath)
+		if realPath == "" {
 			continue // Tool not found, skip
 		}
 		envKey := fmt.Sprintf("WASMIFY_REAL_%s", normalizeEnvKey(name))
@@ -112,6 +122,28 @@ func EnvForBuild(wrapperDir, logFile string, env []string) ([]string, error) {
 	}
 
 	return result, nil
+}
+
+// lookPathIn finds an executable named `name` in the colon-separated `path`,
+// falling back to the process PATH (exec.LookPath) when `path` is empty. Unlike
+// exec.LookPath it honours the explicit search path the caller supplies.
+func lookPathIn(name, path string) string {
+	if path == "" {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+		return ""
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // RunAsWrapper is called when the binary is invoked via a symlink (as a wrapper).

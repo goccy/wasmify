@@ -775,7 +775,25 @@ func cmdBuild(args []string) error {
 	}
 	defer cleanup()
 
-	env, err := wrapper.EnvForBuild(wrapperDir, logFile, os.Environ())
+	// Resolve the wrapper's real compilers against a PATH that has wasi-sdk/bin
+	// FIRST. A captured Makefile invokes the compiler by bare name (CC=clang);
+	// without this, the wrapper's WASMIFY_REAL_clang would bind to whatever
+	// clang the caller's PATH happens to expose (typically the host clang),
+	// which silently cross-compiles for the BUILD machine — for CPython that
+	// trips its LONG_BIT guard. Making the build self-resolve the toolchain
+	// means callers do not have to put wasi-sdk on PATH themselves.
+	baseEnv := os.Environ()
+	if sdk, derr := wasmbuild.DetectWasiSDK(""); derr == nil {
+		sdkBin := filepath.Join(sdk, "bin")
+		for i, e := range baseEnv {
+			if strings.HasPrefix(e, "PATH=") {
+				baseEnv[i] = "PATH=" + sdkBin + ":" + strings.TrimPrefix(e, "PATH=")
+				break
+			}
+		}
+	}
+
+	env, err := wrapper.EnvForBuild(wrapperDir, logFile, baseEnv)
 	if err != nil {
 		return fmt.Errorf("failed to prepare build environment: %w", err)
 	}
@@ -902,7 +920,8 @@ func runBazelBuild(absPath, outDir, dataDir string, buildCmd []string) error {
 // string or already-split argv.
 //
 // Example: ["bazel build -c opt //googlesql/public:analyzer //googlesql/public:sql_formatter"]
-//   → flags=["-c", "opt"], targets=["//googlesql/public:analyzer", "//googlesql/public:sql_formatter"]
+//
+//	→ flags=["-c", "opt"], targets=["//googlesql/public:analyzer", "//googlesql/public:sql_formatter"]
 func splitBazelBuildCommand(buildCmd []string) (flags []string, targets []string) {
 	var tokens []string
 	if len(buildCmd) == 1 {
@@ -1247,6 +1266,12 @@ func cmdWasmBuild(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The config dir (where wasmify.json + the project's own bridge sources
+	// live) on the bridge compile -I, so the generated api_bridge.cc's
+	// project-relative includes (e.g. `#include "py.h"`) resolve without the
+	// caller passing extra include flags. This is the project repo root, NOT
+	// the upstream submodule path.
+	cfg.ProjectRoot = outDir
 
 	// Opt-in host-provided sockets, declared in wasmify.json's bridge config.
 	// When set, the bridge compile gets -DWASMIFY_HOST_SOCKETS so the project's
@@ -1258,6 +1283,17 @@ func cmdWasmBuild(args []string) error {
 		}
 		if s.Bridge.HostSubprocess {
 			cfg.HostSubprocess = true
+		}
+		// The project's hand-written bridge implementation sources (an
+		// embedding layer like py.c). Resolve each against the config dir
+		// (where wasmify.json + the sources live) so wasm-build compiles+links
+		// them from their committed location — no copying into the generated
+		// bridge dir.
+		for _, src := range s.Bridge.CustomBridgeSources {
+			if !filepath.IsAbs(src) {
+				src = filepath.Join(outDir, src)
+			}
+			cfg.CustomBridgeSources = append(cfg.CustomBridgeSources, src)
 		}
 		// Optional wasm linker stack-size override (bytes). Shrinks the initial
 		// linear memory baked into the module when the guest needs less stack
@@ -1505,9 +1541,21 @@ func cmdWasmBuild(args []string) error {
 		}
 		// Bridge objects feed into the final library link so host callers
 		// can reach the wasm target through the per-method `w_<svc>_<mid>`
-		// exports plus `wasm_alloc` / `wasm_free` for buffer management.
+		// exports plus `wasm_alloc` / `wasm_free` for buffer management. The
+		// list is: the generated dispatcher (api_bridge.o), an optional
+		// hand-written custom_bridge.o, the project-declared embedding sources
+		// (bridge.CustomBridgeSources — e.g. pyembed.o, which pulls libpython
+		// into the wasm), and wasmify's host-capability shim objects when the
+		// matching capability is opted in. Library targets have no captured
+		// link step, so these are the only way those objects reach the wasm.
+		extraNames := []string{"api_bridge.o", "custom_bridge.o"}
+		for _, src := range cfg.CustomBridgeSources {
+			base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+			extraNames = append(extraNames, base+".o")
+		}
+		extraNames = append(extraNames, "host_sockets.o", "host_subprocess.o")
 		var extraObjects []string
-		for _, name := range []string{"api_bridge.o", "custom_bridge.o"} {
+		for _, name := range extraNames {
 			obj := filepath.Join(cfg.BuildDir, "obj", name)
 			if _, err := os.Stat(obj); err == nil {
 				extraObjects = append(extraObjects, obj)
