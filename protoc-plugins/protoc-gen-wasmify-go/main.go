@@ -777,6 +777,29 @@ const protoHelpersBody = `import (
 	"strconv"
 )
 
+// pbNewBuf returns the scratch buffer every request marshal starts
+// from. Starting from a presized slice instead of nil removes the
+// append growth ladder (nil→8→16→… reallocations plus copies) that
+// made runtime.growslice-under-pbAppendVarint 90% of one hot
+// consumer's slice-growth profile; 64 bytes covers the dominant
+// single-handle request shape (≤ 13 bytes) and small argument
+// messages in one allocation. A sync.Pool variant was measured and
+// REJECTED: the per-call Get/Put traffic and the pointer box each
+// Put allocates cost more time than the saved reallocations
+// (isolated A/B on googlesqlite's window suite: allocs/op −15% but
+// sec/op +1.5%, B/op +4.8%).
+func pbNewBuf() []byte { return make([]byte, 0, 64) }
+
+// pbVarintLen reports the encoded size of v without writing it.
+func pbVarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
+
 // pbAppendVarint appends a varint-encoded uint64.
 func pbAppendVarint(buf []byte, v uint64) []byte {
 	for v >= 0x80 {
@@ -847,8 +870,17 @@ func pbAppendSubmessage(buf []byte, field uint32, sub []byte) []byte {
 }
 
 func pbAppendHandle(buf []byte, field uint32, ptr uint64) []byte {
-	sub := pbAppendUint64(nil, 1, ptr)
-	return pbAppendSubmessage(buf, field, sub)
+	// The submessage has a fixed shape — tag(1,varint) + varint(ptr),
+	// ≤ 11 bytes — so its length is computable up front and the
+	// whole thing can be written straight into buf. The previous
+	// shape built the inner bytes in a fresh slice per call
+	// (` + "`pbAppendUint64(nil, …)`" + `), one heap allocation per handle
+	// field on every bridge call.
+	inner := 1 + pbVarintLen(ptr)
+	buf = pbAppendTag(buf, field, 2)
+	buf = pbAppendVarint(buf, uint64(inner))
+	buf = append(buf, 0x08) // field 1, wire type varint
+	return pbAppendVarint(buf, ptr)
 }
 
 // pbAppendHandlePtr is the nil-safe one-line wrapper around
@@ -1800,7 +1832,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	if m.typeNameFn == nil {
 		return "", fmt.Errorf("wasm export %q not found", "wasmify_get_type_name")
 	}
-	buf := pbAppendUint64(nil, 1, ptr)
+	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
 	resp, err := m.callExport(m.typeNameFn, buf)
 	if err != nil {
 		return "", err
@@ -2755,7 +2787,7 @@ func generateValueTypes(pkg string, valueMsgs map[string]*protogen.Message, mess
 		// struct fields rather than bare locals.
 		fmt.Fprintf(&b, "func (v *%s) marshal() []byte {\n", name)
 		b.WriteString("\tif v == nil { return nil }\n")
-		b.WriteString("\tvar buf []byte\n")
+		b.WriteString("\tbuf := pbNewBuf()\n")
 		for _, f := range fields {
 			alias := f
 			alias.goName = "v." + upperFirst(f.goName)
@@ -3111,7 +3143,7 @@ func writeCallbackFactory(b *strings.Builder, svc svcInfo, m svcMethodInfo, hand
 		handleName, suffix, paramStr, structName)
 	fmt.Fprintf(b, "\tadapter := &%s{impl: impl}\n", adapterName)
 	b.WriteString("\tid := RegisterCallback(adapter)\n")
-	b.WriteString("\tvar buf []byte\n")
+	b.WriteString("\tbuf := pbNewBuf()\n")
 	b.WriteString("\tbuf = pbAppendInt32(buf, 1, id)\n")
 	for _, a := range ctorArgs {
 		writeEncode(b, a, "buf")
@@ -3174,7 +3206,7 @@ func writeConstructor(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleNa
 		b.WriteString(doc)
 	}
 	fmt.Fprintf(b, "func New%s%s(%s) (*%s, error) {\n", handleName, ctorSuffix, paramStr, structName)
-	b.WriteString("\tvar buf []byte\n")
+	b.WriteString("\tbuf := pbNewBuf()\n")
 	for _, p := range params {
 		writeEncode(b, p, "buf")
 	}
@@ -3227,7 +3259,7 @@ func writeFree(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName stri
 	structName := handleStructName(handleName, messages[handleName].isAbstract)
 	fmt.Fprintf(b, "func (h *%s) free() {\n", structName)
 	b.WriteString("\tif h.ptr != 0 {\n")
-	b.WriteString("\t\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
+	b.WriteString("\t\tbuf := pbAppendHandle(pbNewBuf(), 1, h.ptr)\n")
 	fmt.Fprintf(b, "\t\tmodule().invoke(%d, %d, buf%s)\n", svc.serviceID, m.methodID, invokeArgs(svc.serviceID, m.methodID))
 	b.WriteString("\t\th.ptr = 0\n")
 	b.WriteString("\t}\n")
@@ -3253,7 +3285,7 @@ func writeGetter(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName st
 	}
 	if len(m.outputFields) == 0 {
 		fmt.Fprintf(b, "func (h *%s) %s() error {\n", structName, methodName)
-		b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
+		b.WriteString("\tbuf := pbAppendHandle(pbNewBuf(), 1, h.ptr)\n")
 		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf%s)\n", svc.serviceID, m.methodID, invokeArgs(svc.serviceID, m.methodID))
 		b.WriteString("\treturn err\n")
 		b.WriteString("}\n\n")
@@ -3269,14 +3301,14 @@ func writeGetter(b *strings.Builder, svc svcInfo, m svcMethodInfo, handleName st
 	}
 	if result.goType == "" {
 		fmt.Fprintf(b, "func (h *%s) %s() error {\n", structName, methodName)
-		b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
+		b.WriteString("\tbuf := pbAppendHandle(pbNewBuf(), 1, h.ptr)\n")
 		fmt.Fprintf(b, "\t_, err := invokeMethod(%d, %d, buf%s)\n", svc.serviceID, m.methodID, invokeArgs(svc.serviceID, m.methodID))
 		b.WriteString("\treturn err\n")
 		b.WriteString("}\n\n")
 		return
 	}
 	fmt.Fprintf(b, "func (h *%s) %s() (%s, error) {\n", structName, methodName, result.goType)
-	b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
+	b.WriteString("\tbuf := pbAppendHandle(pbNewBuf(), 1, h.ptr)\n")
 	fmt.Fprintf(b, "\tresp, err := invokeMethod(%d, %d, buf%s)\n", svc.serviceID, m.methodID, invokeArgs(svc.serviceID, m.methodID))
 	fmt.Fprintf(b, "\tif err != nil { return %s, err }\n", zeroValue(result))
 	writeDecode(b, result, structName)
@@ -3315,7 +3347,7 @@ func writeRegularMethod(b *strings.Builder, svc svcInfo, m svcMethodInfo, handle
 	} else {
 		fmt.Fprintf(b, "func (h *%s) %s(%s) error {\n", structName, methodName, paramStr)
 	}
-	b.WriteString("\tbuf := pbAppendHandle(nil, 1, h.ptr)\n")
+	b.WriteString("\tbuf := pbAppendHandle(pbNewBuf(), 1, h.ptr)\n")
 	for _, p := range params {
 		writeEncode(b, p, "buf")
 	}
@@ -3389,7 +3421,7 @@ func generateClient(pkg string, freeServices []svcInfo, messages map[string]msgI
 			} else {
 				fmt.Fprintf(&b, "func %s(%s) error {\n", methodName, paramStr)
 			}
-			b.WriteString("\tvar buf []byte\n")
+			b.WriteString("\tbuf := pbNewBuf()\n")
 			for _, p := range params {
 				writeEncode(&b, p, "buf")
 			}
