@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/tetratelabs/wazero"
@@ -33,11 +34,35 @@ var (
 	_ = strings.TrimSpace
 	_ = strconv.Itoa
 	_ = sync.Once{}
+	_ = atomic.Int64{}
 	_ = unsafe.Sizeof(byte(0))
 	_ = wazero.NewRuntime
 	_ = api.ValueType(0)
 	_ = wasi_snapshot_preview1.Instantiate
 )
+
+// pbNewBuf returns the scratch buffer every request marshal starts
+// from. Starting from a presized slice instead of nil removes the
+// append growth ladder (nil→8→16→… reallocations plus copies) that
+// made runtime.growslice-under-pbAppendVarint 90% of one hot
+// consumer's slice-growth profile; 64 bytes covers the dominant
+// single-handle request shape (≤ 13 bytes) and small argument
+// messages in one allocation. A sync.Pool variant was measured and
+// REJECTED: the per-call Get/Put traffic and the pointer box each
+// Put allocates cost more time than the saved reallocations
+// (isolated A/B on googlesqlite's window suite: allocs/op −15% but
+// sec/op +1.5%, B/op +4.8%).
+func pbNewBuf() []byte { return make([]byte, 0, 64) }
+
+// pbVarintLen reports the encoded size of v without writing it.
+func pbVarintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
 
 // pbAppendVarint appends a varint-encoded uint64.
 func pbAppendVarint(buf []byte, v uint64) []byte {
@@ -109,8 +134,84 @@ func pbAppendSubmessage(buf []byte, field uint32, sub []byte) []byte {
 }
 
 func pbAppendHandle(buf []byte, field uint32, ptr uint64) []byte {
-	sub := pbAppendUint64(nil, 1, ptr)
-	return pbAppendSubmessage(buf, field, sub)
+	// The submessage has a fixed shape — tag(1,varint) + varint(ptr),
+	// ≤ 11 bytes — so its length is computable up front and the
+	// whole thing can be written straight into buf. The previous
+	// shape built the inner bytes in a fresh slice per call
+	// (`pbAppendUint64(nil, …)`), one heap allocation per handle
+	// field on every bridge call.
+	inner := 1 + pbVarintLen(ptr)
+	buf = pbAppendTag(buf, field, 2)
+	buf = pbAppendVarint(buf, uint64(inner))
+	buf = append(buf, 0x08) // field 1, wire type varint
+	return pbAppendVarint(buf, ptr)
+}
+
+// pbAppendHandlePtr is the nil-safe one-line wrapper around
+// pbAppendHandle. Generic + comparable lets it accept any
+// pointer-typed wrapper that provides rawPtr() and short-circuit
+// when the pointer is nil. The caller writes
+//
+//	buf = pbAppendHandlePtr(buf, N, v.X)
+//
+// which gofmt keeps as one line; the alternative
+//
+//	if v.X != nil { buf = pbAppendHandle(buf, N, v.X.rawPtr()) }
+//
+// is gofmt-expanded to three lines per occurrence and accounts
+// for several hundred KB of bloat across the binding.
+func pbAppendHandlePtr[T interface {
+	comparable
+	rawPtr() uint64
+}](buf []byte, field uint32, v T) []byte {
+	var zero T
+	if v == zero {
+		return buf
+	}
+	return pbAppendHandle(buf, field, v.rawPtr())
+}
+
+// pbAppendSubmessagePtr is the value-type-message counterpart of
+// pbAppendHandlePtr: nil-safe, gofmt-friendly one-liner around
+// pbAppendSubmessage + the type's marshal() helper.
+func pbAppendSubmessagePtr[T interface {
+	comparable
+	marshal() []byte
+}](buf []byte, field uint32, v T) []byte {
+	var zero T
+	if v == zero {
+		return buf
+	}
+	return pbAppendSubmessage(buf, field, v.marshal())
+}
+
+// clearPtrAny is the gofmt-friendly nil-safe ownership-transfer
+// helper for handle parameters. Replaces the inline expansion
+//
+//	if c, ok := v.(interface{ clearPtr() }); ok { c.clearPtr() }
+//
+// (3 lines after gofmt) plus its surrounding nil-guard with a
+// single function call. Handles both interface values
+// (CatalogNode et al) and concrete pointers; the type assertion
+// short-circuits when v is a true-nil interface, and the wrapped
+// clearPtr() is itself nil-receiver-safe so a typed-nil pointer
+// passed through the interface no-ops cleanly.
+func clearPtrAny(v any) {
+	if c, ok := v.(interface{ clearPtr() }); ok {
+		c.clearPtr()
+	}
+}
+
+// clearPtrAll is the slice variant of clearPtrAny. Used when the
+// proto-field's wire shape is repeated-handle and the C++ side
+// adopts ownership of every element. Each element runs through
+// the same type-assertion shortcut so the helper handles
+// concrete-pointer slices, interface slices, and slices that mix
+// nil and non-nil entries uniformly.
+func clearPtrAll[T any](items []T) {
+	for _, item := range items {
+		clearPtrAny(item)
+	}
 }
 
 // pbReader is a streaming protobuf decoder.
@@ -272,21 +373,6 @@ func readHandlePtr(data []byte) uint64 {
 	return 0
 }
 
-// invokeMethod fans the wasm call out into the runtime, then folds in
-// the (very common) pbExtractError check on the response. Every per-
-// method client wrapper used to repeat the same three lines; this
-// helper collapses them to one call.
-func invokeMethod(svc, mid int32, req []byte) ([]byte, error) {
-	resp, err := module().invoke(svc, mid, req)
-	if err != nil {
-		return nil, err
-	}
-	if e := pbExtractError(resp); e != nil {
-		return nil, e
-	}
-	return resp, nil
-}
-
 // readPtrAtField returns the handle pointer encoded at response field f.
 // f == 1 takes the fast path via readHandlePtr (which already handles
 // both the direct-varint constructor shape and the submessage write_handle
@@ -425,16 +511,41 @@ var embeddedWasm []byte
 // `api.Function` keyed by serviceID<<32 | methodID so the per-call
 // overhead is one map read after the first invocation.
 type Module struct {
-	mu               sync.Mutex
-	runtime          wazero.Runtime
-	mod              api.Module
-	allocFn          api.Function
-	freeFn           api.Function
-	typeNameFn       api.Function
-	exportFns        map[uint64]api.Function
+	mu         sync.Mutex
+	runtime    wazero.Runtime
+	mod        api.Module
+	allocFn    api.Function
+	freeFn     api.Function
+	typeNameFn api.Function
+	exportFns  map[uint64]api.Function
+	// callbacksMu guards callbacks and nextCBID. RegisterCallback /
+	// UnregisterCallback are called from arbitrary goroutines
+	// (including finalisers running concurrently with a wasm export
+	// on a different goroutine), so the map must not be mutated
+	// without locking. handleCallback runs inside the host-import
+	// dispatch on whatever goroutine currently owns m.mu — its
+	// read also goes through callbacksMu so it sees a consistent
+	// map view even when an Unregister fires during the same
+	// outer wasm export.
+	//
+	// Why a SEPARATE mutex from m.mu: handleCallback runs while
+	// m.mu is already held by the outer callExport on the same
+	// goroutine; sync.Mutex is non-recursive, so reusing m.mu
+	// here would self-deadlock on the read. callbacksMu is held
+	// briefly only for the map lookup / mutation and is released
+	// before any wasm or user code runs, so it does not interact
+	// with m.mu's serialisation invariant.
+	callbacksMu      sync.RWMutex
 	callbacks        map[int32]CallbackHandler
 	nextCBID         int32
 	compilationCache wazero.CompilationCache // owned; closed in Close()
+	// holderGID identifies the goroutine currently inside fn.Call.
+	// Same-goroutine reentry from a host-import callback (e.g. the
+	// user's HandleCallback runs Go code that itself invokes a
+	// wasm export) skips m.mu so it doesn't self-deadlock — but
+	// other goroutines still wait on m.mu, preserving wazero's
+	// per-module single-threaded execution invariant.
+	holderGID atomic.Int64
 }
 
 var (
@@ -494,8 +605,20 @@ type CallbackHandler interface {
 
 // RegisterCallback registers a Go callback handler and returns its ID.
 // The ID can be passed to C++ as a handle pointer for callback dispatch.
+//
+// callbacksMu serialises map mutations: this is called from arbitrary
+// goroutines (test setup, user code, occasionally finaliser-driven
+// re-registration), so without the lock concurrent writes against
+// the same map would corrupt its internal hash buckets and the next
+// handleCallback would dispatch to a stale or wrong handler — a
+// bug surface that does not present as a panic but as a delayed
+// "out of bounds memory access" inside C++ code that subsequently
+// dereferenced the wrong borrowed handle the wrong adapter handed
+// it.
 func RegisterCallback(handler CallbackHandler) int32 {
 	m := module()
+	m.callbacksMu.Lock()
+	defer m.callbacksMu.Unlock()
 	if m.callbacks == nil {
 		m.callbacks = make(map[int32]CallbackHandler)
 	}
@@ -506,13 +629,28 @@ func RegisterCallback(handler CallbackHandler) int32 {
 }
 
 // UnregisterCallback removes a previously registered callback handler.
+//
+// Called from runtime.SetFinalizer functions on the Go-side wrapper
+// for FromImpl-constructed handles. Finalisers run on a dedicated
+// goroutine that is NOT the test goroutine; without callbacksMu,
+// this would race with concurrent RegisterCallback / handleCallback
+// on the active wasm export.
 func UnregisterCallback(id int32) {
-	module().callbacks[id] = nil
-	delete(module().callbacks, id)
+	m := module()
+	m.callbacksMu.Lock()
+	defer m.callbacksMu.Unlock()
+	delete(m.callbacks, id)
 }
 
 func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+	// Read under the callbacks lock so we see a consistent map view
+	// even if a finaliser-driven UnregisterCallback fires on a
+	// different goroutine in parallel. The lock is released before
+	// the user's HandleCallback runs (which itself may invoke wasm
+	// exports — those acquire m.mu the usual way).
+	m.callbacksMu.RLock()
 	handler, ok := m.callbacks[callbackID]
+	m.callbacksMu.RUnlock()
 	if !ok {
 		return 0
 	}
@@ -524,6 +662,14 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 		copy(buf, req)
 		req = buf
 	}
+	// m.mu is held by the outer callExport. The user's
+	// HandleCallback runs on the same goroutine; any nested
+	// callExport it triggers detects same-goroutine reentry via
+	// holderGID and skips re-acquiring m.mu (sync.Mutex is
+	// non-recursive). Cross-goroutine calls during this window
+	// still wait on m.mu, preserving the wazero per-module
+	// serialisation invariant — only same-goroutine reentry is
+	// permitted.
 	resp, err := handler.HandleCallback(methodID, req)
 	if err != nil {
 		// Encode error response
@@ -532,15 +678,51 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	if len(resp) == 0 {
 		return 0
 	}
-	// Write response to wasm memory
+	// Write response to wasm memory.
+	//
+	// allocFn returns 0 when wasm allocation fails (dlmalloc OOM
+	// / arena limit). Without the explicit zero-pointer guard the
+	// Memory().Write below would clobber the module's static data
+	// at offset 0 and silently corrupt every subsequent export.
+	// The observable symptom is a delayed out-of-bounds memory
+	// access from an unrelated call path several iterations later.
 	ctx := context.Background()
 	results, callErr := m.allocFn.Call(ctx, uint64(len(resp)))
 	if callErr != nil || len(results) == 0 {
 		return 0
 	}
 	ptr := results[0]
+	if ptr == 0 {
+		return 0
+	}
 	m.mod.Memory().Write(uint32(ptr), resp)
 	return int64(ptr)<<32 | int64(len(resp))
+}
+
+// currentGID returns a stable per-goroutine identifier extracted
+// from runtime.Stack. The cost is small (a fixed-size buffer
+// scan + integer parse) and only matters during cross-goroutine
+// contention. Same-goroutine reentry never blocks so the cost
+// is not on the hot path.
+func currentGID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Stack output starts with "goroutine N [...".
+	const prefix = "goroutine "
+	s := string(buf[:n])
+	if !strings.HasPrefix(s, prefix) {
+		return 0
+	}
+	rest := s[len(prefix):]
+	id := int64(0)
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + int64(c-'0')
+	}
+	return id
 }
 
 // envStub returns a GoModuleFunction for an unresolved env import.
@@ -762,32 +944,68 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte) ([]byte, error) {
 
 // exportFor returns the cached api.Function for (serviceID, methodID),
 // performing a one-time mod.ExportedFunction lookup if absent.
+//
+// Like callExport, the lock here is goroutine-aware-reentrant:
+// same-goroutine reentry skips the mutex (we already hold it via
+// the outer callExport).
 func (m *Module) exportFor(serviceID, methodID int32) (api.Function, error) {
 	key := uint64(uint32(serviceID))<<32 | uint64(uint32(methodID))
-	m.mu.Lock()
+	gid := currentGID()
+	reentrant := m.holderGID.Load() == gid && gid != 0
+	if !reentrant {
+		m.mu.Lock()
+	}
 	if fn, ok := m.exportFns[key]; ok {
-		m.mu.Unlock()
+		if !reentrant {
+			m.mu.Unlock()
+		}
 		return fn, nil
 	}
-	m.mu.Unlock()
+	if !reentrant {
+		m.mu.Unlock()
+	}
 	name := fmt.Sprintf("w_%d_%d", serviceID, methodID)
 	fn := m.mod.ExportedFunction(name)
 	if fn == nil {
 		return nil, fmt.Errorf("wasm export %q not found", name)
 	}
-	m.mu.Lock()
+	if !reentrant {
+		m.mu.Lock()
+	}
 	m.exportFns[key] = fn
-	m.mu.Unlock()
+	if !reentrant {
+		m.mu.Unlock()
+	}
 	return fn, nil
 }
 
-// callExport copies req into wasm memory, calls fn, and reads back the
-// packed response. Holds the runtime lock for the duration of the wasm
-// call to keep the underlying memory writes atomic w.r.t. the
-// callback invoke path.
+// callExport copies req into wasm memory, calls fn, and reads back
+// the packed response. The mutex is goroutine-aware-recursive:
+//
+//   - Cross-goroutine calls serialise on m.mu so wasm execution
+//     stays single-threaded per module (wazero requires this).
+//   - Same-goroutine reentry (e.g. a host-import callback whose
+//     HandleCallback wants to make further wasm calls for
+//     abstract-handle type lookup, finaliser-driven Free RPC, …)
+//     skips re-acquiring m.mu — the outer callExport on this
+//     goroutine already holds it; sync.Mutex is non-recursive
+//     and would self-deadlock.
+//
+// Reentry is detected via holderGID: the outermost frame on a
+// goroutine sets it; nested frames see their own GID and skip
+// the lock; cross-goroutine frames see a different GID and wait
+// on m.mu as usual.
 func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	gid := currentGID()
+	reentrant := m.holderGID.Load() == gid && gid != 0
+	if !reentrant {
+		m.mu.Lock()
+		m.holderGID.Store(gid)
+		defer func() {
+			m.holderGID.Store(0)
+			m.mu.Unlock()
+		}()
+	}
 	ctx := context.Background()
 	var reqPtr, reqLen uint64
 	if len(req) > 0 {
@@ -796,6 +1014,17 @@ func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
 			return nil, fmt.Errorf("wasm_alloc: %w", err)
 		}
 		reqPtr = results[0]
+		// allocFn returns 0 on allocation failure (dlmalloc OOM /
+		// arena limit). Without this guard the Memory().Write
+		// below would clobber the wasm module's static data at
+		// offset 0 and silently corrupt every subsequent export.
+		if reqPtr == 0 {
+			return nil, fmt.Errorf("wasm_alloc returned NULL (out of memory)")
+		}
+		// Free reqPtr unconditionally on return so the request
+		// buffer never lingers in wasm memory when fn.Call
+		// errors, Memory().Read fails, or respLen == 0.
+		defer m.freeFn.Call(ctx, reqPtr)
 		reqLen = uint64(len(req))
 		if !m.mod.Memory().Write(uint32(reqPtr), req) {
 			return nil, fmt.Errorf("failed to write request to wasm memory")
@@ -811,16 +1040,15 @@ func (m *Module) callExport(fn api.Function, req []byte) ([]byte, error) {
 	if respLen == 0 {
 		return nil, nil
 	}
+	// respPtr was allocated by the wasm-side handler; free it
+	// regardless of whether the Memory().Read below succeeds.
+	defer m.freeFn.Call(ctx, uint64(respPtr))
 	resp, ok := m.mod.Memory().Read(respPtr, respLen)
 	if !ok {
 		return nil, fmt.Errorf("failed to read response from wasm memory")
 	}
 	out := make([]byte, len(resp))
 	copy(out, resp)
-	m.freeFn.Call(ctx, uint64(respPtr))
-	if reqPtr != 0 {
-		m.freeFn.Call(ctx, reqPtr)
-	}
 	return out, nil
 }
 
@@ -831,7 +1059,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	if m.typeNameFn == nil {
 		return "", fmt.Errorf("wasm export %q not found", "wasmify_get_type_name")
 	}
-	buf := pbAppendUint64(nil, 1, ptr)
+	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
 	resp, err := m.callExport(m.typeNameFn, buf)
 	if err != nil {
 		return "", err
@@ -847,6 +1075,19 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 		r.skip(w)
 	}
 	return "", nil
+}
+
+// invokeMethod fans the wasm call out into the runtime, then folds in
+// the (very common) pbExtractError check on the response.
+func invokeMethod(svc, mid int32, req []byte) ([]byte, error) {
+	resp, err := module().invoke(svc, mid, req)
+	if err != nil {
+		return nil, err
+	}
+	if e := pbExtractError(resp); e != nil {
+		return nil, e
+	}
+	return resp, nil
 }
 
 var _ = fmt.Errorf
@@ -1005,7 +1246,7 @@ func (v *Result) marshal() []byte {
 	if v == nil {
 		return nil
 	}
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendString(buf, 1, v.ErrorMessage)
 	buf = pbAppendBool(buf, 2, v.Ok)
 	buf = pbAppendDouble(buf, 3, v.Value)
@@ -1166,14 +1407,14 @@ func newAnimalNoFinalizer(ptr uint64) *Animal {
 }
 
 func (h *Animal) SetSpecies(s string) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendString(buf, 2, s)
 	_, err := invokeMethod(1, 0, buf)
 	return err
 }
 
 func (h *Animal) Species() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(1, 1, buf)
 	if err != nil {
 		return "", err
@@ -1183,7 +1424,7 @@ func (h *Animal) Species() (string, error) {
 
 func (h *Animal) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(1, 2, buf)
 		h.ptr = 0
 	}
@@ -1221,31 +1462,32 @@ func newCalculatorNoFinalizer(ptr uint64) *Calculator {
 }
 
 func NewCalculator() (*Calculator, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(2, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newCalculator(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newCalculator(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 // History
 func (h *Calculator) AddToHistory(value float64) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendDouble(buf, 2, value)
 	_, err := invokeMethod(2, 1, buf)
 	return err
 }
 
 func (h *Calculator) ClearHistory() error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	_, err := invokeMethod(2, 2, buf)
 	return err
 }
 
 // Basic operations
 func (h *Calculator) Compute(op Operation, a float64, b float64) (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, int32(op))
 	buf = pbAppendDouble(buf, 3, a)
 	buf = pbAppendDouble(buf, 4, b)
@@ -1257,7 +1499,7 @@ func (h *Calculator) Compute(op Operation, a float64, b float64) (float64, error
 }
 
 func (h *Calculator) ComputeSafe(op Operation, a float64, b float64) (*Result, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, int32(op))
 	buf = pbAppendDouble(buf, 3, a)
 	buf = pbAppendDouble(buf, 4, b)
@@ -1278,7 +1520,7 @@ func (h *Calculator) ComputeSafe(op Operation, a float64, b float64) (*Result, e
 }
 
 func (h *Calculator) GetHistory() ([]float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(2, 5, buf)
 	if err != nil {
 		return nil, err
@@ -1304,7 +1546,7 @@ func (h *Calculator) GetHistory() ([]float64, error) {
 
 // Name
 func (h *Calculator) Name() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(2, 6, buf)
 	if err != nil {
 		return "", err
@@ -1313,7 +1555,7 @@ func (h *Calculator) Name() (string, error) {
 }
 
 func (h *Calculator) SetName(name string) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendString(buf, 2, name)
 	_, err := invokeMethod(2, 7, buf)
 	return err
@@ -1321,7 +1563,7 @@ func (h *Calculator) SetName(name string) error {
 
 func (h *Calculator) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(2, 8, buf)
 		h.ptr = 0
 	}
@@ -1347,7 +1589,7 @@ func newCanineNoFinalizer(ptr uint64) *Canine {
 }
 
 func (h *Canine) Breed() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(3, 0, buf)
 	if err != nil {
 		return "", err
@@ -1356,7 +1598,7 @@ func (h *Canine) Breed() (string, error) {
 }
 
 func (h *Canine) SetBreed(b string) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendString(buf, 2, b)
 	_, err := invokeMethod(3, 1, buf)
 	return err
@@ -1364,7 +1606,7 @@ func (h *Canine) SetBreed(b string) error {
 
 func (h *Canine) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(3, 2, buf)
 		h.ptr = 0
 	}
@@ -1390,17 +1632,18 @@ func newCircleNoFinalizer(ptr uint64) *Circle {
 }
 
 func NewCircle(r float64) (*Circle, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendDouble(buf, 1, r)
 	resp, err := invokeMethod(4, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newCircle(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newCircle(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *Circle) Area() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(4, 1, buf)
 	if err != nil {
 		return 0, err
@@ -1409,7 +1652,7 @@ func (h *Circle) Area() (float64, error) {
 }
 
 func (h *Circle) Radius() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(4, 2, buf)
 	if err != nil {
 		return 0, err
@@ -1419,7 +1662,7 @@ func (h *Circle) Radius() (float64, error) {
 
 func (h *Circle) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(4, 3, buf)
 		h.ptr = 0
 	}
@@ -1445,16 +1688,17 @@ func newDogNoFinalizer(ptr uint64) *Dog {
 }
 
 func NewDog() (*Dog, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(5, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newDog(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newDog(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *Dog) BarkVolume() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(5, 1, buf)
 	if err != nil {
 		return 0, err
@@ -1463,7 +1707,7 @@ func (h *Dog) BarkVolume() (int32, error) {
 }
 
 func (h *Dog) SetBarkVolume(v int32) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, v)
 	_, err := invokeMethod(5, 2, buf)
 	return err
@@ -1471,7 +1715,7 @@ func (h *Dog) SetBarkVolume(v int32) error {
 
 func (h *Dog) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(5, 3, buf)
 		h.ptr = 0
 	}
@@ -1497,18 +1741,19 @@ func newHeadingNodeNoFinalizer(ptr uint64) *HeadingNode {
 }
 
 func NewHeadingNode(level int32, text string) (*HeadingNode, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendInt32(buf, 1, level)
 	buf = pbAppendString(buf, 2, text)
 	resp, err := invokeMethod(6, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newHeadingNode(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newHeadingNode(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *HeadingNode) Render() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(6, 1, buf)
 	if err != nil {
 		return "", err
@@ -1518,7 +1763,7 @@ func (h *HeadingNode) Render() (string, error) {
 
 func (h *HeadingNode) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(6, 2, buf)
 		h.ptr = 0
 	}
@@ -1560,7 +1805,7 @@ func newLoggerNoFinalizer(ptr uint64) *Logger {
 }
 
 func (h *Logger) Level() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(7, 0, buf)
 	if err != nil {
 		return 0, err
@@ -1569,7 +1814,7 @@ func (h *Logger) Level() (int32, error) {
 }
 
 func (h *Logger) Log(message string) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendString(buf, 2, message)
 	_, err := invokeMethod(7, 1, buf)
 	return err
@@ -1578,7 +1823,7 @@ func (h *Logger) Log(message string) error {
 func NewLoggerFromImpl(impl LoggerCallback) (*Logger, error) {
 	adapter := &loggerCallbackAdapter{impl: impl}
 	id := RegisterCallback(adapter)
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendInt32(buf, 1, id)
 	resp, err := invokeMethod(7, 2, buf)
 	if err != nil {
@@ -1593,7 +1838,7 @@ func NewLoggerFromImpl(impl LoggerCallback) (*Logger, error) {
 
 func (h *Logger) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(7, 3, buf)
 		h.ptr = 0
 	}
@@ -1619,7 +1864,7 @@ func newMammalNoFinalizer(ptr uint64) *Mammal {
 }
 
 func (h *Mammal) Legs() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(8, 0, buf)
 	if err != nil {
 		return 0, err
@@ -1628,7 +1873,7 @@ func (h *Mammal) Legs() (int32, error) {
 }
 
 func (h *Mammal) SetLegs(n int32) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, n)
 	_, err := invokeMethod(8, 1, buf)
 	return err
@@ -1636,7 +1881,7 @@ func (h *Mammal) SetLegs(n int32) error {
 
 func (h *Mammal) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(8, 2, buf)
 		h.ptr = 0
 	}
@@ -1679,17 +1924,18 @@ func newManagedFactoryNoFinalizer(ptr uint64) *ManagedFactory {
 }
 
 func NewManagedFactory() (*ManagedFactory, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(9, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newManagedFactory(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newManagedFactory(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 // Creates and owns a new ManagedValue. Caller must not delete.
 func (h *ManagedFactory) Make(kind int32, tag string) (*ManagedValue, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, kind)
 	buf = pbAppendString(buf, 3, tag)
 	resp, err := invokeMethod(9, 1, buf)
@@ -1701,7 +1947,7 @@ func (h *ManagedFactory) Make(kind int32, tag string) (*ManagedValue, error) {
 
 func (h *ManagedFactory) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(9, 2, buf)
 		h.ptr = 0
 	}
@@ -1738,7 +1984,7 @@ func newManagedValueNoFinalizer(ptr uint64) *ManagedValue {
 
 // Accessors are public.
 func (h *ManagedValue) Kind() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(10, 0, buf)
 	if err != nil {
 		return 0, err
@@ -1747,7 +1993,7 @@ func (h *ManagedValue) Kind() (int32, error) {
 }
 
 func (h *ManagedValue) Tag() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(10, 1, buf)
 	if err != nil {
 		return "", err
@@ -1789,7 +2035,7 @@ func newNamedNoFinalizer(ptr uint64) *Named {
 }
 
 func (h *Named) NamedName() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(11, 0, buf)
 	if err != nil {
 		return "", err
@@ -1798,7 +2044,7 @@ func (h *Named) NamedName() (string, error) {
 }
 
 func (h *Named) SetNamedName(n string) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendString(buf, 2, n)
 	_, err := invokeMethod(11, 1, buf)
 	return err
@@ -1806,7 +2052,7 @@ func (h *Named) SetNamedName(n string) error {
 
 func (h *Named) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(11, 2, buf)
 		h.ptr = 0
 	}
@@ -1843,7 +2089,7 @@ func newPricedNoFinalizer(ptr uint64) *Priced {
 }
 
 func (h *Priced) PricedPrice() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(12, 0, buf)
 	if err != nil {
 		return 0, err
@@ -1852,7 +2098,7 @@ func (h *Priced) PricedPrice() (float64, error) {
 }
 
 func (h *Priced) SetPricedPrice(p float64) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendDouble(buf, 2, p)
 	_, err := invokeMethod(12, 1, buf)
 	return err
@@ -1860,7 +2106,7 @@ func (h *Priced) SetPricedPrice(p float64) error {
 
 func (h *Priced) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(12, 2, buf)
 		h.ptr = 0
 	}
@@ -1907,23 +2153,24 @@ func newProductNoFinalizer(ptr uint64) *Product {
 }
 
 func NewProduct() (*Product, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(13, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newProduct(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newProduct(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *Product) SetStock(s int32) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, s)
 	_, err := invokeMethod(13, 1, buf)
 	return err
 }
 
 func (h *Product) Stock() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(13, 2, buf)
 	if err != nil {
 		return 0, err
@@ -1933,7 +2180,7 @@ func (h *Product) Stock() (int32, error) {
 
 func (h *Product) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(13, 3, buf)
 		h.ptr = 0
 	}
@@ -1960,7 +2207,7 @@ func newScientificCalculatorNoFinalizer(ptr uint64) *ScientificCalculator {
 }
 
 func (h *ScientificCalculator) Power(base float64, exp float64) (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendDouble(buf, 2, base)
 	buf = pbAppendDouble(buf, 3, exp)
 	resp, err := invokeMethod(14, 0, buf)
@@ -1971,7 +2218,7 @@ func (h *ScientificCalculator) Power(base float64, exp float64) (float64, error)
 }
 
 func (h *ScientificCalculator) Sqrt(value float64) (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendDouble(buf, 2, value)
 	resp, err := invokeMethod(14, 1, buf)
 	if err != nil {
@@ -1982,7 +2229,7 @@ func (h *ScientificCalculator) Sqrt(value float64) (float64, error) {
 
 func (h *ScientificCalculator) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(14, 2, buf)
 		h.ptr = 0
 	}
@@ -2022,7 +2269,7 @@ func newShapeNoFinalizer(ptr uint64) *Shape {
 }
 
 func (h *Shape) Area() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(15, 0, buf)
 	if err != nil {
 		return 0, err
@@ -2033,7 +2280,7 @@ func (h *Shape) Area() (float64, error) {
 func NewShapeFromImpl(impl ShapeCallback) (*Shape, error) {
 	adapter := &shapeCallbackAdapter{impl: impl}
 	id := RegisterCallback(adapter)
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendInt32(buf, 1, id)
 	resp, err := invokeMethod(15, 1, buf)
 	if err != nil {
@@ -2048,7 +2295,7 @@ func NewShapeFromImpl(impl ShapeCallback) (*Shape, error) {
 
 func (h *Shape) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(15, 2, buf)
 		h.ptr = 0
 	}
@@ -2085,19 +2332,18 @@ func newShapeBoxNoFinalizer(ptr uint64) *ShapeBox {
 }
 
 func NewShapeBox() (*ShapeBox, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(16, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newShapeBox(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newShapeBox(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *ShapeBox) Add(s ShapeNode) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
-	if s != nil {
-		buf = pbAppendHandle(buf, 2, s.rawPtr())
-	}
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
+	buf = pbAppendHandlePtr(buf, 2, s)
 	h.setKeepAlive(s)
 	_, err := invokeMethod(16, 1, buf)
 	return err
@@ -2113,22 +2359,16 @@ func (h *ShapeBox) Add(s ShapeNode) error {
 // invoke so the per-instance finalizer cannot issue a second Free
 // RPC against memory ShapeBox now owns through `owned_`.
 func (h *ShapeBox) AddUnique(s ShapeNode) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
-	if s != nil {
-		buf = pbAppendHandle(buf, 2, s.rawPtr())
-	}
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
+	buf = pbAppendHandlePtr(buf, 2, s)
 	h.setKeepAlive(s)
 	_, err := invokeMethod(16, 2, buf)
-	if s != nil {
-		if _c, _ok := s.(interface{ clearPtr() }); _ok {
-			_c.clearPtr()
-		}
-	}
+	clearPtrAny(s)
 	return err
 }
 
 func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, i)
 	resp, err := invokeMethod(16, 3, buf)
 	if err != nil {
@@ -2138,7 +2378,7 @@ func (h *ShapeBox) Get(i int32) (ShapeNode, error) {
 }
 
 func (h *ShapeBox) Size() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(16, 4, buf)
 	if err != nil {
 		return 0, err
@@ -2148,7 +2388,7 @@ func (h *ShapeBox) Size() (int32, error) {
 
 func (h *ShapeBox) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(16, 5, buf)
 		h.ptr = 0
 	}
@@ -2174,17 +2414,18 @@ func newSquareNoFinalizer(ptr uint64) *Square {
 }
 
 func NewSquare(s float64) (*Square, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendDouble(buf, 1, s)
 	resp, err := invokeMethod(17, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newSquare(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newSquare(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *Square) Area() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(17, 1, buf)
 	if err != nil {
 		return 0, err
@@ -2193,7 +2434,7 @@ func (h *Square) Area() (float64, error) {
 }
 
 func (h *Square) Side() (float64, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(17, 2, buf)
 	if err != nil {
 		return 0, err
@@ -2203,7 +2444,7 @@ func (h *Square) Side() (float64, error) {
 
 func (h *Square) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(17, 3, buf)
 		h.ptr = 0
 	}
@@ -2254,33 +2495,35 @@ func newStatefulCounterNoFinalizer(ptr uint64) *StatefulCounter {
 }
 
 func NewStatefulCounter() (*StatefulCounter, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(18, 0, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newStatefulCounter(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newStatefulCounter(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func NewStatefulCounter2(initialId int32) (*StatefulCounter, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendInt32(buf, 1, initialId)
 	resp, err := invokeMethod(18, 1, buf)
 	if err != nil {
 		return nil, err
 	}
-	return newStatefulCounter(readScalarAtField(resp, 1, (*pbReader).readUint64)), nil
+	_h := newStatefulCounter(readScalarAtField(resp, 1, (*pbReader).readUint64))
+	return _h, nil
 }
 
 func (h *StatefulCounter) Add(delta int32) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, delta)
 	_, err := invokeMethod(18, 2, buf)
 	return err
 }
 
 func (h *StatefulCounter) CallCount() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(18, 3, buf)
 	if err != nil {
 		return 0, err
@@ -2289,7 +2532,7 @@ func (h *StatefulCounter) CallCount() (int32, error) {
 }
 
 func (h *StatefulCounter) Id() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(18, 4, buf)
 	if err != nil {
 		return 0, err
@@ -2298,20 +2541,20 @@ func (h *StatefulCounter) Id() (int32, error) {
 }
 
 func (h *StatefulCounter) Reset() error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	_, err := invokeMethod(18, 5, buf)
 	return err
 }
 
 func (h *StatefulCounter) SetLabel(newLabel int32) error {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	buf = pbAppendInt32(buf, 2, newLabel)
 	_, err := invokeMethod(18, 6, buf)
 	return err
 }
 
 func (h *StatefulCounter) Total() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(18, 7, buf)
 	if err != nil {
 		return 0, err
@@ -2321,7 +2564,7 @@ func (h *StatefulCounter) Total() (int32, error) {
 
 // public field: intentionally exposed
 func (h *StatefulCounter) GetLabel() (int32, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(18, 8, buf)
 	if err != nil {
 		return 0, err
@@ -2331,7 +2574,7 @@ func (h *StatefulCounter) GetLabel() (int32, error) {
 
 func (h *StatefulCounter) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(18, 9, buf)
 		h.ptr = 0
 	}
@@ -2376,7 +2619,7 @@ func newTextNodeBaseNoFinalizer(ptr uint64) *TextNodeBase {
 }
 
 func (h *TextNodeBase) Render() (string, error) {
-	buf := pbAppendHandle(nil, 1, h.ptr)
+	buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 	resp, err := invokeMethod(19, 0, buf)
 	if err != nil {
 		return "", err
@@ -2387,7 +2630,7 @@ func (h *TextNodeBase) Render() (string, error) {
 func NewTextNodeFromImpl(impl TextNodeCallback) (*TextNodeBase, error) {
 	adapter := &textNodeCallbackAdapter{impl: impl}
 	id := RegisterCallback(adapter)
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendInt32(buf, 1, id)
 	resp, err := invokeMethod(19, 1, buf)
 	if err != nil {
@@ -2402,7 +2645,7 @@ func NewTextNodeFromImpl(impl TextNodeCallback) (*TextNodeBase, error) {
 
 func (h *TextNodeBase) free() {
 	if h.ptr != 0 {
-		buf := pbAppendHandle(nil, 1, h.ptr)
+		buf := pbAppendHandle(pbNewBuf(), 1, h.ptr)
 		module().invoke(19, 2, buf)
 		h.ptr = 0
 	}
@@ -2414,7 +2657,7 @@ var _ = runtime.SetFinalizer
 
 // Free functions
 func Add(a float64, b float64) (float64, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	buf = pbAppendDouble(buf, 1, a)
 	buf = pbAppendDouble(buf, 2, b)
 	resp, err := invokeMethod(0, 0, buf)
@@ -2425,7 +2668,7 @@ func Add(a float64, b float64) (float64, error) {
 }
 
 func AggregateResults(values []float64) ([]*Result, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	for _, item := range values {
 		buf = pbAppendDouble(buf, 1, item)
 	}
@@ -2447,10 +2690,8 @@ func AggregateResults(values []float64) ([]*Result, error) {
 }
 
 func FormatResult(r *Result) (string, error) {
-	var buf []byte
-	if r != nil {
-		buf = pbAppendSubmessage(buf, 1, r.marshal())
-	}
+	buf := pbNewBuf()
+	buf = pbAppendSubmessagePtr(buf, 1, r)
 	resp, err := invokeMethod(0, 2, buf)
 	if err != nil {
 		return "", err
@@ -2461,10 +2702,8 @@ func FormatResult(r *Result) (string, error) {
 // Exercises the Logger callback end-to-end: invokes both virtuals on the
 // supplied logger and returns the level it reported.
 func RunWithLogger(logger LoggerNode, message string) (int32, error) {
-	var buf []byte
-	if logger != nil {
-		buf = pbAppendHandle(buf, 1, logger.rawPtr())
-	}
+	buf := pbNewBuf()
+	buf = pbAppendHandlePtr(buf, 1, logger)
 	buf = pbAppendString(buf, 2, message)
 	resp, err := invokeMethod(0, 3, buf)
 	if err != nil {
@@ -2474,7 +2713,7 @@ func RunWithLogger(logger LoggerNode, message string) (int32, error) {
 }
 
 func Version() (int32, error) {
-	var buf []byte
+	buf := pbNewBuf()
 	resp, err := invokeMethod(0, 4, buf)
 	if err != nil {
 		return 0, err

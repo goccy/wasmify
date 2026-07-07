@@ -206,7 +206,7 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 // resolveTypeName calls the C++ bridge to get the runtime type name of
 // the object at ptr. Returns a fully qualified C++ class name.
 func (m *Module) resolveTypeName(ptr uint64) (string, error) {
-	buf := pbAppendUint64(nil, 1, ptr)
+	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	reqPtr := wasm2go.WasmAlloc(m.g, int32(len(buf)))
