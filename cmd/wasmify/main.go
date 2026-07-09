@@ -735,6 +735,39 @@ func cmdClassify(args []string) error {
 	return nil
 }
 
+// hostCaptureInjectFlags returns the extra compile flags (as one shell-split
+// string) to inject into the capture build's C/C++ compiles when wasmify.json's
+// bridge config opts into host sockets/subprocess: the POSIX-compat stub
+// headers (sys/socket.h, netdb.h, ...) and, for subprocess, the host-subprocess
+// stub headers (spawn.h, sys/wait.h) plus the -DWASMIFY_HOST_* macros the stubs
+// gate their declarations on. Returns "" when neither capability is opted in.
+// Mirrors what cmdWasmBuild deploys, so both phases see the same declarations.
+func hostCaptureInjectFlags(dataDir, outDir string) string {
+	s, err := state.Load(outDir)
+	if err != nil || s == nil || s.Bridge == nil {
+		return ""
+	}
+	if !s.Bridge.HostSockets && !s.Bridge.HostSubprocess {
+		return ""
+	}
+	buildDir := filepath.Join(dataDir, "wasm-build")
+	var flags []string
+	if os.Getenv("WASMIFY_NO_POSIX_COMPAT") != "1" {
+		if compatDir, derr := wasmbuild.DeployPosixCompat(buildDir); derr == nil {
+			flags = append(flags, "-isystem", compatDir)
+		}
+	}
+	if s.Bridge.HostSubprocess {
+		if incDir, herr := wasmbuild.DeployHostSubprocessHeaders(buildDir); herr == nil {
+			flags = append(flags, "-isystem", incDir, "-DWASMIFY_HOST_SUBPROCESS")
+		}
+	}
+	if s.Bridge.HostSockets {
+		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
+	}
+	return strings.Join(flags, " ")
+}
+
 func cmdBuild(args []string) error {
 	// Split args at "--" so everything after it is the verbatim build command.
 	var buildCmd []string
@@ -804,6 +837,18 @@ func cmdBuild(args []string) error {
 			env[i] = fmt.Sprintf("PATH=%s:%s", wrapperDir, strings.TrimPrefix(e, "PATH="))
 			break
 		}
+	}
+
+	// Host-capability stub headers for the CAPTURE compile, driven by
+	// wasmify.json's bridge config. wasm-build injects the POSIX-compat +
+	// host-subprocess stubs on replay; the capture build needs the same
+	// declarations so the project's socket/subprocess code (e.g. sources
+	// compiled against netdb.h / sys/wait.h) compiles here too. The
+	// implementations are linked at wasm-build. The wrapper injects these into
+	// compile invocations only (see RunAsWrapper / WASMIFY_INJECT_COMPILE_FLAGS).
+	if inject := hostCaptureInjectFlags(dataDir, outDir); inject != "" {
+		env = append(env, "WASMIFY_INJECT_COMPILE_FLAGS="+inject)
+		fmt.Fprintf(os.Stderr, "[wasmify] Host-capability stub headers injected into capture compiles\n")
 	}
 
 	// Run build command
@@ -1303,6 +1348,14 @@ func cmdWasmBuild(args []string) error {
 		}
 	}
 
+	// Optional wasm-build knobs declared under wasmify.json's `wasm_build` key
+	// (independent of whether the project has a bridge).
+	if s, serr := state.Load(outDir); serr == nil && s != nil && s.WasmBuild != nil {
+		if s.WasmBuild.KeepSymbols {
+			cfg.KeepSymbols = true
+		}
+	}
+
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
 	// once per machine and reused across every project wasmify builds.
@@ -1548,12 +1601,16 @@ func cmdWasmBuild(args []string) error {
 		// into the wasm), and wasmify's host-capability shim objects when the
 		// matching capability is opted in. Library targets have no captured
 		// link step, so these are the only way those objects reach the wasm.
+		// Object names MUST match those inject_bridge assigns. Custom bridge
+		// sources and shims carry a wasmify_ prefix so their objects cannot
+		// collide with a project source of the same basename (e.g. a custom
+		// bridge foo.cc's object vs the project's own foo.o) — see inject_bridge.go.
 		extraNames := []string{"api_bridge.o", "custom_bridge.o"}
 		for _, src := range cfg.CustomBridgeSources {
 			base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
-			extraNames = append(extraNames, base+".o")
+			extraNames = append(extraNames, "wasmify_bridge_"+base+".o")
 		}
-		extraNames = append(extraNames, "host_sockets.o", "host_subprocess.o")
+		extraNames = append(extraNames, "wasmify_shim_host_sockets.o", "wasmify_shim_host_subprocess.o")
 		var extraObjects []string
 		for _, name := range extraNames {
 			obj := filepath.Join(cfg.BuildDir, "obj", name)

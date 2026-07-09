@@ -92,7 +92,13 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 	// resolve.
 	for _, src := range cfg.CustomBridgeSources {
 		base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
-		out := filepath.Join(cfg.BuildDir, "obj", base+".o")
+		// Prefix the object so a custom bridge source (e.g. foo.cc) can never
+		// collide with a PROJECT source of the same basename (foo.c) — both
+		// would otherwise derive obj/foo.o, and the later compile clobbers the
+		// earlier on disk. That corrupts the archive when order shifts and,
+		// worse, masks incremental recompiles: the bridge's obj/foo.o makes the
+		// build cache treat the project's own foo.o as already up to date.
+		out := filepath.Join(cfg.BuildDir, "obj", "wasmify_bridge_"+base+".o")
 		// Force C++ regardless of the source extension: a custom bridge is the
 		// C++ counterpart of api_bridge.cc (it bridges the same C++ API), and a
 		// project may name it `.c` while it uses C++ constructs.
@@ -117,7 +123,9 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 	// in the final wasm.
 	for _, shimSrc := range shimSrcs {
 		base := strings.TrimSuffix(filepath.Base(shimSrc), filepath.Ext(shimSrc))
-		shimOutput := filepath.Join(cfg.BuildDir, "obj", base+".o")
+		// Prefix as for custom bridge sources: a project source named e.g.
+		// host_sockets.c must not collide with the shim's obj/host_sockets.o.
+		shimOutput := filepath.Join(cfg.BuildDir, "obj", "wasmify_shim_"+base+".o")
 		shimStep := WasmBuildStep{
 			Type:       buildjson.StepCompile,
 			Executable: filepath.Join(cfg.WasiSDKPath, "bin", "clang++"),

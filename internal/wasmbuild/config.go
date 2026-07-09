@@ -21,6 +21,7 @@ type WasmConfig struct {
 	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
 	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
+	KeepSymbols         bool     // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
 }
 
 // DefaultConfig returns a WasmConfig with sensible defaults.

@@ -110,8 +110,8 @@ func TestInjectBridgeSteps_HostShims(t *testing.T) {
 		}
 	}
 
-	socketsObj := filepath.Join(tmpDir, "obj", "host_sockets.o")
-	subprocessObj := filepath.Join(tmpDir, "obj", "host_subprocess.o")
+	socketsObj := filepath.Join(tmpDir, "obj", "wasmify_shim_host_sockets.o")
+	subprocessObj := filepath.Join(tmpDir, "obj", "wasmify_shim_host_subprocess.o")
 
 	linkHasObj := func(steps []WasmBuildStep, obj string) bool {
 		for _, step := range steps {
@@ -191,7 +191,7 @@ func TestInjectBridgeSteps_CustomBridgeSources(t *testing.T) {
 
 	result := InjectBridgeSteps(steps, cfg, srcDir, nil)
 
-	customObj := filepath.Join(tmpDir, "obj", "py.o")
+	customObj := filepath.Join(tmpDir, "obj", "wasmify_bridge_py.o")
 
 	// The api_bridge compile must carry the project root on its include path so
 	// the generated dispatcher's project-relative includes resolve.

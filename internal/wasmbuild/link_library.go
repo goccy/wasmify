@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -14,30 +15,44 @@ import (
 // extraObjects are additional .o files to include (e.g., api_bridge.o).
 func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (string, error) {
 	libDir := filepath.Join(cfg.BuildDir, "lib")
-	entries, err := os.ReadDir(libDir)
-	if err != nil {
-		return "", fmt.Errorf("failed to read lib directory: %w", err)
-	}
 
+	// Archives are laid out under lib/ mirroring their source directories
+	// (target isolation, see rewriteOutputPath), so walk the tree recursively.
+	// A cc_library archive is recorded with either a `.a` or a `.lo`
+	// (libtool-style "library object") extension; both hold wasm32-wasip1 .o
+	// files after wasm-build replay, so pick up either.
 	var archives []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	err := filepath.WalkDir(libDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		// Bazel records cc_library archives with either `.a` or `.lo`
-		// (libtool-style "library object") extensions; both contain
-		// wasm32-wasip1 .o files after wasm-build replay. Pick up
-		// either so libraries that bazel ships exclusively in `.lo`
-		// form (e.g. some googlesql public types) end up linked into
-		// the final wasm.
-		name := e.Name()
-		if strings.HasSuffix(name, ".a") || strings.HasSuffix(name, ".lo") {
-			archives = append(archives, filepath.Join(libDir, name))
+		if d.IsDir() {
+			return nil
 		}
+		if strings.HasSuffix(path, ".a") || strings.HasSuffix(path, ".lo") {
+			archives = append(archives, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to walk lib directory: %w", err)
 	}
 	if len(archives) == 0 {
-		return "", fmt.Errorf("no .a/.lo archives found in %s", libDir)
+		return "", fmt.Errorf("no .a/.lo archives found under %s", libDir)
 	}
+	// Order archives by basename (full path breaks ties deterministically).
+	// wasm-ld pulls archive members to satisfy still-undefined symbols, so the
+	// order affects which members — and their transitive host imports — end up
+	// in the wasm. Keying on basename keeps that order stable against where an
+	// archive is nested under lib/ (target isolation), so the linked output is
+	// independent of the intermediate directory layout.
+	sort.Slice(archives, func(i, j int) bool {
+		bi, bj := filepath.Base(archives[i]), filepath.Base(archives[j])
+		if bi != bj {
+			return bi < bj
+		}
+		return archives[i] < archives[j]
+	})
 
 	outputFile := filepath.Join(cfg.BuildDir, "output", targetName+".wasm")
 	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {
@@ -62,6 +77,19 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	// the archive libraries are what pull the needed code in.
 	args = append(args, extraObjects...)
 	args = append(args, archives...)
+
+	// Resolve the LLVM SjLj runtime last. Code compiled with
+	// `-mllvm -wasm-enable-sjlj` lowers every setjmp/longjmp to calls into
+	// __wasm_setjmp / __wasm_longjmp / __wasm_setjmp_test, which live in the
+	// wasi-sysroot's libsetjmp.a (they implement the jump via wasm exception
+	// handling). Without -lsetjmp those stay UNDEFINED and the transpiler
+	// surfaces them as no-op host imports, so a longjmp silently falls through
+	// to the `unreachable` the compiler placed after it and traps at run time
+	// (this is how a guest's longjmp-based unwinding is realised at run time). -l is
+	// harmless when unreferenced: the linker only pulls archive members that
+	// something actually calls, so projects with no setjmp/longjmp are
+	// unaffected. It must come AFTER the archives that reference it.
+	args = append(args, "-lsetjmp")
 
 	fmt.Fprintf(os.Stderr, "[wasm-build] Linking library: %s (%d archives, %d extra objects)\n",
 		targetName+".wasm", len(archives), len(extraObjects))
