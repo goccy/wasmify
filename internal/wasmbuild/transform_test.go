@@ -629,31 +629,42 @@ func TestRewriteOutputPath_FallbackArchiveStructure(t *testing.T) {
 
 func TestRewriteInputPaths(t *testing.T) {
 	buildDir := "/build"
+	workDir, root := "", "" // build-sandbox layout: work dir not under project root
 	args := []string{
 		"-c",
-		"obj/main.o",
-		"lib/foo.a",
+		// A bazel per-target object whose basename collides across targets:
+		// rewriteOutputPath disambiguates it to obj/analyzer_<suffix>.o, so the
+		// archive MUST reference that same suffixed path, not a flat obj/analyzer.o
+		// that nothing wrote (the regression that broke libanalyzer.a).
+		"bazel-out/darwin_arm64-opt/bin/googlesql/public/_objs/analyzer/analyzer.o",
+		"bazel-out/darwin_arm64-opt/bin/googlesql/public/libtype.a",
 		"some.lo",
 		"-I/usr/include",
 	}
-	result := rewriteInputPaths(args, buildDir)
-	// Flags preserved
+	result := rewriteInputPaths(args, buildDir, workDir, root)
+	// Flags preserved.
 	if result[0] != "-c" {
 		t.Errorf("expected -c preserved, got %q", result[0])
 	}
 	if result[4] != "-I/usr/include" {
 		t.Errorf("expected flag preserved, got %q", result[4])
 	}
-	// .o / .a / .lo refs are mapped onto the flat build dir by basename;
-	// resolveObjectRefs later re-points them to the actual (nested) outputs.
-	if result[1] != filepath.Join(buildDir, "obj", "main.o") {
-		t.Errorf("got %q for .o, want %s/obj/main.o", result[1], buildDir)
+	// .o / .a / .lo refs must get the SAME collision-safe path rewriteOutputPath
+	// gives the producing compile/archive OUTPUT, so archive inputs resolve to
+	// files that were actually written.
+	if want := rewriteOutputPath(args[1], buildDir, "obj", workDir, root); result[1] != want {
+		t.Errorf("got %q for .o, want %q (must match the compile output)", result[1], want)
 	}
-	if result[2] != filepath.Join(buildDir, "lib", "foo.a") {
-		t.Errorf("got %q for .a, want %s/lib/foo.a", result[2], buildDir)
+	if want := rewriteOutputPath(args[2], buildDir, "lib", workDir, root); result[2] != want {
+		t.Errorf("got %q for .a, want %q", result[2], want)
 	}
-	if result[3] != filepath.Join(buildDir, "lib", "some.lo") {
-		t.Errorf("got %q for .lo, want %s/lib/some.lo", result[3], buildDir)
+	if want := rewriteOutputPath(args[3], buildDir, "lib", workDir, root); result[3] != want {
+		t.Errorf("got %q for .lo, want %q", result[3], want)
+	}
+	// Guard the specific regression: the colliding .o must NOT collapse to a
+	// bare flat path.
+	if result[1] == filepath.Join(buildDir, "obj", "analyzer.o") {
+		t.Errorf("colliding .o collapsed to flat %q — archive would reference an object that was never written", result[1])
 	}
 }
 
@@ -858,6 +869,72 @@ func TestTransformArchiveStep(t *testing.T) {
 	if len(result.Args) >= 2 && result.Args[0] == "rcs" {
 		if !strings.HasPrefix(result.Args[1], "/build/lib/") {
 			t.Errorf("expected archive name updated, got args: %v", result.Args)
+		}
+	}
+}
+
+// TestTransformSteps_ArchiveResolvesCollidingObject reproduces the libanalyzer.a
+// failure: a bazel per-target object whose basename is disambiguated on OUTPUT
+// (analyzer.o → obj/analyzer_<suffix>.o) must still be referenced by the archive
+// that consumes it at that same suffixed path. The v0.4.6 regression rewrote
+// archive inputs to a flat obj/analyzer.o that nothing wrote, so `llvm-ar`
+// failed with "obj/analyzer.o: No such file".
+func TestTransformSteps_ArchiveResolvesCollidingObject(t *testing.T) {
+	cfg := WasmConfig{WasiSDKPath: "/opt/wasi-sdk", BuildDir: "/build"}
+	const objDir = "bazel-out/darwin_arm64-opt/bin/googlesql/public/_objs/analyzer/"
+	objPath := objDir + "analyzer.o"
+	// A SECOND object in the same archive/work dir. With more than one produced
+	// object the "exactly one unreferenced output" orphan heuristic in
+	// resolveObjectRefs can no longer paper over a mismatched input path, so the
+	// archive genuinely needs each input rewritten to its real (suffixed) output.
+	obj2Path := objDir + "table_name_resolver.o"
+	steps := []buildjson.BuildStep{
+		{
+			Type: buildjson.StepCompile, Compiler: "clang++", Language: "c++",
+			Args:       []string{"-c", "-o", objPath, "googlesql/public/analyzer.cc"},
+			OutputFile: objPath,
+		},
+		{
+			Type: buildjson.StepCompile, Compiler: "clang++", Language: "c++",
+			Args:       []string{"-c", "-o", obj2Path, "googlesql/public/table_name_resolver.cc"},
+			OutputFile: obj2Path,
+		},
+		{
+			Type:       buildjson.StepArchive,
+			Args:       []string{"rcsD", "bazel-out/darwin_arm64-opt/bin/googlesql/public/libanalyzer.a", objPath, obj2Path},
+			OutputFile: "bazel-out/darwin_arm64-opt/bin/googlesql/public/libanalyzer.a",
+		},
+	}
+	result := TransformSteps(steps, cfg)
+
+	// Every compile output must be an object the archive actually references.
+	var compileOuts []string
+	var archive WasmBuildStep
+	for _, s := range result {
+		switch s.Type {
+		case buildjson.StepCompile:
+			if !strings.HasPrefix(s.OutputFile, "/build/obj/") {
+				t.Fatalf("compile output not under /build/obj/: %q", s.OutputFile)
+			}
+			compileOuts = append(compileOuts, s.OutputFile)
+		case buildjson.StepArchive:
+			archive = s
+		}
+	}
+	argSet := map[string]bool{}
+	for _, a := range archive.Args {
+		argSet[a] = true
+	}
+	// The flat names nothing wrote must not appear (the regression symptom).
+	for _, flat := range []string{"/build/obj/analyzer.o", "/build/obj/table_name_resolver.o"} {
+		if argSet[flat] {
+			t.Errorf("archive references flat %q, which no compile step wrote", flat)
+		}
+	}
+	// Each produced object must be referenced at its real (suffixed) path.
+	for _, out := range compileOuts {
+		if !argSet[out] {
+			t.Errorf("archive does not reference produced object %q; args=%v", out, archive.Args)
 		}
 	}
 }
