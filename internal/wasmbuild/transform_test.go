@@ -939,6 +939,52 @@ func TestTransformSteps_ArchiveResolvesCollidingObject(t *testing.T) {
 	}
 }
 
+// TestTransformSteps_PerlStyleCollidingDirs models perl-wasm's multi-directory
+// build: two ext/ modules each compile a same-basename object in their OWN work
+// dir (under the project root, so target isolation namespaces them by subdir)
+// and archive it locally. Each archive must reference its own object, not the
+// other module's — the collision case the target-isolation work (#24) added.
+func TestTransformSteps_PerlStyleCollidingDirs(t *testing.T) {
+	const root = "/src/perl"
+	cfg := WasmConfig{WasiSDKPath: "/opt/wasi-sdk", BuildDir: "/wb", ProjectRoot: root}
+	steps := []buildjson.BuildStep{
+		{Type: buildjson.StepCompile, Compiler: "cc", Language: "c", WorkDir: root + "/ext/A",
+			Args: []string{"-c", "-o", "Mod.o", "Mod.c"}, OutputFile: "Mod.o"},
+		{Type: buildjson.StepArchive, WorkDir: root + "/ext/A",
+			Args: []string{"cr", "Mod.a", "Mod.o"}, OutputFile: "Mod.a"},
+		{Type: buildjson.StepCompile, Compiler: "cc", Language: "c", WorkDir: root + "/ext/B",
+			Args: []string{"-c", "-o", "Mod.o", "Mod.c"}, OutputFile: "Mod.o"},
+		{Type: buildjson.StepArchive, WorkDir: root + "/ext/B",
+			Args: []string{"cr", "Mod.a", "Mod.o"}, OutputFile: "Mod.a"},
+	}
+	result := TransformSteps(steps, cfg)
+
+	produced := map[string]bool{}
+	byWD := map[string]string{} // archive workDir → its Mod.o arg
+	for _, s := range result {
+		switch s.Type {
+		case buildjson.StepCompile:
+			produced[s.OutputFile] = true
+		case buildjson.StepArchive:
+			for _, a := range s.Args {
+				if strings.HasSuffix(a, "Mod.o") {
+					byWD[s.WorkDir] = a
+				}
+			}
+		}
+	}
+	// Namespaced by subdir — distinct paths, both actually produced.
+	if a := byWD[root+"/ext/A"]; a != "/wb/obj/ext/A/Mod.o" || !produced[a] {
+		t.Errorf("ext/A archive references %q (produced=%v), want /wb/obj/ext/A/Mod.o", a, produced[a])
+	}
+	if b := byWD[root+"/ext/B"]; b != "/wb/obj/ext/B/Mod.o" || !produced[b] {
+		t.Errorf("ext/B archive references %q (produced=%v), want /wb/obj/ext/B/Mod.o", b, produced[b])
+	}
+	if byWD[root+"/ext/A"] == byWD[root+"/ext/B"] {
+		t.Error("the two modules' Mod.o collided — target isolation lost")
+	}
+}
+
 func TestTransformSteps_Unsupported(t *testing.T) {
 	cfg := WasmConfig{
 		WasiSDKPath: "/opt/wasi-sdk",
