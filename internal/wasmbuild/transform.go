@@ -322,7 +322,7 @@ func transformLinkStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
 	args = replaceOutputArg(args, outputFile)
 
 	// Rewrite input .o and .a paths
-	args = rewriteInputPaths(args, cfg.BuildDir)
+	args = rewriteInputPaths(args, cfg.BuildDir, step.WorkDir, cfg.ProjectRoot)
 
 	return WasmBuildStep{
 		Type:       buildjson.StepLink,
@@ -405,7 +405,7 @@ func transformArchiveStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildSte
 	if len(args) >= 2 && isArOperation(args[0]) {
 		args[1] = outputFile
 	}
-	args = rewriteInputPaths(args, cfg.BuildDir)
+	args = rewriteInputPaths(args, cfg.BuildDir, step.WorkDir, cfg.ProjectRoot)
 
 	return WasmBuildStep{
 		Type:       buildjson.StepArchive,
@@ -1101,7 +1101,17 @@ func collectInputFiles(args []string) []string {
 // can't nest correctly on its own because an archive/link may reference an
 // object built in a different work dir (e.g. a top-level libcore.a pulling in
 // a plugin.o compiled under a plugins/ subdir).
-func rewriteInputPaths(args []string, buildDir string) []string {
+// rewriteInputPaths re-points the .o / .a / .lo operands of an archive or link
+// command onto the wasm build tree. It must apply the SAME collision-safe
+// naming that rewriteOutputPath gave the corresponding compile/archive OUTPUT —
+// otherwise an input that was disambiguated on output (target-isolation
+// namespace subdir, or the `<stem>_<suffix>.o` collision suffix) is referenced
+// here under a bare `obj/<base>` path that nothing ever wrote, and the archive
+// fails with "<obj>: No such file". Passing the step's own workDir/projectRoot
+// makes the reference reproduce the producer's path, because the archive that
+// consumes an object runs in the same work dir as the compile that produced it.
+// resolveObjectRefs is the later safety net for genuine cross-work-dir refs.
+func rewriteInputPaths(args []string, buildDir, workDir, projectRoot string) []string {
 	result := make([]string, len(args))
 	for i, arg := range args {
 		if strings.HasPrefix(arg, "-") {
@@ -1110,9 +1120,9 @@ func rewriteInputPaths(args []string, buildDir string) []string {
 		}
 		switch strings.ToLower(filepath.Ext(arg)) {
 		case ".o":
-			result[i] = filepath.Join(buildDir, "obj", filepath.Base(arg))
+			result[i] = rewriteOutputPath(arg, buildDir, "obj", workDir, projectRoot)
 		case ".a", ".lo":
-			result[i] = filepath.Join(buildDir, "lib", filepath.Base(arg))
+			result[i] = rewriteOutputPath(arg, buildDir, "lib", workDir, projectRoot)
 		default:
 			result[i] = arg
 		}
