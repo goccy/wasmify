@@ -41,6 +41,7 @@ type State struct {
 	Output     *Output           `json:"output,omitempty"`
 	Selection  *Selection        `json:"user_selection,omitempty"`
 	Bridge     *BridgeConfig     `json:"bridge,omitempty"`
+	WasmBuild  *WasmBuildConfig  `json:"wasm_build,omitempty"`
 	Skip       *SkipConfig       `json:"skip,omitempty"`
 	Phases     map[string]*Phase `json:"phases,omitempty"`
 	AnalyzedAt string            `json:"analyzed_at,omitempty"`
@@ -203,6 +204,18 @@ func (s Selection) MarshalJSON() ([]byte, error) {
 // is injected via this struct so the generator core stays library-
 // agnostic.
 //
+// WasmBuildConfig holds wasm-target build knobs that must be declared per
+// project (as opposed to flags wasmify applies unconditionally because they
+// are harmless when unused, e.g. -lsetjmp / -fno-strict-aliasing). It lives
+// under the `wasm_build` key of wasmify.json.
+type WasmBuildConfig struct {
+	// KeepSymbols, when true, omits `-Wl,--strip-all` from the final link so
+	// the wasm keeps its name section. The default (false) strips, producing a
+	// smaller shipping wasm; enable this when a function-name ↔ symbol mapping
+	// is needed for debugging or symbolication.
+	KeepSymbols bool `json:"keep_symbols,omitempty"`
+}
+
 // Previously serialised as bridge-config.json; now lives under the
 // `bridge` key of wasmify.json.
 type BridgeConfig struct {

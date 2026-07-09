@@ -110,8 +110,8 @@ func TestInjectBridgeSteps_HostShims(t *testing.T) {
 		}
 	}
 
-	socketsObj := filepath.Join(tmpDir, "obj", "host_sockets.o")
-	subprocessObj := filepath.Join(tmpDir, "obj", "host_subprocess.o")
+	socketsObj := filepath.Join(tmpDir, "obj", "wasmify_shim_host_sockets.o")
+	subprocessObj := filepath.Join(tmpDir, "obj", "wasmify_shim_host_subprocess.o")
 
 	linkHasObj := func(steps []WasmBuildStep, obj string) bool {
 		for _, step := range steps {
@@ -191,7 +191,7 @@ func TestInjectBridgeSteps_CustomBridgeSources(t *testing.T) {
 
 	result := InjectBridgeSteps(steps, cfg, srcDir, nil)
 
-	customObj := filepath.Join(tmpDir, "obj", "py.o")
+	customObj := filepath.Join(tmpDir, "obj", "wasmify_bridge_py.o")
 
 	// The api_bridge compile must carry the project root on its include path so
 	// the generated dispatcher's project-relative includes resolve.
@@ -335,12 +335,14 @@ func TestWasmLinkFlagsIncludesStackSize(t *testing.T) {
 
 func TestAppendExtraLDFlags(t *testing.T) {
 	t.Setenv("WASMIFY_EXTRA_LDFLAGS", "-Wl,--wrap=socket -Wl,--wrap=connect")
+	var cfg WasmConfig
+	cfg.ApplyEnvOverrides()
 	steps := []WasmBuildStep{
 		{ID: 1, Type: buildjson.StepCompile, Args: []string{"-c", "a.c"}},
 		{ID: 2, Type: buildjson.StepLink, Args: []string{"-o", "out.wasm", "a.o"}},
 		{ID: 3, Type: buildjson.StepLink, Args: []string{"-o", "skip.wasm"}, Skipped: true},
 	}
-	got := appendExtraLDFlags(steps)
+	got := appendExtraLDFlags(steps, cfg)
 	// Compile step untouched.
 	if len(got[0].Args) != 2 {
 		t.Errorf("compile step args changed: %v", got[0].Args)
@@ -404,9 +406,11 @@ func TestBuildBridgeCompileArgsHostSubprocess(t *testing.T) {
 	}
 }
 
-func TestExtraBridgeIncludes(t *testing.T) {
+func TestApplyEnvOverridesBridgeIncludes(t *testing.T) {
 	t.Setenv("WASMIFY_BRIDGE_EXTRA_INCLUDES", "/work:/work/embed::/x")
-	got := extraBridgeIncludes()
+	var cfg WasmConfig
+	cfg.ApplyEnvOverrides()
+	got := cfg.BridgeExtraIncludes
 	want := []string{"/work", "/work/embed", "/x"} // empty segments dropped
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -417,18 +421,25 @@ func TestExtraBridgeIncludes(t *testing.T) {
 		}
 	}
 	t.Setenv("WASMIFY_BRIDGE_EXTRA_INCLUDES", "")
-	if got := extraBridgeIncludes(); got != nil {
-		t.Fatalf("empty env should yield nil, got %v", got)
+	var empty WasmConfig
+	empty.ApplyEnvOverrides()
+	if empty.BridgeExtraIncludes != nil {
+		t.Fatalf("empty env should yield nil, got %v", empty.BridgeExtraIncludes)
 	}
 }
 
-func TestEmscriptenDefineDisabled(t *testing.T) {
-	t.Setenv("WASMIFY_NO_EMSCRIPTEN_DEFINE", "1")
-	if !emscriptenDefineDisabled() {
-		t.Fatal("expected true when WASMIFY_NO_EMSCRIPTEN_DEFINE=1")
+func TestApplyEnvOverridesEmscriptenDefine(t *testing.T) {
+	// Presence — any non-empty value — enables the opt-out (not just "1").
+	t.Setenv("WASMIFY_NO_EMSCRIPTEN_DEFINE", "true")
+	var cfg WasmConfig
+	cfg.ApplyEnvOverrides()
+	if !cfg.NoEmscriptenDefine {
+		t.Fatal("expected NoEmscriptenDefine when WASMIFY_NO_EMSCRIPTEN_DEFINE is set")
 	}
 	t.Setenv("WASMIFY_NO_EMSCRIPTEN_DEFINE", "")
-	if emscriptenDefineDisabled() {
-		t.Fatal("expected false when unset")
+	var unset WasmConfig
+	unset.ApplyEnvOverrides()
+	if unset.NoEmscriptenDefine {
+		t.Fatal("expected NoEmscriptenDefine false when unset")
 	}
 }

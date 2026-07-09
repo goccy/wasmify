@@ -10,9 +10,11 @@ import (
 )
 
 // TransformSteps converts all native build steps to wasm32-wasi equivalents.
-// After the initial transform, it resolves output filename collisions
-// (e.g., multiple bazel targets producing different arena.o files) by
-// appending a short hash suffix to colliding names.
+// Outputs are laid out under obj//lib/ mirroring each step's source directory
+// (see rewriteOutputPath), so same-basename objects/archives from different
+// source trees never collide. resolveObjectRefs then re-points every object/
+// archive reference in archive and link steps to the actual (nested) output
+// that produced it.
 func TransformSteps(steps []buildjson.BuildStep, cfg WasmConfig) []WasmBuildStep {
 	steps = dropPICDuplicateSteps(steps)
 	var result []WasmBuildStep
@@ -30,7 +32,7 @@ func TransformSteps(steps []buildjson.BuildStep, cfg WasmConfig) []WasmBuildStep
 		}
 		result = append(result, ws)
 	}
-	resolveOutputCollisions(result)
+	resolveObjectRefs(result)
 	scrubPersistedSkips(result)
 	return result
 }
@@ -165,100 +167,87 @@ func scrubPersistedSkips(steps []WasmBuildStep) {
 	}
 }
 
-// resolveOutputCollisions detects when multiple compile steps produce the
-// same output basename (e.g., obj/arena.o) from different source files,
-// and renames the colliding outputs to obj/arena_<hash>.o. Archive steps
-// that reference the old name are updated to use the new name.
-func resolveOutputCollisions(steps []WasmBuildStep) {
-	// First pass: find collisions among compile step outputs
-	seen := make(map[string]int) // output path → first step index
-	renames := make(map[int]string) // step index → new output path
-
+// resolveObjectRefs re-points every .o / .a / .lo reference in archive and link
+// steps to the ACTUAL output that produced it. Outputs are laid out under
+// obj//lib/ mirroring their source directory (rewriteOutputPath), but a step
+// may reference an object/archive built in a DIFFERENT work dir — e.g. a
+// top-level libcore.a (archived in the project root) pulling in a plugin.o
+// compiled under a plugins/ subdir — so a reference cannot be nested from the
+// REFERENCING step's work dir alone. Resolve each through a basename →
+// produced-output registry; when a basename was produced by more than one work
+// dir (two compress.o), pick the output whose producing work dir matches the
+// referencing step's.
+func resolveObjectRefs(steps []WasmBuildStep) {
+	type produced struct{ workDir, path string }
+	reg := map[string][]produced{}
+	compileOutByWD := map[string][]string{} // work dir → compile output paths
+	referenced := map[string]bool{}         // basenames referenced by archive/link steps
 	for i := range steps {
 		s := &steps[i]
-		if s.Type != "compile" || s.OutputFile == "" {
-			continue
+		if (s.Type == buildjson.StepCompile || s.Type == buildjson.StepArchive) && s.OutputFile != "" {
+			b := filepath.Base(s.OutputFile)
+			reg[b] = append(reg[b], produced{s.WorkDir, s.OutputFile})
 		}
-		if prevIdx, exists := seen[s.OutputFile]; exists {
-			// Collision! Rename the current step's output.
-			// Use the original bazel output path to generate a unique suffix.
-			origPath := ""
-			for _, arg := range s.Args {
-				if strings.HasSuffix(arg, ".cc") || strings.HasSuffix(arg, ".c") {
-					origPath = arg
-					break
+		if s.Type == buildjson.StepCompile && s.OutputFile != "" {
+			compileOutByWD[s.WorkDir] = append(compileOutByWD[s.WorkDir], s.OutputFile)
+		}
+		if s.Type == buildjson.StepArchive || s.Type == buildjson.StepLink {
+			for _, a := range s.Args {
+				if !strings.HasPrefix(a, "-") && strings.ToLower(filepath.Ext(a)) == ".o" {
+					referenced[filepath.Base(a)] = true
 				}
 			}
-			if origPath == "" {
-				origPath = s.OutputFile + "_" + strings.Repeat("x", i)
-			}
-
-			// Also rename the first occurrence if not already renamed
-			if _, firstRenamed := renames[prevIdx]; !firstRenamed {
-				prevOrig := ""
-				for _, arg := range steps[prevIdx].Args {
-					if strings.HasSuffix(arg, ".cc") || strings.HasSuffix(arg, ".c") {
-						prevOrig = arg
-						break
+		}
+	}
+	resolve := func(arg, workDir string) string {
+		cands := reg[filepath.Base(arg)]
+		switch len(cands) {
+		case 1:
+			return cands[0].path
+		default:
+			if len(cands) > 1 {
+				for _, c := range cands {
+					if c.workDir == workDir {
+						return c.path
 					}
 				}
-				if prevOrig != "" {
-					newName := uniqueOutputName(s.OutputFile, prevOrig)
-					renames[prevIdx] = newName
+				return cands[0].path // best effort when no same-work-dir producer
+			}
+		}
+		// No producer for this basename. Some build systems rename an object
+		// after compiling it via a shell step wasmify does not wrap — e.g.
+		// MakeMaker compiles FooBar.c to FooBar.o and then `mv FooBar.o Bar.o`,
+		// so the archive references Bar.o but only FooBar.o was recorded. If the
+		// referencing work dir has exactly ONE compile output that no archive/
+		// link references, it is that renamed-away object; resolve to it.
+		if strings.ToLower(filepath.Ext(arg)) == ".o" {
+			var orphans []string
+			for _, out := range compileOutByWD[workDir] {
+				if !referenced[filepath.Base(out)] {
+					orphans = append(orphans, out)
 				}
 			}
-
-			newName := uniqueOutputName(s.OutputFile, origPath)
-			renames[i] = newName
-		} else {
-			seen[s.OutputFile] = i
+			if len(orphans) == 1 {
+				return orphans[0]
+			}
 		}
+		return arg // external/system library, or ambiguous — leave as-is
 	}
-
-	if len(renames) == 0 {
-		return
-	}
-
-	// Build old→new mapping for archive step fixup
-	oldToNew := make(map[string]string)
-	for idx, newPath := range renames {
-		oldPath := steps[idx].OutputFile
-		oldToNew[oldPath] = newPath
-		steps[idx].OutputFile = newPath
-		steps[idx].Args = replaceOutputArg(steps[idx].Args, newPath)
-	}
-
-	// Fix up archive steps that reference renamed .o files
 	for i := range steps {
-		if steps[i].Type != "archive" {
+		s := &steps[i]
+		if s.Type != buildjson.StepArchive && s.Type != buildjson.StepLink {
 			continue
 		}
-		for j, arg := range steps[i].Args {
-			if newPath, ok := oldToNew[arg]; ok {
-				steps[i].Args[j] = newPath
+		for j, arg := range s.Args {
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			switch strings.ToLower(filepath.Ext(arg)) {
+			case ".o", ".a", ".lo":
+				s.Args[j] = resolve(arg, s.WorkDir)
 			}
 		}
 	}
-}
-
-// uniqueOutputName generates a collision-free output name by inserting a
-// short hash of the source path before the extension.
-// E.g., obj/arena.o + "mylib/base/arena.cc" → obj/arena_a3f2.o
-func uniqueOutputName(outputPath, sourcePath string) string {
-	ext := filepath.Ext(outputPath)
-	base := strings.TrimSuffix(outputPath, ext)
-	// Use first 8 chars of hex-encoded hash of source path
-	h := uint32(0)
-	for _, b := range []byte(sourcePath) {
-		h = h*31 + uint32(b)
-	}
-	suffix := strings.ToLower(strings.ReplaceAll(
-		strings.ReplaceAll(filepath.Base(filepath.Dir(sourcePath)), "/", "_"),
-		"~", ""))
-	if len(suffix) > 12 {
-		suffix = suffix[:12]
-	}
-	return base + "_" + suffix + ext
 }
 
 func transformStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
@@ -287,11 +276,20 @@ func transformCompileStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildSte
 	args := filterCompileFlags(step.Args)
 	args = append(args, wasmCompileFlags(cfg)...)
 
-	// Rewrite output path
-	outputFile := rewriteOutputPath(step.OutputFile, cfg.BuildDir, "obj")
+	// Rewrite output path. Some build systems compile with an IMPLICIT object
+	// output — e.g. a hand-written Makefile runs `cc -c foo.c`, which defaults
+	// the object to foo.o in the work dir — so step.OutputFile is empty. Derive
+	// the object name from the source in that case; otherwise the object lands
+	// in the work dir while the ARCHIVE step's inputs ARE rewritten into obj/,
+	// and the archive fails with "foo.o: No such file".
+	origOutput := step.OutputFile
+	if origOutput == "" {
+		origOutput = deriveObjectOutput(step.Args)
+	}
+	outputFile := rewriteOutputPath(origOutput, cfg.BuildDir, "obj", step.WorkDir, cfg.ProjectRoot)
 
-	// Replace -o argument
-	args = replaceOutputArg(args, outputFile)
+	// Set -o to the obj/ path, ADDING it when the original compile had none.
+	args = ensureOutputArg(args, outputFile)
 
 	return WasmBuildStep{
 		Type:       buildjson.StepCompile,
@@ -317,7 +315,7 @@ func transformLinkStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
 	}
 
 	// Rewrite output path
-	outputFile := rewriteOutputPath(origOutput, cfg.BuildDir, "output")
+	outputFile := rewriteOutputPath(origOutput, cfg.BuildDir, "output", step.WorkDir, cfg.ProjectRoot)
 	if outputFile != "" && !strings.HasSuffix(outputFile, ".wasm") {
 		outputFile += ".wasm"
 	}
@@ -381,6 +379,15 @@ func extractOutputFromArgs(args []string) string {
 }
 
 func transformArchiveStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
+	// ranlib (index-only) is a distinct tool from ar. Some Makefiles run
+	// `ar rc libfoo.a *.o` and then `ranlib libfoo.a` as SEPARATE steps, and
+	// normalize.go classifies both as archive. Route ranlib to llvm-ranlib —
+	// feeding its lone archive operand to llvm-ar just prints ar's usage and
+	// fails.
+	if filepath.Base(step.Compiler) == "ranlib" {
+		return transformRanlibStep(step, cfg)
+	}
+
 	archiver := filepath.Join(cfg.WasiSDKPath, "bin", "llvm-ar")
 	args := expandResponseFiles(step.Args, step.WorkDir)
 	args, extractedOutput := convertLibtoolToAr(args)
@@ -391,10 +398,11 @@ func transformArchiveStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildSte
 		origOutput = extractedOutput
 	}
 
-	outputFile := rewriteOutputPath(origOutput, cfg.BuildDir, "lib")
-	// For llvm-ar, the archive name is positional (args[1] after "rcs").
-	// Replace it directly instead of using replaceOutputArg which looks for -o.
-	if len(args) >= 2 && args[0] == "rcs" {
+	outputFile := rewriteOutputPath(origOutput, cfg.BuildDir, "lib", step.WorkDir, cfg.ProjectRoot)
+	// For llvm-ar, the archive name is positional, right after the operation
+	// word (rc / rcs / cr / crus / ...). Some projects use `ar rc`, not the
+	// previously hard-coded "rcs", so match any ar operation word.
+	if len(args) >= 2 && isArOperation(args[0]) {
 		args[1] = outputFile
 	}
 	args = rewriteInputPaths(args, cfg.BuildDir)
@@ -407,6 +415,52 @@ func transformArchiveStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildSte
 		OutputFile: outputFile,
 		InputFiles: collectInputFiles(args),
 	}
+}
+
+// transformRanlibStep maps a `ranlib <archive>` step onto llvm-ranlib, pointing
+// it at the archive where the ar step wrote it (lib/). An empty index pass is
+// harmless, so this need not be skipped even when llvm-ar already wrote a
+// symbol table.
+func transformRanlibStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
+	ranlib := filepath.Join(cfg.WasiSDKPath, "bin", "llvm-ranlib")
+	args := make([]string, len(step.Args))
+	copy(args, step.Args)
+	outputFile := ""
+	for i, a := range args {
+		if strings.HasSuffix(strings.ToLower(a), ".a") {
+			args[i] = rewriteOutputPath(a, cfg.BuildDir, "lib", step.WorkDir, cfg.ProjectRoot)
+			outputFile = args[i]
+		}
+	}
+	return WasmBuildStep{
+		Type:       buildjson.StepArchive,
+		Executable: ranlib,
+		Args:       args,
+		WorkDir:    step.WorkDir,
+		OutputFile: outputFile,
+	}
+}
+
+// isArOperation reports whether an argument is an ar operation word — the
+// leading positional key like "rc", "rcs", "cr", "crus", "q", "t". It is a
+// non-flag token (no leading '-') composed solely of ar operation/modifier
+// letters, with at least one of the operations r/c/q/d/m/p/s/t/x present.
+func isArOperation(arg string) bool {
+	if arg == "" || strings.HasPrefix(arg, "-") {
+		return false
+	}
+	hasOp := false
+	for _, c := range arg {
+		switch c {
+		case 'r', 'c', 'q', 'd', 'm', 'p', 's', 't', 'x':
+			hasOp = true
+		case 'u', 'v', 'a', 'b', 'i', 'o', 'l', 'N', 'P', 'T', 'D', 'U', 'S':
+			// modifiers — allowed, but not sufficient on their own
+		default:
+			return false
+		}
+	}
+	return hasOp
 }
 
 // expandResponseFiles expands @file arguments by reading the file contents
@@ -696,13 +750,6 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 }
 
 // wasmCompileFlags returns the flags to add for wasm compilation.
-// emscriptenDefineDisabled reports whether the build opted out of the
-// implicit -D__EMSCRIPTEN__ (set by wasi-native projects that have real
-// __EMSCRIPTEN__ code paths). Controlled by WASMIFY_NO_EMSCRIPTEN_DEFINE=1.
-func emscriptenDefineDisabled() bool {
-	return os.Getenv("WASMIFY_NO_EMSCRIPTEN_DEFINE") == "1"
-}
-
 func wasmCompileFlags(cfg WasmConfig) []string {
 	var flags []string
 	if cfg.PosixCompatDir != "" {
@@ -713,11 +760,10 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	// bridge), so the upstream's own sources enable the matching feature at
 	// wasm-build only. The upstream's separate (host-arch-equivalent) make phase
 	// never sees these, so it stays plain and needs none of the extra headers.
-	hostSockets, hostSubprocess := hostShimFlags(cfg)
-	if hostSockets {
+	if cfg.HostSockets {
 		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
 	}
-	if hostSubprocess {
+	if cfg.HostSubprocess {
 		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
 		if cfg.HostIncludeDir != "" {
 			// Carries spawn.h/sys/wait.h that wasi-libc omits; gated behind the
@@ -734,9 +780,10 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	// that guard wasm compatibility behind this macro. It is HARMFUL for
 	// projects that natively support wasm32-wasi and have real
 	// `#ifdef __EMSCRIPTEN__` branches (e.g. a source file includes
-	// <emscripten/stack.h> under it). Such wasi-native projects set
-	// WASMIFY_NO_EMSCRIPTEN_DEFINE=1 to keep their wasi code paths.
-	if !emscriptenDefineDisabled() {
+	// <emscripten/stack.h> under it). Such wasi-native projects set the
+	// NoEmscriptenDefine option (also settable via WASMIFY_NO_EMSCRIPTEN_DEFINE)
+	// to keep their wasi code paths.
+	if !cfg.NoEmscriptenDefine {
 		flags = append(flags, "-D__EMSCRIPTEN__")
 	}
 	flags = append(flags,
@@ -744,6 +791,20 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		"-D_WASI_EMULATED_PROCESS_CLOCKS",
 		"-D_WASI_EMULATED_MMAN",
 		"-mllvm", "-wasm-enable-sjlj",
+		// Disable type-based-alias-analysis (TBAA) optimizations. This is a
+		// conservative correctness flag: it can only PREVENT miscompiles, never
+		// introduce them, at the cost of a little optimization on
+		// aliasing-heavy code. Many mature C/C++ codebases type-pun pointers in
+		// ways that technically violate C's strict-aliasing rule — treating a
+		// family of distinct struct pointer types as interchangeable, e.g.
+		// `p = (A**)&b; *p` where the slot holds a `B*` — and such projects MUST
+		// be built with this flag; their own build systems routinely add it for
+		// gcc/clang. Without it, at -O2+/-Oz TBAA lets Dead-Store-Elimination
+		// delete a store it wrongly proves non-aliasing (e.g. the write that
+		// initialises a stack slot whose address is later read back through a
+		// differently-typed pointer), producing wrong code. Applying it to every
+		// wasm compile keeps the output faithful to what these projects expect.
+		"-fno-strict-aliasing",
 		// Force size-optimal codegen on every per-file compile. The
 		// native build (Bazel etc.) usually compiles with -O2;
 		// transformCompileStep concatenates wasmCompileFlags AFTER
@@ -777,8 +838,13 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 		"-Wl,--export=wasm_init",
 		"-Wl,--export=_initialize",
 		"-Wl,--gc-sections",
-		"-Wl,--strip-all",
 	)
+	// Strip the name section for a smaller shipping wasm, unless the project
+	// opted to keep symbols (wasmify.json wasm_build.keep_symbols) for
+	// debugging / symbolication.
+	if !cfg.KeepSymbols {
+		flags = append(flags, "-Wl,--strip-all")
+	}
 	if cfg.AllowUndefined {
 		flags = append(flags, "-Wl,--allow-undefined")
 	}
@@ -808,7 +874,7 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 // idempotency guard the second pass would re-disambiguate the already-
 // disambiguated archive name and append a spurious `__lib` suffix
 // (e.g. `libtype__public.a` -> `libtype__public__lib.a`).
-func rewriteOutputPath(originalPath, buildDir, subdir string) string {
+func rewriteOutputPath(originalPath, buildDir, subdir, workDir, projectRoot string) string {
 	if originalPath == "" {
 		return ""
 	}
@@ -818,6 +884,20 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 	}
 	base := filepath.Base(originalPath)
 	ext := filepath.Ext(base)
+	// Target isolation: when the step ran in a work dir that lives under the
+	// project root, mirror that directory under obj//lib/. Two source trees
+	// that produce the same object/archive basename (e.g. a compress.c in each
+	// of two codec dirs, or a Util.a from each of two modules) then land in
+	// separate subdirectories and cannot clobber each other — no name hashing
+	// needed. rewriteOutputPath is a pure function of (originalPath, workDir),
+	// and the archive that consumes an object runs in the SAME work dir as the
+	// compile that produced it, so the object's create-output and its
+	// archive-input reference map to the same nested path.
+	if subdir == "obj" || subdir == "lib" {
+		if ns := workDirNamespace(workDir, projectRoot); ns != "" {
+			return filepath.Join(buildDir, subdir, ns, base)
+		}
+	}
 	// For .o files, derive a unique prefix from the parent directory to
 	// avoid collisions when multiple bazel targets produce the same
 	// basename (e.g., parser.o from project/parser vs protobuf/compiler).
@@ -835,7 +915,7 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 		// target subdir AND its containing package so siblings in
 		// different bazel packages survive side by side.
 		dir := filepath.Dir(originalPath)
-		parentDir := filepath.Base(dir)              // typically the cc_library target name
+		parentDir := filepath.Base(dir)                 // typically the cc_library target name
 		grandParent := filepath.Base(filepath.Dir(dir)) // either "_objs" or, when no _objs, the package
 		if grandParent == "_objs" {
 			grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))
@@ -863,24 +943,53 @@ func rewriteOutputPath(originalPath, buildDir, subdir string) string {
 			return filepath.Join(buildDir, subdir, stem+"_"+sanitizeDirName(suffix)+ext)
 		}
 	}
-	// For .a / .lo archives, bazel emits one archive per cc_library
-	// target named lib<target>.a in the package's output directory.
-	// Sibling cc_libraries in different packages can have the same
-	// target name (e.g. `googlesql/public/libtype.a` from cc_library
-	// "type" alongside `googlesql/public/types/libtype.a` from a
-	// different cc_library also named "type"). Collapsing to the
-	// basename here would silently overwrite one with the other in
-	// `<buildDir>/lib/`, dropping every .o the loser archived. Encode
-	// the package directory into the filename so co-located archives
-	// from distinct bazel packages survive side by side.
+	// For .a / .lo archives whose work dir was NOT under the project root (so
+	// the work-dir nesting above did not apply — e.g. a build sandbox whose
+	// exec root sits elsewhere), fall back to mirroring the archive's OWN
+	// source directory structure under lib/. Two archives with the same
+	// basename from different source trees (googlesql/public/libtype.a vs
+	// googlesql/public/types/libtype.a) then keep distinct nested paths and
+	// cannot clobber each other, still without name hashing. LinkLibrary globs
+	// lib/ recursively, so the exact names never matter to linking — only their
+	// uniqueness does.
 	if (ext == ".a" || ext == ".lo") && subdir == "lib" {
-		stem := strings.TrimSuffix(base, ext)
-		parentDir := filepath.Base(filepath.Dir(originalPath))
-		if parentDir != "" && parentDir != "." && parentDir != stem {
-			return filepath.Join(buildDir, subdir, stem+"__"+sanitizeDirName(parentDir)+ext)
+		if ns := structuralNamespace(filepath.Dir(originalPath)); ns != "" {
+			return filepath.Join(buildDir, subdir, ns, base)
 		}
 	}
 	return filepath.Join(buildDir, subdir, base)
+}
+
+// workDirNamespace returns the step's work dir relative to the project root
+// when it is a clean descendant of it (e.g. "src/mylib"), or ""
+// when the work dir is the root itself, escapes the root (starts with ".."),
+// or either path is unset. It is the per-target output namespace: outputs from
+// distinct source directories mirror that structure under obj//lib/ and so
+// never collide by basename.
+func workDirNamespace(workDir, projectRoot string) string {
+	if workDir == "" || projectRoot == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(projectRoot, workDir)
+	if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return rel
+}
+
+// structuralNamespace turns a source directory into a clean, hash-free nested
+// namespace by dropping empty / "." / ".." and volume-root segments and
+// sanitizing each remaining component. It mirrors the original tree under
+// obj//lib/ so same-basename outputs from different directories stay distinct.
+func structuralNamespace(dir string) string {
+	var out []string
+	for _, p := range strings.Split(filepath.ToSlash(filepath.Clean(dir)), "/") {
+		if p == "" || p == "." || p == ".." {
+			continue
+		}
+		out = append(out, p)
+	}
+	return filepath.Join(out...)
 }
 
 func sanitizeDirName(name string) string {
@@ -913,6 +1022,53 @@ func replaceOutputArg(args []string, newOutput string) []string {
 	return result
 }
 
+// ensureOutputArg sets the -o value, APPENDING `-o <newOutput>` when the args
+// carry no -o at all. Unlike replaceOutputArg (used where an explicit -o always
+// exists), this handles compiles that relied on the compiler's implicit object
+// name, e.g. `cc -c op.c` → op.o. A no-op when newOutput is empty.
+func ensureOutputArg(args []string, newOutput string) []string {
+	if newOutput == "" {
+		return args
+	}
+	for i, arg := range args {
+		if arg == "-o" && i+1 < len(args) {
+			result := make([]string, len(args))
+			copy(result, args)
+			result[i+1] = newOutput
+			return result
+		}
+	}
+	return append(append([]string{}, args...), "-o", newOutput)
+}
+
+// deriveObjectOutput computes the object name for a compile that omitted -o:
+// the first source operand's basename with a .o extension (op.c → op.o). Returns
+// "" when no source operand is present.
+func deriveObjectOutput(args []string) string {
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			// Options that take a separate value; skip the value so it is not
+			// mistaken for a source operand (e.g. `-include foo.h`).
+			switch a {
+			case "-o", "-I", "-D", "-U", "-L", "-l", "-include", "-isystem", "-x", "-MT", "-MF":
+				skipNext = true
+			}
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(a)) {
+		case ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".m", ".mm":
+			base := filepath.Base(a)
+			return strings.TrimSuffix(base, filepath.Ext(base)) + ".o"
+		}
+	}
+	return ""
+}
+
 // collectInputFiles extracts source and object file paths from args for cache tracking.
 func collectInputFiles(args []string) []string {
 	var inputs []string
@@ -939,6 +1095,12 @@ func collectInputFiles(args []string) []string {
 }
 
 // rewriteInputPaths rewrites .o and .a file references in args to point to the wasm build dir.
+// rewriteInputPaths maps .o / .a / .lo references onto the flat build dir as a
+// first approximation; resolveObjectRefs later re-points each to the ACTUAL
+// (possibly nested) output that produced it, keyed by basename + work dir. It
+// can't nest correctly on its own because an archive/link may reference an
+// object built in a different work dir (e.g. a top-level libcore.a pulling in
+// a plugin.o compiled under a plugins/ subdir).
 func rewriteInputPaths(args []string, buildDir string) []string {
 	result := make([]string, len(args))
 	for i, arg := range args {
@@ -946,16 +1108,11 @@ func rewriteInputPaths(args []string, buildDir string) []string {
 			result[i] = arg
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(arg))
-		switch ext {
+		switch strings.ToLower(filepath.Ext(arg)) {
 		case ".o":
-			// Use the same collision-safe naming as rewriteOutputPath
-			result[i] = rewriteOutputPath(arg, buildDir, "obj")
+			result[i] = filepath.Join(buildDir, "obj", filepath.Base(arg))
 		case ".a", ".lo":
-			// Same collision-safe naming as rewriteOutputPath so that
-			// archive references in link/archive command lines resolve
-			// to the disambiguated paths produced for archive outputs.
-			result[i] = rewriteOutputPath(arg, buildDir, "lib")
+			result[i] = filepath.Join(buildDir, "lib", filepath.Base(arg))
 		default:
 			result[i] = arg
 		}

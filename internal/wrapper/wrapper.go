@@ -16,6 +16,16 @@ var toolNames = []string{
 	"ar", "ld", "ranlib", "strip",
 }
 
+// isCompileTool reports whether the wrapped tool is a C/C++ compiler front-end
+// (which accepts -isystem / -D), as opposed to ar/ld/ranlib/strip.
+func isCompileTool(name string) bool {
+	switch name {
+	case "cc", "c++", "gcc", "g++", "clang", "clang++":
+		return true
+	}
+	return false
+}
+
 // LogEntry represents a single captured tool invocation.
 type LogEntry struct {
 	Timestamp  string   `json:"timestamp"`
@@ -175,8 +185,19 @@ func RunAsWrapper() error {
 
 	_ = appendLogEntry(logFile, entry)
 
+	// Inject host-capability stub-header flags (driven by wasmify.json's bridge
+	// config; set by cmdBuild) into COMPILE invocations only, so the capture
+	// build compiles the project's socket/subprocess code against the same
+	// stubs wasm-build uses. The LOG keeps the original args — wasm-build
+	// re-injects its own copy on replay, so the flags are not double-recorded.
+	realArgs := os.Args[1:]
+	if inject := os.Getenv("WASMIFY_INJECT_COMPILE_FLAGS"); inject != "" && isCompileTool(toolName) {
+		extra := strings.Fields(inject)
+		realArgs = append(append([]string{}, extra...), realArgs...)
+	}
+
 	// Exec the real tool
-	cmd := exec.Command(realPath, os.Args[1:]...)
+	cmd := exec.Command(realPath, realArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

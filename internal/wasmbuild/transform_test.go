@@ -519,18 +519,17 @@ func TestRewriteOutputPath(t *testing.T) {
 		orig     string
 		buildDir string
 		subdir   string
+		workDir  string
+		root     string
 		want     string
 	}{
-		{"empty", "", "/build", "obj", ""},
-		// .a archives are disambiguated by the bazel package directory:
-		// libfoo.a in package mylib lands at libfoo__mylib.a so a sibling
-		// libfoo.a from another package does not overwrite it.
-		{"package-disambiguated .a", "bazel-out/k8-fastbuild/bin/mylib/libfoo.a", "/build", "lib", "/build/lib/libfoo__mylib.a"},
-		{"plain output", "bazel-out/bin/main", "/build", "output", "/build/output/main"},
+		{"empty", "", "/build", "obj", "", "", ""},
+		// The "output" subdir (final wasm) is never nested.
+		{"plain output", "bazel-out/bin/main", "/build", "output", "/root/x", "/root", "/build/output/main"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := rewriteOutputPath(tt.orig, tt.buildDir, tt.subdir)
+			got := rewriteOutputPath(tt.orig, tt.buildDir, tt.subdir, tt.workDir, tt.root)
 			if got != tt.want {
 				t.Errorf("rewriteOutputPath(%q) = %q, want %q", tt.orig, got, tt.want)
 			}
@@ -538,80 +537,93 @@ func TestRewriteOutputPath(t *testing.T) {
 	}
 }
 
+// TestRewriteOutputPath_TargetNesting: when the step's work dir lives under the
+// project root, outputs mirror that structure under obj//lib/ so same-basename
+// outputs from different source dirs never collide — no name hashing.
+func TestRewriteOutputPath_TargetNesting(t *testing.T) {
+	root := "/src/proj"
+	// Two modules each compile a compress.c; nested under their work dirs.
+	z := rewriteOutputPath("compress.o", "/build", "obj", root+"/mods/zlib-codec", root)
+	b := rewriteOutputPath("compress.o", "/build", "obj", root+"/mods/bzip2-codec", root)
+	if z != "/build/obj/mods/zlib-codec/compress.o" {
+		t.Errorf("zlib compress.o = %q, want /build/obj/mods/zlib-codec/compress.o", z)
+	}
+	if b != "/build/obj/mods/bzip2-codec/compress.o" {
+		t.Errorf("bzip2 compress.o = %q, want /build/obj/mods/bzip2-codec/compress.o", b)
+	}
+	if z == b {
+		t.Fatal("two compress.o collided after nesting")
+	}
+	// Two modules each archive a Util.a (leaf dir == stem); nested by work dir.
+	lu := rewriteOutputPath("../../build/x/Util/Util.a", "/build", "lib", root+"/mod-a", root)
+	hu := rewriteOutputPath("../../build/y/Util/Util.a", "/build", "lib", root+"/mod-b", root)
+	if lu != "/build/lib/mod-a/Util.a" {
+		t.Errorf("mod-a Util.a = %q, want /build/lib/mod-a/Util.a", lu)
+	}
+	if hu != "/build/lib/mod-b/Util.a" {
+		t.Errorf("mod-b Util.a = %q, want /build/lib/mod-b/Util.a", hu)
+	}
+	if lu == hu {
+		t.Fatal("two Util.a collided after nesting")
+	}
+	// Work dir == project root nests nothing (stays flat).
+	flat := rewriteOutputPath("core.o", "/build", "obj", root, root)
+	if flat != "/build/obj/core.o" {
+		t.Errorf("root-level object = %q, want /build/obj/core.o", flat)
+	}
+}
+
 func TestRewriteOutputPath_Idempotent(t *testing.T) {
-	// Archive steps set args[1] to the rewritten output path and then
-	// pass the whole arg list through rewriteInputPaths, which calls
-	// rewriteOutputPath again on every .a/.lo arg. Running the second
-	// pass must be a no-op — otherwise we get spurious double suffixes
-	// like libtype__public__lib.a.
-	a := "/build/lib/libtype__public.a"
-	if got := rewriteOutputPath(a, "/build", "lib"); got != a {
+	// Archive steps set args to rewritten output paths and then pass the whole
+	// arg list through rewriteInputPaths, which calls rewriteOutputPath again on
+	// every .a/.lo arg. Running the second pass must be a no-op — a path already
+	// under <buildDir>/<subdir>/ is returned unchanged.
+	a := "/build/lib/list-utils/Util.a"
+	if got := rewriteOutputPath(a, "/build", "lib", "/src/proj/list-utils", "/src/proj"); got != a {
 		t.Errorf("rewriteOutputPath should be idempotent for already-rewritten paths\n got %q\nwant %q", got, a)
 	}
-	o := "/build/obj/parser_parser.o"
-	if got := rewriteOutputPath(o, "/build", "obj"); got != o {
+	o := "/build/obj/mods/zlib/compress.o"
+	if got := rewriteOutputPath(o, "/build", "obj", "/src/proj/mods/zlib", "/src/proj"); got != o {
 		t.Errorf("rewriteOutputPath should be idempotent for .o paths\n got %q\nwant %q", got, o)
 	}
 }
 
-func TestRewriteOutputPath_ObjCollisionSafe(t *testing.T) {
-	// The .o disambiguator must encode both the cc_library target
-	// subdirectory AND its enclosing bazel package, otherwise two
-	// targets that share a subdir name collide. The actual googlesql
-	// case: `googlesql/public/_objs/type_proto/type.pb.o` from the
-	// public/type_proto cc_library, and the protobuf vendor's
-	// `external/protobuf~/src/google/protobuf/_objs/type_proto/type.pb.o`
-	// — both have parentDir "type_proto" but are entirely different .o
-	// files.
-	a := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/googlesql/public/_objs/type_proto/type.pb.o", "/build", "obj")
-	b := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/external/protobuf~/src/google/protobuf/_objs/type_proto/type.pb.o", "/build", "obj")
+func TestRewriteOutputPath_FallbackObjStructure(t *testing.T) {
+	// When the work dir is NOT under the project root (e.g. a build sandbox
+	// whose exec root sits elsewhere), objects keep the target-subdir + package
+	// token scheme so two same-named .o from different packages stay distinct.
+	a := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/googlesql/public/_objs/type_proto/type.pb.o", "/build", "obj", "", "")
+	b := rewriteOutputPath("bazel-out/darwin_arm64-opt/bin/external/protobuf~/src/google/protobuf/_objs/type_proto/type.pb.o", "/build", "obj", "", "")
 	if a == b {
 		t.Fatalf("colliding .o paths: %q", a)
 	}
 	if a != "/build/obj/type.pb_type_proto_public.o" {
-		t.Errorf("googlesql .o got %q, want %q", a, "/build/obj/type.pb_type_proto_public.o")
+		t.Errorf("first .o got %q, want %q", a, "/build/obj/type.pb_type_proto_public.o")
 	}
 	if b != "/build/obj/type.pb_type_proto_protobuf.o" {
-		t.Errorf("protobuf .o got %q, want %q", b, "/build/obj/type.pb_type_proto_protobuf.o")
+		t.Errorf("second .o got %q, want %q", b, "/build/obj/type.pb_type_proto_protobuf.o")
 	}
 }
 
-func TestRewriteOutputPath_ArchiveCollisionSafe(t *testing.T) {
-	// Two distinct bazel cc_library targets in different packages can
-	// produce the same archive basename (the actual googlesql collision
-	// that motivated this disambiguation: `googlesql/public/libtype.a`
-	// from one cc_library and `googlesql/public/types/libtype.a` from
-	// another). Without per-package suffixing, copying both into
-	// <buildDir>/lib/ would overwrite one with the other and drop every
-	// .o the loser archived.
-	a := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libtype.a", "/build", "lib")
-	b := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/types/libtype.a", "/build", "lib")
+func TestRewriteOutputPath_FallbackArchiveStructure(t *testing.T) {
+	// When the work dir is not under the project root, archives mirror their own
+	// source directory structure under lib/ (hash-free), so two same-basename
+	// archives from different source trees keep distinct nested paths.
+	a := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libtype.a", "/build", "lib", "", "")
+	b := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/types/libtype.a", "/build", "lib", "", "")
 	if a == b {
 		t.Fatalf("colliding archives mapped to the same path: %q", a)
 	}
-	if a != "/build/lib/libtype__public.a" {
-		t.Errorf("first libtype.a got %q, want %q", a, "/build/lib/libtype__public.a")
+	if a != "/build/lib/bazel-out/aarch64-opt/bin/googlesql/public/libtype.a" {
+		t.Errorf("first libtype.a got %q", a)
 	}
-	if b != "/build/lib/libtype__types.a" {
-		t.Errorf("second libtype.a got %q, want %q", b, "/build/lib/libtype__types.a")
+	if b != "/build/lib/bazel-out/aarch64-opt/bin/googlesql/public/types/libtype.a" {
+		t.Errorf("second libtype.a got %q", b)
 	}
-
 	// .lo archives (libtool-style) follow the same rule.
-	c := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libfoo.lo", "/build", "lib")
-	if c != "/build/lib/libfoo__public.lo" {
-		t.Errorf("libfoo.lo got %q, want %q", c, "/build/lib/libfoo__public.lo")
-	}
-}
-
-func TestRewriteOutputPath_ObjDisambiguation(t *testing.T) {
-	// _objs/foo/bar.o should disambiguate with "foo" parent dir
-	got := rewriteOutputPath("bazel-out/k8/bin/project/lib/_objs/importer/parser.o", "/build", "obj")
-	// Should be /build/obj/parser_<something>.o (a disambiguation)
-	if !strings.HasPrefix(got, "/build/obj/parser_") {
-		t.Errorf("expected disambiguated name, got %q", got)
-	}
-	if !strings.HasSuffix(got, ".o") {
-		t.Errorf("expected .o extension, got %q", got)
+	c := rewriteOutputPath("bazel-out/aarch64-opt/bin/googlesql/public/libfoo.lo", "/build", "lib", "", "")
+	if c != "/build/lib/bazel-out/aarch64-opt/bin/googlesql/public/libfoo.lo" {
+		t.Errorf("libfoo.lo got %q", c)
 	}
 }
 
@@ -632,17 +644,16 @@ func TestRewriteInputPaths(t *testing.T) {
 	if result[4] != "-I/usr/include" {
 		t.Errorf("expected flag preserved, got %q", result[4])
 	}
-	// .a and .lo go through rewriteOutputPath with subdir "lib", which
-	// suffixes the archive with the bazel package directory so two
-	// archives with the same basename in different packages don't
-	// collide. For these inputs the parent dir is "lib" itself, so the
-	// suffix becomes "__lib".
-	if result[2] != filepath.Join(buildDir, "lib", "foo__lib.a") {
-		t.Errorf("got %q for .a", result[2])
+	// .o / .a / .lo refs are mapped onto the flat build dir by basename;
+	// resolveObjectRefs later re-points them to the actual (nested) outputs.
+	if result[1] != filepath.Join(buildDir, "obj", "main.o") {
+		t.Errorf("got %q for .o, want %s/obj/main.o", result[1], buildDir)
+	}
+	if result[2] != filepath.Join(buildDir, "lib", "foo.a") {
+		t.Errorf("got %q for .a, want %s/lib/foo.a", result[2], buildDir)
 	}
 	if result[3] != filepath.Join(buildDir, "lib", "some.lo") {
-		// "some.lo" has no parent dir, so no suffix is applied.
-		t.Errorf("got %q for .lo", result[3])
+		t.Errorf("got %q for .lo, want %s/lib/some.lo", result[3], buildDir)
 	}
 }
 
@@ -893,61 +904,78 @@ func TestTransformSteps_IDs(t *testing.T) {
 	}
 }
 
-func TestResolveOutputCollisions(t *testing.T) {
-	// Two compile steps output same basename "arena.o" but from different source dirs.
+// TestResolveObjectRefs covers the two cases per-step nesting can't handle on
+// its own: (1) a CROSS-work-dir reference — a top-level archive pulling in an
+// object compiled elsewhere (libcore.a ← plugins/loader's plugin.o) — resolves
+// by unique basename regardless of the archive's own work dir; and (2) a
+// colliding basename (two codec.o) resolves to the object from the SAME work
+// dir as the referencing archive.
+func TestResolveObjectRefs(t *testing.T) {
+	const aWD = "/src/proj/codecs/a"
+	const bWD = "/src/proj/codecs/b"
+	const plWD = "/src/proj/plugins/loader"
+	const coreWD = "/src/proj"
 	steps := []WasmBuildStep{
-		{
-			ID:         1,
-			Type:       buildjson.StepCompile,
-			Args:       []string{"-c", "-o", "/build/obj/arena.o", "proj/base/arena.cc"},
-			OutputFile: "/build/obj/arena.o",
-		},
-		{
-			ID:         2,
-			Type:       buildjson.StepCompile,
-			Args:       []string{"-c", "-o", "/build/obj/arena.o", "protobuf/compiler/arena.cc"},
-			OutputFile: "/build/obj/arena.o",
-		},
-		{
-			ID:         3,
-			Type:       buildjson.StepArchive,
-			Args:       []string{"rcs", "/build/lib/foo.a", "/build/obj/arena.o"},
-			OutputFile: "/build/lib/foo.a",
-		},
+		// codec.o compiled in each codec dir (nested outputs).
+		{ID: 1, Type: buildjson.StepCompile, WorkDir: aWD,
+			OutputFile: "/build/obj/codecs/a/codec.o"},
+		{ID: 2, Type: buildjson.StepCompile, WorkDir: bWD,
+			OutputFile: "/build/obj/codecs/b/codec.o"},
+		// plugin.o compiled under plugins/loader (unique basename).
+		{ID: 3, Type: buildjson.StepCompile, WorkDir: plWD,
+			OutputFile: "/build/obj/plugins/loader/plugin.o"},
+		// Each codec archives its own codec.o (flat ref, pre-resolution).
+		{ID: 4, Type: buildjson.StepArchive, WorkDir: aWD,
+			Args: []string{"cr", "/build/lib/codecs/a/CodecA.a", "/build/obj/codec.o"}},
+		{ID: 5, Type: buildjson.StepArchive, WorkDir: bWD,
+			Args: []string{"cr", "/build/lib/codecs/b/CodecB.a", "/build/obj/codec.o"}},
+		// libcore.a (project root) pulls in plugin.o from plugins/loader.
+		{ID: 6, Type: buildjson.StepArchive, WorkDir: coreWD,
+			Args: []string{"rc", "/build/lib/libcore.a", "/build/obj/plugin.o"}},
 	}
-	resolveOutputCollisions(steps)
-	// Both compile steps must now have different output paths
-	if steps[0].OutputFile == steps[1].OutputFile {
-		t.Errorf("expected collision resolved, both = %q", steps[0].OutputFile)
+	resolveObjectRefs(steps)
+
+	// (2) collision disambiguation by work dir.
+	if got := steps[3].Args[len(steps[3].Args)-1]; got != "/build/obj/codecs/a/codec.o" {
+		t.Errorf("CodecA.a codec.o ref = %q, want the codec-a object", got)
+	}
+	if got := steps[4].Args[len(steps[4].Args)-1]; got != "/build/obj/codecs/b/codec.o" {
+		t.Errorf("CodecB.a codec.o ref = %q, want the codec-b object", got)
+	}
+	// (1) cross-work-dir reference to a unique basename.
+	if got := steps[5].Args[len(steps[5].Args)-1]; got != "/build/obj/plugins/loader/plugin.o" {
+		t.Errorf("libcore.a plugin.o ref = %q, want the plugins/loader object", got)
 	}
 }
 
-func TestUniqueOutputName(t *testing.T) {
-	got := uniqueOutputName("/build/obj/arena.o", "proj/base/arena.cc")
-	// Must end with .o
-	if !strings.HasSuffix(got, ".o") {
-		t.Errorf("expected .o suffix, got %q", got)
+// TestResolveObjectRefs_RenamedObject models a build that compiles FooBar.c to
+// FooBar.o and then renames it (a shell `mv FooBar.o Bar.o` wasmify never
+// wraps), so the archive references Bar.o but only FooBar.o was recorded. The
+// sole unreferenced compile output in that work dir IS the renamed-away object.
+func TestResolveObjectRefs_RenamedObject(t *testing.T) {
+	const wd = "/src/proj/ext/Foo-Bar"
+	steps := []WasmBuildStep{
+		{ID: 1, Type: buildjson.StepCompile, WorkDir: wd,
+			OutputFile: "/build/obj/ext/Foo-Bar/FooBar.o"},
+		{ID: 2, Type: buildjson.StepArchive, WorkDir: wd,
+			Args: []string{"cr", "/build/lib/ext/Foo-Bar/Bar.a", "/build/obj/Bar.o"}},
 	}
-	// Must include "arena" and a suffix
-	if !strings.Contains(got, "arena_") {
-		t.Errorf("expected arena_ prefix, got %q", got)
-	}
-}
-
-func TestUniqueOutputName_TruncateLongDir(t *testing.T) {
-	// Source path with very long dir name gets truncated (first 12 chars)
-	got := uniqueOutputName("/build/obj/x.o", "my-very-long-directory-name-here/x.cc")
-	if !strings.HasSuffix(got, ".o") {
-		t.Errorf("expected .o suffix, got %q", got)
+	resolveObjectRefs(steps)
+	if got := steps[1].Args[len(steps[1].Args)-1]; got != "/build/obj/ext/Foo-Bar/FooBar.o" {
+		t.Errorf("Bar.a Bar.o ref = %q, want the renamed-away FooBar.o", got)
 	}
 }
 
-func TestRewriteOutputPath_ObjNoDisambig(t *testing.T) {
-	// When parent dir equals stem and grandparent walks to stem, no rename
-	got := rewriteOutputPath("abc/parser.o", "/build", "obj")
-	// "abc" is the parent, stem is "parser", they differ → disambiguation expected
-	if !strings.Contains(got, "parser_abc") {
-		t.Logf("got: %q", got)
+// TestResolveObjectRefs_ExternalLibKept: a reference to something wasmify did
+// not build (no producer, no lone orphan) is left untouched.
+func TestResolveObjectRefs_ExternalLibKept(t *testing.T) {
+	steps := []WasmBuildStep{
+		{ID: 1, Type: buildjson.StepLink, WorkDir: "/src/proj",
+			Args: []string{"-o", "out", "/usr/lib/libcrypto.a"}},
+	}
+	resolveObjectRefs(steps)
+	if got := steps[0].Args[len(steps[0].Args)-1]; got != "/usr/lib/libcrypto.a" {
+		t.Errorf("external lib ref = %q, want it left as-is", got)
 	}
 }
 
