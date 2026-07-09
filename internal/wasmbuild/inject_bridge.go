@@ -139,8 +139,8 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 	}
 
 	// Append any extra linker flags (e.g. -Wl,--wrap=connect for host-provided
-	// socket shims) from WASMIFY_EXTRA_LDFLAGS to every link step.
-	steps = appendExtraLDFlags(steps)
+	// socket shims) from cfg.ExtraLDFlags to every link step.
+	steps = appendExtraLDFlags(steps, cfg)
 
 	for i := range steps {
 		steps[i].ID = i + 1
@@ -149,21 +149,19 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 	return steps
 }
 
-// appendExtraLDFlags appends space-separated flags from WASMIFY_EXTRA_LDFLAGS
-// to every (non-skipped) link step. Used to pass --wrap and similar linker
-// options the captured upstream build doesn't include — e.g. routing libc
-// socket()/connect() to host-provided shims in the bridge sources.
-func appendExtraLDFlags(steps []WasmBuildStep) []WasmBuildStep {
-	v := strings.TrimSpace(os.Getenv("WASMIFY_EXTRA_LDFLAGS"))
-	if v == "" {
+// appendExtraLDFlags appends cfg.ExtraLDFlags to every (non-skipped) link step.
+// Used to pass --wrap and similar linker options the captured upstream build
+// doesn't include — e.g. routing libc socket()/connect() to host-provided shims
+// in the bridge sources.
+func appendExtraLDFlags(steps []WasmBuildStep, cfg WasmConfig) []WasmBuildStep {
+	if len(cfg.ExtraLDFlags) == 0 {
 		return steps
 	}
-	flags := strings.Fields(v)
 	for i := range steps {
 		if steps[i].Type != buildjson.StepLink || steps[i].Skipped {
 			continue
 		}
-		steps[i].Args = append(steps[i].Args, flags...)
+		steps[i].Args = append(steps[i].Args, cfg.ExtraLDFlags...)
 	}
 	return steps
 }
@@ -204,17 +202,6 @@ func extractIncludeFlags(steps []WasmBuildStep) []string {
 	return flags
 }
 
-// hostShimFlags resolves the effective host-capability opt-ins for the bridge
-// build, honouring both wasmify.json (via cfg) and the env overrides. It is the
-// single source of truth shared by buildBridgeCompileArgs (which defines the
-// -DWASMIFY_HOST_* macros) and the shim deployment in cmd/wasmify, so the macro
-// is defined exactly when the corresponding shim TU is compiled.
-func hostShimFlags(cfg WasmConfig) (hostSockets, hostSubprocess bool) {
-	hostSockets = cfg.HostSockets || os.Getenv("WASMIFY_HOST_SOCKETS") != ""
-	hostSubprocess = cfg.HostSubprocess || os.Getenv("WASMIFY_HOST_SUBPROCESS") != ""
-	return hostSockets, hostSubprocess
-}
-
 func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeFlags []string) []string {
 	args := []string{
 		"-c",
@@ -233,7 +220,7 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 		"-DNDEBUG",
 		// __EMSCRIPTEN__ (to bypass sizeof(void*)==8 static_asserts in project
 		// headers) is added by wasmCompileFlags below, unless the build opted
-		// out via WASMIFY_NO_EMSCRIPTEN_DEFINE=1 (wasi-native projects whose
+		// out via the NoEmscriptenDefine option (wasi-native projects whose
 		// headers have real __EMSCRIPTEN__ branches). A stub
 		// <emscripten/version.h> satisfies include checks when it IS set.
 	}
@@ -242,10 +229,9 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 	args = append(args, includeFlags...)
 	// Extra include dirs for hand-written bridge / wrapper sources that live
 	// OUTSIDE the captured upstream build (e.g. a project's own embedding
-	// header that the generated api_bridge.cc includes). Colon-separated, via
-	// WASMIFY_BRIDGE_EXTRA_INCLUDES. Without this the bridge cannot resolve a
-	// wrapper header that is not on any captured -I path.
-	for _, dir := range extraBridgeIncludes() {
+	// header that the generated api_bridge.cc includes). Without this the bridge
+	// cannot resolve a wrapper header that is not on any captured -I path.
+	for _, dir := range cfg.BridgeExtraIncludes {
 		args = append(args, "-I", dir)
 	}
 	// The host-capability -D macros (WASMIFY_HOST_SOCKETS / _SUBPROCESS) and the
@@ -254,23 +240,6 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 	// alike), so they are not repeated here.
 	args = append(args, "-o", outputFile, srcFile)
 	return args
-}
-
-// extraBridgeIncludes returns additional -I directories for compiling the
-// generated bridge and any custom_bridge.cc, from the colon-separated
-// WASMIFY_BRIDGE_EXTRA_INCLUDES env var.
-func extraBridgeIncludes() []string {
-	v := os.Getenv("WASMIFY_BRIDGE_EXTRA_INCLUDES")
-	if v == "" {
-		return nil
-	}
-	var out []string
-	for _, p := range strings.Split(v, ":") {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 // extractWorkDir returns the work directory from the first non-skipped compile step.

@@ -27,15 +27,6 @@ const (
 	hostSubprocessShimName = "host_subprocess.cc"
 )
 
-// HostShimFlags resolves the effective host-capability opt-ins for the bridge
-// build, honouring both wasmify.json (via cfg) and the WASMIFY_HOST_* env
-// overrides. It is the single source of truth callers use to decide which
-// shims to deploy, matching the macros buildBridgeCompileArgs defines for the
-// compile.
-func HostShimFlags(cfg WasmConfig) (hostSockets, hostSubprocess bool) {
-	return hostShimFlags(cfg)
-}
-
 // HostSubprocessStubHeaders lists the stub headers the subprocess shim needs to
 // compile (resolved from the stub registry against cfg.PosixCompatDir). The
 // socket shim's headers are part of the always-deployed POSIX-compat set, so

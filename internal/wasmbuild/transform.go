@@ -180,8 +180,8 @@ func scrubPersistedSkips(steps []WasmBuildStep) {
 func resolveObjectRefs(steps []WasmBuildStep) {
 	type produced struct{ workDir, path string }
 	reg := map[string][]produced{}
-	compileOutByWD := map[string][]string{}   // work dir → compile output paths
-	referenced := map[string]bool{}           // basenames referenced by archive/link steps
+	compileOutByWD := map[string][]string{} // work dir → compile output paths
+	referenced := map[string]bool{}         // basenames referenced by archive/link steps
 	for i := range steps {
 		s := &steps[i]
 		if (s.Type == buildjson.StepCompile || s.Type == buildjson.StepArchive) && s.OutputFile != "" {
@@ -750,13 +750,6 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 }
 
 // wasmCompileFlags returns the flags to add for wasm compilation.
-// emscriptenDefineDisabled reports whether the build opted out of the
-// implicit -D__EMSCRIPTEN__ (set by wasi-native projects that have real
-// __EMSCRIPTEN__ code paths). Controlled by WASMIFY_NO_EMSCRIPTEN_DEFINE=1.
-func emscriptenDefineDisabled() bool {
-	return os.Getenv("WASMIFY_NO_EMSCRIPTEN_DEFINE") == "1"
-}
-
 func wasmCompileFlags(cfg WasmConfig) []string {
 	var flags []string
 	if cfg.PosixCompatDir != "" {
@@ -767,11 +760,10 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	// bridge), so the upstream's own sources enable the matching feature at
 	// wasm-build only. The upstream's separate (host-arch-equivalent) make phase
 	// never sees these, so it stays plain and needs none of the extra headers.
-	hostSockets, hostSubprocess := hostShimFlags(cfg)
-	if hostSockets {
+	if cfg.HostSockets {
 		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
 	}
-	if hostSubprocess {
+	if cfg.HostSubprocess {
 		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
 		if cfg.HostIncludeDir != "" {
 			// Carries spawn.h/sys/wait.h that wasi-libc omits; gated behind the
@@ -788,9 +780,10 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	// that guard wasm compatibility behind this macro. It is HARMFUL for
 	// projects that natively support wasm32-wasi and have real
 	// `#ifdef __EMSCRIPTEN__` branches (e.g. a source file includes
-	// <emscripten/stack.h> under it). Such wasi-native projects set
-	// WASMIFY_NO_EMSCRIPTEN_DEFINE=1 to keep their wasi code paths.
-	if !emscriptenDefineDisabled() {
+	// <emscripten/stack.h> under it). Such wasi-native projects set the
+	// NoEmscriptenDefine option (also settable via WASMIFY_NO_EMSCRIPTEN_DEFINE)
+	// to keep their wasi code paths.
+	if !cfg.NoEmscriptenDefine {
 		flags = append(flags, "-D__EMSCRIPTEN__")
 	}
 	flags = append(flags,
@@ -922,7 +915,7 @@ func rewriteOutputPath(originalPath, buildDir, subdir, workDir, projectRoot stri
 		// target subdir AND its containing package so siblings in
 		// different bazel packages survive side by side.
 		dir := filepath.Dir(originalPath)
-		parentDir := filepath.Base(dir)              // typically the cc_library target name
+		parentDir := filepath.Base(dir)                 // typically the cc_library target name
 		grandParent := filepath.Base(filepath.Dir(dir)) // either "_objs" or, when no _objs, the package
 		if grandParent == "_objs" {
 			grandParent = filepath.Base(filepath.Dir(filepath.Dir(dir)))

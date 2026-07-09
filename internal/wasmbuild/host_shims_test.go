@@ -66,23 +66,29 @@ func TestDeployHostShims(t *testing.T) {
 	}
 }
 
-func TestHostShimFlags(t *testing.T) {
-	// Defaults: both off.
-	gotS, gotP := HostShimFlags(WasmConfig{})
-	if gotS || gotP {
-		t.Fatalf("defaults should be off, got sockets=%v subprocess=%v", gotS, gotP)
+func TestApplyEnvOverridesHostCapabilities(t *testing.T) {
+	// Defaults: both off, and nothing in the environment turns them on.
+	var def WasmConfig
+	def.ApplyEnvOverrides()
+	if def.HostSockets || def.HostSubprocess {
+		t.Fatalf("defaults should be off, got sockets=%v subprocess=%v", def.HostSockets, def.HostSubprocess)
 	}
 
-	// cfg opt-in.
-	gotS, gotP = HostShimFlags(WasmConfig{HostSockets: true, HostSubprocess: true})
-	if !gotS || !gotP {
-		t.Fatalf("cfg opt-in should enable both, got sockets=%v subprocess=%v", gotS, gotP)
+	// wasmify.json opt-in (already true) survives the fold.
+	cfgOpt := WasmConfig{HostSockets: true, HostSubprocess: true}
+	cfgOpt.ApplyEnvOverrides()
+	if !cfgOpt.HostSockets || !cfgOpt.HostSubprocess {
+		t.Fatalf("config opt-in should stay enabled, got sockets=%v subprocess=%v", cfgOpt.HostSockets, cfgOpt.HostSubprocess)
 	}
 
-	// Env override.
-	t.Setenv("WASMIFY_HOST_SOCKETS", "1")
-	gotS, _ = HostShimFlags(WasmConfig{})
-	if !gotS {
+	// Environment sets the same option — presence (not "1" specifically) enables it.
+	t.Setenv("WASMIFY_HOST_SOCKETS", "yes")
+	var env WasmConfig
+	env.ApplyEnvOverrides()
+	if !env.HostSockets {
 		t.Fatalf("env override should enable sockets")
+	}
+	if env.HostSubprocess {
+		t.Fatalf("only sockets was set, subprocess should stay off")
 	}
 }

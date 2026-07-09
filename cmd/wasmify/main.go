@@ -751,8 +751,13 @@ func hostCaptureInjectFlags(dataDir, outDir string) string {
 		return ""
 	}
 	buildDir := filepath.Join(dataDir, "wasm-build")
+	// Resolve the POSIX-compat opt-out the same way the replay phase does — via
+	// a WasmConfig option — so both phases agree regardless of whether the
+	// option was set in wasmify.json or through the environment.
+	var cfg wasmbuild.WasmConfig
+	cfg.ApplyEnvOverrides()
 	var flags []string
-	if os.Getenv("WASMIFY_NO_POSIX_COMPAT") != "1" {
+	if !cfg.NoPosixCompat {
 		if compatDir, derr := wasmbuild.DeployPosixCompat(buildDir); derr == nil {
 			flags = append(flags, "-isystem", compatDir)
 		}
@@ -1356,6 +1361,13 @@ func cmdWasmBuild(args []string) error {
 		}
 	}
 
+	// Fold the recognised WASMIFY_* environment overrides into cfg now that it
+	// has been populated from wasmify.json / state. From here on every build
+	// code path branches on the cfg options, never on the environment directly,
+	// so an option set through wasmify.json and one set through the environment
+	// behave identically.
+	cfg.ApplyEnvOverrides()
+
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
 	// once per machine and reused across every project wasmify builds.
@@ -1388,13 +1400,13 @@ func cmdWasmBuild(args []string) error {
 	}
 
 	// Deploy POSIX compatibility headers. Skipped for wasi-native projects
-	// (WASMIFY_NO_POSIX_COMPAT=1): the stubs define feature macros (e.g.
+	// (NoPosixCompat option): the stubs define feature macros (e.g.
 	// CMSG_*) that the bare wasi sysroot leaves undefined, which enables code
 	// paths the sysroot can't back. A wasi-native project's socket code
 	// compiles fine against the bare sysroot but breaks when the stubs are
 	// -isystem'd in.
-	if os.Getenv("WASMIFY_NO_POSIX_COMPAT") == "1" {
-		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: disabled (WASMIFY_NO_POSIX_COMPAT=1)\n")
+	if cfg.NoPosixCompat {
+		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: disabled (NoPosixCompat)\n")
 	} else {
 		compatDir, err := wasmbuild.DeployPosixCompat(cfg.BuildDir)
 		if err != nil {
@@ -1404,11 +1416,11 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 	}
 
-	// Resolve host-capability opt-ins up front: the subprocess capability adds
-	// stub headers + a -D macro to EVERY wasm-build compile (via
-	// wasmCompileFlags), so cfg must carry the include dir before TransformSteps
-	// runs.
-	hostSockets, hostSubprocess := wasmbuild.HostShimFlags(cfg)
+	// Host-capability opt-ins (resolved into cfg by ApplyEnvOverrides above): the
+	// subprocess capability adds stub headers + a -D macro to EVERY wasm-build
+	// compile (via wasmCompileFlags), so cfg must carry the include dir before
+	// TransformSteps runs.
+	hostSockets, hostSubprocess := cfg.HostSockets, cfg.HostSubprocess
 	if hostSubprocess {
 		// Materialize spawn.h/sys/wait.h into a build-local include dir and put
 		// it on every compile's -I (see wasmCompileFlags). Paired with the
