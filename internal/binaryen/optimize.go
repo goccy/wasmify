@@ -1,10 +1,13 @@
 package binaryen
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // OptimizeOptions tunes the wasm-opt invocation. The defaults are
@@ -83,6 +86,13 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		"--enable-multivalue",
 		"--enable-reference-types",
 		"--enable-nontrapping-float-to-int",
+		// Exception handling: clang lowers setjmp/longjmp to wasm EH
+		// under -mllvm -wasm-enable-sjlj, so a project using SjLj (e.g.
+		// an interpreter core) produces a wasm carrying EH opcodes and a
+		// __c_longjmp tag. Without this flag wasm-opt refuses to read it
+		// ("exit status 1" before any pass runs). Inert for wasm that
+		// has no EH.
+		"--enable-exception-handling",
 		"--strip-debug",
 		"--strip-producers",
 		"--strip-target-features",
@@ -91,12 +101,21 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		inputPath,
 	}
 	cmd := exec.Command(wasmOpt, args...)
+	// Always capture stderr so a failure surfaces wasm-opt's own diagnostic
+	// (e.g. "Fatal: ... requires <feature>") instead of a bare "exit status 1".
+	// In verbose mode it is ALSO streamed live.
+	var stderr bytes.Buffer
 	if opts.Verbose {
 		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	} else {
+		cmd.Stderr = &stderr
 	}
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(tmpOut)
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return res, fmt.Errorf("wasm-opt failed: %w\n%s", err, detail)
+		}
 		return res, fmt.Errorf("wasm-opt failed: %w", err)
 	}
 
