@@ -27,6 +27,19 @@ var wasm2goImportPath string
 // engine's New takes only env and the WasmifyImports interface is absent.
 var wasm2goHasWasmify bool
 
+// wasm2goHasEnv records whether the transpiled engine imports anything from the
+// wasm "env" module. It is set by emitWasm2go and read by the bridge-body
+// generation, for the same reason as wasm2goHasWasmify: the transpiler emits an
+// EnvImports interface — and a New that takes it — only for the import modules
+// the wasm actually names.
+//
+// A wasm links against "env" when it has unresolved symbols the host must
+// supply: the C++ runtime entry points, wasmify's host-capability shims. A
+// self-contained project has none — with host sockets and subprocess off, every
+// one of its imports is wasi_snapshot_preview1, so there is no env module, no
+// EnvImports, and referencing either would not compile.
+var wasm2goHasEnv bool
+
 // unifiedImportsWasm2go is the import block of the consolidated bridge
 // file in runtime=wasm2go mode. It drops the wazero imports of the
 // default block and pulls in the transpiled wasm2go package instead.
@@ -150,7 +163,6 @@ func module() *Module {
 
 func initModule() (retErr error) {
 	m := &Module{}
-	env := envStubs{m: m}
 __WASM2GO_NEW__
 	// Set globalModule eagerly so the rest of the API can run even if
 	// _initialize panics partway through C++ static-initializer code.
@@ -248,6 +260,13 @@ func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int
 	return resp, nil
 }
 
+`
+
+// envStubsDeclWasm2go declares the receiver the generated env stub methods hang
+// off. It is appended only when the wasm imports from the "env" module; a
+// self-contained wasm imports nothing there, and an envStubs with no methods
+// would be dead code that no wasm2go.New signature accepts.
+const envStubsDeclWasm2go = `
 // envStubs implements wasm2go/base.EnvImports — the host side of the
 // wasm "env" imports. The per-method definitions are emitted by the
 // generator (generateEnvStubs) since the import set is module-specific.
@@ -374,6 +393,10 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 	if envImportsSrc == nil {
 		return nil, fmt.Errorf("transpileGenwasm: cannot locate EnvImports source")
 	}
+	// Detect whether the engine imports from the "env" module at all. Same
+	// reasoning as wasm2goHasWasmify above: the interface exists only if the
+	// wasm names that module.
+	wasm2goHasEnv = strings.Contains(string(envImportsSrc), "EnvImports")
 	gwImport := protogen.GoImportPath(wasm2goImportPath)
 	rels := make([]string, 0, len(files))
 	for rel := range files {
@@ -447,7 +470,14 @@ func invokeArgs(svc, mt int32) string {
 // EnvImports interface so the generated stubs satisfy it exactly. Most
 // imports are unresolved symbols stubbed to a zero return; the C++
 // runtime entry points (__cxa_*) get real bodies.
+//
+// A wasm with no "env" imports has no EnvImports interface to satisfy, and
+// nothing to stub — return empty rather than failing. generateModule then omits
+// the env argument to wasm2go.New, matching the New the transpiler emitted.
 func generateEnvStubs(baseGoSrc []byte) (string, error) {
+	if !wasm2goHasEnv {
+		return "", nil
+	}
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "base.go", baseGoSrc, 0)
 	if err != nil {

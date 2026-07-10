@@ -1239,12 +1239,27 @@ func generateModule(pkg string) string {
 		// callback infrastructure links; when no callback service exists the
 		// optimizer drops that import, so New takes only env and the callback
 		// code (which references the absent WasmifyImports) must be omitted.
+		// The engine's New takes one argument per import module the wasm names,
+		// so build the call from the modules that survived: "env" only when the
+		// wasm has unresolved host-supplied symbols, "wasmify" only when a
+		// callback service exists.
+		newArgs, prelude := "", ""
+		if wasm2goHasEnv {
+			prelude += "\tenv := envStubs{m: m}\n"
+			newArgs = "env"
+			body += envStubsDeclWasm2go
+		}
 		if wasm2goHasWasmify {
-			body = strings.ReplaceAll(body, "__WASM2GO_NEW__",
-				"\twm := wasmifyStubs{m: m}\n\tm.g = wasm2go.New(env, wm)")
+			prelude += "\twm := wasmifyStubs{m: m}\n"
+			if newArgs != "" {
+				newArgs += ", "
+			}
+			newArgs += "wm"
+		}
+		body = strings.ReplaceAll(body, "__WASM2GO_NEW__",
+			prelude+"\tm.g = wasm2go.New("+newArgs+")")
+		if wasm2goHasWasmify {
 			body += callbackInfraWasm2go
-		} else {
-			body = strings.ReplaceAll(body, "__WASM2GO_NEW__", "\tm.g = wasm2go.New(env)")
 		}
 	} else {
 		body = strings.ReplaceAll(moduleBody, "__WASM_FILE__", pkg+".wasm")
