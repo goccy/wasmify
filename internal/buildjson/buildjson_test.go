@@ -104,6 +104,10 @@ func TestClassifyStep(t *testing.T) {
 		{"clang compile", "clang", []string{"-c", "foo.c"}, StepCompile},
 		{"clang link no -c", "clang", []string{"foo.o", "-o", "out"}, StepLink},
 		{"gcc compile", "gcc", []string{"-c", "foo.c"}, StepCompile},
+		{"clang preprocess -E -dM probe", "clang", []string{"-E", "-dM", "-include", "shim.h", "shim.h"}, StepOther},
+		{"clang dependency scan -M", "clang", []string{"-M", "foo.c"}, StepOther},
+		{"clang dependency scan -MM", "clang", []string{"-MM", "foo.c"}, StepOther},
+		{"clang compile with -MD side-effect deps", "clang", []string{"-c", "-MD", "foo.c"}, StepCompile},
 		{"unknown tool", "ninja", []string{"all"}, StepOther},
 	}
 	for _, tc := range tests {

@@ -112,6 +112,20 @@ func classifyStep(tool string, args []string) StepType {
 
 	if compilerNames[tool] {
 		for _, arg := range args {
+			// Preprocess/dependency-only invocations never produce an object or
+			// a binary — e.g. a Configure probe dumping predefined macros
+			// (`-E -dM`), or a `-M`/`-MM` dependency scan. They are not build
+			// steps. Classifying them as a link would make wasm-build append
+			// link flags and objects to a `-E` command, which the compiler then
+			// rejects (`-mexec-model=` is invalid in preprocess mode). Treat
+			// them as StepOther so wasm-build skips them. `-MD`/`-MMD` are NOT
+			// matched here: those emit deps as a side effect of a real compile
+			// (they always accompany `-c`).
+			if arg == "-E" || arg == "-M" || arg == "-MM" {
+				return StepOther
+			}
+		}
+		for _, arg := range args {
 			if arg == "-c" {
 				return StepCompile
 			}
