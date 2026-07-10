@@ -1359,6 +1359,23 @@ func cmdWasmBuild(args []string) error {
 		if s.WasmBuild.KeepSymbols {
 			cfg.KeepSymbols = true
 		}
+		// Already-compiled wasm archives the link must pull from. Resolve each
+		// against the config dir, as for CustomBridgeSources: the declared path
+		// is relative to wasmify.json, not to the upstream build's work dir.
+		for _, ar := range s.WasmBuild.PrebuiltArchives {
+			if !filepath.IsAbs(ar) {
+				ar = filepath.Join(outDir, ar)
+			}
+			cfg.PrebuiltArchives = append(cfg.PrebuiltArchives, ar)
+		}
+		cfg.ExtraCXXFlags = append(cfg.ExtraCXXFlags, s.WasmBuild.ExtraCXXFlags...)
+		cfg.ExtraLDFlags = append(cfg.ExtraLDFlags, s.WasmBuild.ExtraLDFlags...)
+		for _, dir := range s.WasmBuild.BridgeExtraIncludes {
+			if !filepath.IsAbs(dir) {
+				dir = filepath.Join(outDir, dir)
+			}
+			cfg.BridgeExtraIncludes = append(cfg.BridgeExtraIncludes, dir)
+		}
 	}
 
 	// Fold the recognised WASMIFY_* environment overrides into cfg now that it

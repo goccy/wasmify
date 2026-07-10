@@ -214,6 +214,54 @@ type WasmBuildConfig struct {
 	// smaller shipping wasm; enable this when a function-name ↔ symbol mapping
 	// is needed for debugging or symbolication.
 	KeepSymbols bool `json:"keep_symbols,omitempty"`
+
+	// PrebuiltArchives lists static libraries that are NOT produced by
+	// replaying the captured upstream build, and that the library link must
+	// nevertheless pull from. Each entry is a path to a wasm32-wasi `.a`
+	// (plain objects or LLVM bitcode); relative paths resolve against the
+	// directory holding wasmify.json.
+	//
+	// This exists for upstreams that ship, or publish, an already-compiled
+	// wasm static library instead of sources wasmify can compile — a project
+	// whose native build is too heavy to reproduce, and which therefore
+	// releases the wasm32-wasi archive as a build artifact. Such a project has
+	// an empty build.json (nothing to replay), so the archive would otherwise
+	// never reach the link.
+	//
+	// The archives are appended AFTER the ones discovered under the build
+	// tree's lib/, so a symbol the replayed build defines wins over the same
+	// symbol in a prebuilt archive.
+	PrebuiltArchives []string `json:"prebuilt_archives,omitempty"`
+
+	// ExtraCXXFlags are appended to the compile of every bridge source (the
+	// generated api_bridge.cc, custom_bridge.cc, and each
+	// bridge.CustomBridgeSources entry). They land after wasmify's own flags,
+	// so a repeated option overrides wasmify's default — `-std=gnu++23`
+	// overrides the built-in `-std=c++20`.
+	//
+	// A bridge that includes a prebuilt library's headers generally has to
+	// match the flags that library was compiled with, because several of them
+	// change ABI rather than just diagnostics: `-fno-rtti`, `-fno-exceptions`,
+	// `-fno-sized-deallocation` and `-fno-aligned-new` all alter which
+	// `operator new`/`operator delete` overloads are emitted and called.
+	ExtraCXXFlags []string `json:"extra_cxxflags,omitempty"`
+
+	// BridgeExtraIncludes are extra `-I` directories for the bridge compiles.
+	// Relative paths resolve against the directory holding wasmify.json.
+	//
+	// The bridge otherwise only sees include paths harvested from the captured
+	// upstream compile steps, so a prebuilt library's headers — which no
+	// captured step ever referenced — are unreachable without this. Mirrors the
+	// WASMIFY_BRIDGE_EXTRA_INCLUDES environment variable.
+	BridgeExtraIncludes []string `json:"bridge_extra_includes,omitempty"`
+
+	// ExtraLDFlags are appended to every link step, including the library link
+	// that LinkLibrary performs. Use it for flags the captured build never
+	// carried: `-Wl,--wrap=connect` to route libc calls to host shims,
+	// `-Wl,--stack-first` for a library that assumes the C stack grows down
+	// toward address zero, an extra `-l` for a sysroot emulation library.
+	// Mirrors the WASMIFY_EXTRA_LDFLAGS environment variable.
+	ExtraLDFlags []string `json:"extra_ldflags,omitempty"`
 }
 
 // Previously serialised as bridge-config.json; now lives under the

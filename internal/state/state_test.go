@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -256,5 +257,33 @@ func TestBridgeConfigHostSubprocessJSON(t *testing.T) {
 	}
 	if s2.Bridge == nil || s2.Bridge.HostSubprocess {
 		t.Fatalf("HostSubprocess should default to false, got %+v", s2.Bridge)
+	}
+}
+
+// The wasm_build knobs a prebuilt-archive project depends on must survive a
+// Save/Load round trip: they are the only channel through which such a project
+// can reach the link and the bridge compiles, and a silently dropped field would
+// surface as an inscrutable linker error rather than a config error.
+func TestWasmBuildConfigRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	want := &WasmBuildConfig{
+		KeepSymbols:         true,
+		PrebuiltArchives:    []string{"deps/libengine.a", "deps/libengine_support.a"},
+		ExtraCXXFlags:       []string{"-std=gnu++20", "-fno-rtti"},
+		ExtraLDFlags:        []string{"-Wl,--stack-first"},
+		BridgeExtraIncludes: []string{"deps/include"},
+	}
+	if err := Save(dir, &State{Version: SchemaVersion, WasmBuild: want}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.WasmBuild == nil {
+		t.Fatal("wasm_build section lost")
+	}
+	if !reflect.DeepEqual(got.WasmBuild, want) {
+		t.Errorf("wasm_build = %+v, want %+v", got.WasmBuild, want)
 	}
 }

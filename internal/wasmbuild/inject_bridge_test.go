@@ -443,3 +443,85 @@ func TestApplyEnvOverridesEmscriptenDefine(t *testing.T) {
 		t.Fatal("expected NoEmscriptenDefine false when unset")
 	}
 }
+
+// A bridge that includes a prebuilt library's headers has to be compiled with
+// that library's flags. The project declares them in wasm_build.extra_cxxflags;
+// they must land after wasmify's own flags (clang takes the LAST occurrence of a
+// repeated option) but before the -o/source operands, so `-std=gnu++23`
+// overrides the built-in `-std=c++20` instead of being ignored.
+func TestBuildBridgeCompileArgsExtraCXXFlags(t *testing.T) {
+	cfg := WasmConfig{
+		WasiSDKPath:   "/fake/wasi-sdk",
+		Target:        "wasm32-wasip1",
+		ExtraCXXFlags: []string{"-std=gnu++23", "-fno-rtti", "-fno-sized-deallocation"},
+	}
+	args := buildBridgeCompileArgs("b.cc", "b.o", cfg, nil)
+
+	lastStd, wantStd := -1, -1
+	for i, a := range args {
+		if strings.HasPrefix(a, "-std=") {
+			lastStd = i
+		}
+		if a == "-std=gnu++23" {
+			wantStd = i
+		}
+	}
+	if wantStd == -1 {
+		t.Fatalf("-std=gnu++23 missing from bridge compile args: %v", args)
+	}
+	if lastStd != wantStd {
+		t.Errorf("-std=gnu++23 at %d is not the last -std flag (last is %q at %d); clang would use the wrong standard",
+			wantStd, args[lastStd], lastStd)
+	}
+
+	// The operands must stay at the tail: `-o <out> <src>`.
+	if n := len(args); n < 3 || args[n-3] != "-o" || args[n-2] != "b.o" || args[n-1] != "b.cc" {
+		t.Errorf("extra flags displaced the -o/source operands: %v", args[max(0, len(args)-4):])
+	}
+
+	for _, want := range []string{"-fno-rtti", "-fno-sized-deallocation"} {
+		found := false
+		for _, a := range args {
+			if a == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s missing from bridge compile args: %v", want, args)
+		}
+	}
+}
+
+func TestApplyEnvOverridesExtraCXXFlagsAndPrebuiltArchives(t *testing.T) {
+	t.Setenv("WASMIFY_EXTRA_CXXFLAGS", "-fno-rtti  -fno-exceptions")
+	t.Setenv("WASMIFY_PREBUILT_ARCHIVES", "/deps/a.a::/deps/b.a")
+
+	// Env overrides ADD to what wasmify.json already configured, matching how
+	// ExtraLDFlags / BridgeExtraIncludes behave.
+	cfg := WasmConfig{
+		ExtraCXXFlags:    []string{"-std=gnu++23"},
+		PrebuiltArchives: []string{"/deps/pre.a"},
+	}
+	cfg.ApplyEnvOverrides()
+
+	wantFlags := []string{"-std=gnu++23", "-fno-rtti", "-fno-exceptions"}
+	if len(cfg.ExtraCXXFlags) != len(wantFlags) {
+		t.Fatalf("ExtraCXXFlags = %v, want %v", cfg.ExtraCXXFlags, wantFlags)
+	}
+	for i, w := range wantFlags {
+		if cfg.ExtraCXXFlags[i] != w {
+			t.Errorf("ExtraCXXFlags[%d] = %q, want %q", i, cfg.ExtraCXXFlags[i], w)
+		}
+	}
+
+	// Empty colon-separated segments are dropped, as for BridgeExtraIncludes.
+	wantArchives := []string{"/deps/pre.a", "/deps/a.a", "/deps/b.a"}
+	if len(cfg.PrebuiltArchives) != len(wantArchives) {
+		t.Fatalf("PrebuiltArchives = %v, want %v", cfg.PrebuiltArchives, wantArchives)
+	}
+	for i, w := range wantArchives {
+		if cfg.PrebuiltArchives[i] != w {
+			t.Errorf("PrebuiltArchives[%d] = %q, want %q", i, cfg.PrebuiltArchives[i], w)
+		}
+	}
+}
