@@ -9,11 +9,11 @@ import (
 	"strings"
 )
 
-// LinkLibrary creates a single .wasm from all successfully built .a files
-// in the build directory. This is used for library targets that have no
-// native link step (e.g., Bazel cc_library targets).
-// extraObjects are additional .o files to include (e.g., api_bridge.o).
-func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (string, error) {
+// collectArchives returns, in link order, every static library the library link
+// must pass to the linker: first the archives the wasm-build replay produced
+// under <BuildDir>/lib/, then the ones the project declared as already compiled
+// (wasmify.json wasm_build.prebuilt_archives).
+func collectArchives(cfg WasmConfig) ([]string, error) {
 	libDir := filepath.Join(cfg.BuildDir, "lib")
 
 	// Archives are laid out under lib/ mirroring their source directories
@@ -24,6 +24,13 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	var archives []string
 	err := filepath.WalkDir(libDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// A project whose every archive is prebuilt replays no compile or
+			// archive step, so lib/ is never created. Treat that as "no archives
+			// from the build tree" rather than a failure; the emptiness check
+			// below decides whether the link has anything to work with.
+			if path == libDir && os.IsNotExist(err) {
+				return filepath.SkipAll
+			}
 			return err
 		}
 		if d.IsDir() {
@@ -35,10 +42,7 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to walk lib directory: %w", err)
-	}
-	if len(archives) == 0 {
-		return "", fmt.Errorf("no .a/.lo archives found under %s", libDir)
+		return nil, fmt.Errorf("failed to walk lib directory: %w", err)
 	}
 	// Order archives by basename (full path breaks ties deterministically).
 	// wasm-ld pulls archive members to satisfy still-undefined symbols, so the
@@ -53,6 +57,33 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 		}
 		return archives[i] < archives[j]
 	})
+
+	// Archives the project ships already compiled go last, so a symbol the
+	// replayed build defines is picked up before the prebuilt copy of the same
+	// symbol. Sorting is deliberately NOT applied: the declared order is the
+	// user's, and a prebuilt set can require a specific order among its members.
+	for _, ar := range cfg.PrebuiltArchives {
+		if _, statErr := os.Stat(ar); statErr != nil {
+			return nil, fmt.Errorf("prebuilt archive %s: %w (declared in wasmify.json wasm_build.prebuilt_archives)", ar, statErr)
+		}
+		archives = append(archives, ar)
+	}
+
+	if len(archives) == 0 {
+		return nil, fmt.Errorf("no .a/.lo archives found under %s and no wasm_build.prebuilt_archives declared", libDir)
+	}
+	return archives, nil
+}
+
+// LinkLibrary creates a single .wasm from all successfully built .a files
+// in the build directory. This is used for library targets that have no
+// native link step (e.g., Bazel cc_library targets).
+// extraObjects are additional .o files to include (e.g., api_bridge.o).
+func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (string, error) {
+	archives, err := collectArchives(cfg)
+	if err != nil {
+		return "", err
+	}
 
 	outputFile := filepath.Join(cfg.BuildDir, "output", targetName+".wasm")
 	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {

@@ -238,6 +238,15 @@ func buildBridgeCompileArgs(srcFile, outputFile string, cfg WasmConfig, includeF
 	// -I for the host-include stubs are applied by wasmCompileFlags above, which
 	// runs for every wasm-build compile (bridge, shims, and upstream sources
 	// alike), so they are not repeated here.
+	//
+	// Project-declared flags come last (wasmify.json wasm_build.extra_cxxflags).
+	// clang resolves a repeated option to its last occurrence, so this is also
+	// how a project overrides a wasmify default — notably the -std=c++20 above,
+	// which a library whose headers need a newer standard must raise. A bridge
+	// including a prebuilt library's headers additionally has to match that
+	// library's ABI-affecting flags (-fno-rtti, -fno-exceptions,
+	// -fno-sized-deallocation, -fno-aligned-new).
+	args = append(args, cfg.ExtraCXXFlags...)
 	args = append(args, "-o", outputFile, srcFile)
 	return args
 }

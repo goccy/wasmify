@@ -31,6 +31,8 @@ type WasmConfig struct {
 	NoEmscriptenDefine  bool     // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
 	ExtraLDFlags        []string // Extra linker flags appended to every (non-skipped) link step, e.g. -Wl,--wrap=connect; mirrors WASMIFY_EXTRA_LDFLAGS
 	BridgeExtraIncludes []string // Extra -I directories for compiling the generated/custom bridge sources; mirrors WASMIFY_BRIDGE_EXTRA_INCLUDES
+	ExtraCXXFlags       []string // Extra compile flags for the bridge sources, appended last so they override wasmify's defaults (wasmify.json wasm_build.extra_cxxflags); mirrors WASMIFY_EXTRA_CXXFLAGS
+	PrebuiltArchives    []string // Absolute paths to already-compiled wasm32-wasi .a files linked after the build tree's own archives (wasmify.json wasm_build.prebuilt_archives); mirrors WASMIFY_PREBUILT_ARCHIVES
 }
 
 // envSet reports whether an environment variable carries a value. Presence —
@@ -63,10 +65,20 @@ func (c *WasmConfig) ApplyEnvOverrides() {
 	// Space-separated linker flags, appended so an env override adds to (rather
 	// than replaces) anything already configured.
 	c.ExtraLDFlags = append(c.ExtraLDFlags, strings.Fields(os.Getenv("WASMIFY_EXTRA_LDFLAGS"))...)
+	// Space-separated bridge compile flags. Appended for the same reason, and
+	// because clang resolves a repeated option to its last occurrence, an env
+	// override also beats the same flag set in wasmify.json.
+	c.ExtraCXXFlags = append(c.ExtraCXXFlags, strings.Fields(os.Getenv("WASMIFY_EXTRA_CXXFLAGS"))...)
 	// Colon-separated include directories; empty segments are dropped.
 	for _, dir := range strings.Split(os.Getenv("WASMIFY_BRIDGE_EXTRA_INCLUDES"), ":") {
 		if dir = strings.TrimSpace(dir); dir != "" {
 			c.BridgeExtraIncludes = append(c.BridgeExtraIncludes, dir)
+		}
+	}
+	// Colon-separated archive paths; empty segments are dropped.
+	for _, ar := range strings.Split(os.Getenv("WASMIFY_PREBUILT_ARCHIVES"), ":") {
+		if ar = strings.TrimSpace(ar); ar != "" {
+			c.PrebuiltArchives = append(c.PrebuiltArchives, ar)
 		}
 	}
 }
