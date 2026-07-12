@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/bufbuild/protocompile v0.14.1
-	github.com/goccy/wasm2go v0.4.5
+	github.com/goccy/wasm2go v0.4.6
 	google.golang.org/protobuf v1.36.11
 )
 
