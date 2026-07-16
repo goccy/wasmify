@@ -93,6 +93,13 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// ("exit status 1" before any pass runs). Inert for wasm that
 		// has no EH.
 		"--enable-exception-handling",
+		// Threads: a shared-memory wasm carries atomic rmw/wait/notify
+		// opcodes. Without this flag wasm-opt treats the module as
+		// single-threaded and is free to DOWNGRADE atomics to plain
+		// loads/stores — the binary still validates and runs, but mutex
+		// unlocks stop seeing waiter bits and cross-thread futex handoffs
+		// silently deadlock. Inert for non-threaded wasm.
+		"--enable-threads",
 		"--strip-debug",
 		"--strip-producers",
 		"--strip-target-features",

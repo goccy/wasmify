@@ -10,6 +10,21 @@ import (
 // a bigger stack than the wasi-sdk default (64 KB) to avoid stack overflow.
 const DefaultStackSize = 33554432
 
+// DefaultMaxMemoryPages is the maximum a THREADS build declares for its shared
+// memory, in 64 KiB pages (1024 pages = 64 MiB). The WebAssembly threads
+// proposal requires a shared memory to declare a bounded maximum, and
+// wasm-ld --shared-memory will not link without --max-memory, so a threads
+// build must carry one. It is a property of the wasm binary, enforced by
+// whatever runs it — a conventional VM caps memory.grow at this value.
+//
+// The wasm2go backend is the exception: it transpiles the wasm to Go and
+// enforces the EMBEDDING HOST's own runtime cap instead of the baked value, so
+// under wasm2go this bounds nothing the host does not re-choose (it only seeds
+// a default the host may override per instance). Raise it (wasmify.json
+// wasm_build.max_memory_pages) for VM backends whose guest heap needs more, or
+// to lift the default ceiling a wasm2go embedder starts from.
+const DefaultMaxMemoryPages = 1024
+
 // WasmConfig holds configuration for wasm build transformation and execution.
 type WasmConfig struct {
 	WasiSDKPath         string   // Path to wasi-sdk installation
@@ -26,6 +41,8 @@ type WasmConfig struct {
 	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
 	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
+	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
+	MaxMemoryPages      int      // Threads only: the shared memory's declared maximum in the wasm binary, in 64 KiB pages (default DefaultMaxMemoryPages). Mandatory for a threads build (the WebAssembly threads proposal requires a bounded shared memory). A conventional VM enforces it as the memory.grow cap; the wasm2go backend instead honors the embedding host's own runtime cap, which overrides this baked value.
 	KeepSymbols         bool     // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
 	NoPosixCompat       bool     // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT
 	NoEmscriptenDefine  bool     // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
@@ -55,6 +72,9 @@ func (c *WasmConfig) ApplyEnvOverrides() {
 	}
 	if envSet("WASMIFY_HOST_SUBPROCESS") {
 		c.HostSubprocess = true
+	}
+	if envSet("WASMIFY_HOST_THREADS") {
+		c.HostThreads = true
 	}
 	if envSet("WASMIFY_NO_POSIX_COMPAT") {
 		c.NoPosixCompat = true
