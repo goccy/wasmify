@@ -747,7 +747,7 @@ func hostCaptureInjectFlags(dataDir, outDir string) string {
 	if err != nil || s == nil || s.Bridge == nil {
 		return ""
 	}
-	if !s.Bridge.HostSockets && !s.Bridge.HostSubprocess {
+	if !s.Bridge.HostSockets && !s.Bridge.HostSubprocess && !s.Bridge.HostThreads {
 		return ""
 	}
 	buildDir := filepath.Join(dataDir, "wasm-build")
@@ -769,6 +769,9 @@ func hostCaptureInjectFlags(dataDir, outDir string) string {
 	}
 	if s.Bridge.HostSockets {
 		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
+	}
+	if s.Bridge.HostThreads {
+		flags = append(flags, "-DWASMIFY_HOST_THREADS", "-pthread")
 	}
 	return strings.Join(flags, " ")
 }
@@ -1333,6 +1336,12 @@ func cmdWasmBuild(args []string) error {
 		}
 		if s.Bridge.HostSubprocess {
 			cfg.HostSubprocess = true
+		}
+		if s.Bridge.HostThreads {
+			cfg.HostThreads = true
+		}
+		if s.Bridge.MaxMemoryPages > 0 {
+			cfg.MaxMemoryPages = s.Bridge.MaxMemoryPages
 		}
 		// The project's hand-written bridge implementation sources (an
 		// embedding layer like py.c). Resolve each against the config dir

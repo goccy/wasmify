@@ -365,6 +365,32 @@ type BridgeConfig struct {
 	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
 	HostSubprocess bool `json:"HostSubprocess,omitempty"`
 
+	// HostThreads opts into threads. The wasm is built for wasi-threads
+	// (-pthread, shared memory, atomics), which makes it import
+	// wasi_thread_spawn and export wasi_thread_start — and wasm2go runs each
+	// guest thread on a GOROUTINE, so unlike sockets or subprocess this
+	// capability needs no host implementation at all: a Go embedder gets real
+	// concurrency for free. Guests that never spawn pay nothing.
+	HostThreads bool `json:"HostThreads,omitempty"`
+
+	// MaxMemoryPages declares the shared memory's maximum in the wasm binary, in
+	// 64 KiB pages (threads only; the WebAssembly threads proposal requires a
+	// shared memory to declare a bounded maximum, and wasm-ld --shared-memory
+	// will not link without it). It is a property of the binary, enforced by
+	// whatever runs the wasm — a conventional VM caps memory.grow here.
+	//
+	// The wasm2go backend is the exception. It transpiles the wasm to Go and
+	// enforces the embedding host's own runtime cap instead: an embedder can set
+	// a per-instance memory cap that overrides this baked maximum in either
+	// direction. Under wasm2go this value only seeds a default the host may
+	// replace; it bounds nothing the host re-chooses. (Reserving the ceiling up
+	// front as virtual, lazily-resident address space is what lets a shared
+	// memory's growth stay a single atomic store rather than a relocation that
+	// would invalidate the pointers other agents hold.)
+	//
+	// Zero means wasmbuild.DefaultMaxMemoryPages (64 MiB).
+	MaxMemoryPages int `json:"MaxMemoryPages,omitempty"`
+
 	// StackSize overrides the wasm linker stack size (bytes) for the final
 	// link, i.e. the `-Wl,-z,stack-size=` value. The wasi-sdk default (64 KB)
 	// is too small for C++ with deeply-nested template instantiations, so

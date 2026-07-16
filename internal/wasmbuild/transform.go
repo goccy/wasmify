@@ -749,6 +749,20 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 	return false
 }
 
+// effectiveTarget returns the target triple the wasm build actually compiles
+// and links for. HostThreads swaps wasm32-wasip1 for wasm32-wasip1-threads:
+// -pthread alone is not enough, because the target triple decides WHICH
+// prebuilt sysroot libraries (libc, libc++, libc++abi) the driver links, and
+// only the -threads flavor is compiled with the atomics/bulk-memory features.
+// Linking the plain flavor into a --shared-memory module fails with e.g.
+// "--shared-memory is disallowed by call_once.cpp.o".
+func effectiveTarget(cfg WasmConfig) string {
+	if cfg.HostThreads && cfg.Target == "wasm32-wasip1" {
+		return "wasm32-wasip1-threads"
+	}
+	return cfg.Target
+}
+
 // wasmCompileFlags returns the flags to add for wasm compilation.
 func wasmCompileFlags(cfg WasmConfig) []string {
 	var flags []string
@@ -763,6 +777,15 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	if cfg.HostSockets {
 		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
 	}
+	if cfg.HostThreads {
+		// wasi-libc's threads build: -pthread turns on <pthread.h>, thread-local
+		// storage, and the atomics/shared-memory features the threads proposal
+		// needs. The wasm carries a wasi_thread_spawn import and a
+		// wasi_thread_start export; wasm2go maps the former onto a goroutine, so
+		// the HOST implements nothing. The macro lets upstream sources take their
+		// threaded path at wasm-build only.
+		flags = append(flags, "-DWASMIFY_HOST_THREADS", "-pthread")
+	}
 	if cfg.HostSubprocess {
 		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
 		if cfg.HostIncludeDir != "" {
@@ -772,7 +795,7 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		}
 	}
 	flags = append(flags,
-		"--target="+cfg.Target,
+		"--target="+effectiveTarget(cfg),
 		"--sysroot="+Sysroot(cfg.WasiSDKPath),
 	)
 	// __EMSCRIPTEN__ bypasses sizeof(void*)==8 static_asserts, POSIX
@@ -818,7 +841,7 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 // wasmLinkFlags returns the flags to add for wasm linking.
 func wasmLinkFlags(cfg WasmConfig) []string {
 	flags := []string{
-		"--target=" + cfg.Target,
+		"--target=" + effectiveTarget(cfg),
 		"--sysroot=" + Sysroot(cfg.WasiSDKPath),
 	}
 	if cfg.NoEntry {
@@ -856,6 +879,30 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 		stackSize = DefaultStackSize
 	}
 	flags = append(flags, fmt.Sprintf("-Wl,-z,stack-size=%d", stackSize))
+	if cfg.HostThreads {
+		// A shared memory MUST declare a maximum (threads proposal), and
+		// --shared-memory + --import-memory/--export-memory is what makes
+		// wasm-ld emit one. The declared maximum is a property of the binary
+		// that a conventional VM would enforce as the growth cap; the wasm2go
+		// backend instead honors the embedding host's runtime cap and overrides
+		// this baked value (see WasmConfig.MaxMemoryPages). Reserving the
+		// ceiling up front as virtual address space, resident only where
+		// touched, is what lets a grow be a lone atomic store instead of a
+		// relocation that would invalidate every other agent's pointer.
+		maxPages := cfg.MaxMemoryPages
+		if maxPages <= 0 {
+			maxPages = DefaultMaxMemoryPages
+		}
+		flags = append(flags,
+			"-pthread",
+			"-Wl,--shared-memory",
+			"-Wl,--export-memory",
+			fmt.Sprintf("-Wl,--max-memory=%d", maxPages*65536),
+			// wasi-libc's thread entry, kept alive for wasm2go to start on a
+			// goroutine; the linker would otherwise GC it as unreferenced.
+			"-Wl,--export=wasi_thread_start",
+		)
+	}
 	// WASI emulation libraries
 	flags = append(flags,
 		"-lwasi-emulated-signal",
