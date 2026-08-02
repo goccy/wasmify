@@ -40,6 +40,14 @@ var wasm2goHasWasmify bool
 // EnvImports, and referencing either would not compile.
 var wasm2goHasEnv bool
 
+// wasm2goHasWasi records whether the transpiled engine imports
+// wasi_snapshot_preview1, i.e. whether there is anything for a caller-supplied
+// implementation to replace. It is set by emitWasm2go and read by the
+// bridge-body generation to decide whether to emit InitWith/Options: the
+// transpiler emits NewWithWASI / NewWithWASIReserve only for an engine that
+// names that module, and Options.WASI would have nowhere to go without them.
+var wasm2goHasWasi bool
+
 // unifiedImportsWasm2go is the import block of the consolidated bridge
 // file in runtime=wasm2go mode. It drops the wazero imports of the
 // default block and pulls in the transpiled wasm2go package instead.
@@ -143,11 +151,21 @@ type CallbackHandler interface {
 	HandleCallback(methodID int32, req []byte) ([]byte, error)
 }
 
-// Init initializes the global module. Must be called before any API
-// use. Safe to call multiple times (uses sync.Once).
-func Init() error {
+__WASM2GO_OPTIONS__
+
+// Init initializes the global module with the default Options. Must be
+// called before any API use. Safe to call multiple times (uses
+// sync.Once).
+func Init() error { return InitWith(Options{}) }
+
+// InitWith initializes the global module with opts. Like Init it runs at
+// most once per process: the module owns one linear memory and one C
+// heap, so there is exactly one instance and the first initialization
+// wins. A later call — with any Options — returns that instance's
+// initialization result without reconfiguring it.
+func InitWith(opts Options) error {
 	initOnce.Do(func() {
-		initErr = initModule()
+		initErr = initModule(opts)
 	})
 	return initErr
 }
@@ -161,9 +179,29 @@ func module() *Module {
 	return globalModule
 }
 
-func initModule() (retErr error) {
+// Instance returns the transpiled module the global API runs on, or nil
+// before initialization.
+//
+// It exists for base.AccessMemory, which is the only safe way to read or
+// write linear memory from a goroutine other than the one running a call
+// — an interrupt flag an embedder raises while a long call is in flight,
+// a progress word it polls. Everything else should go through the
+// generated API: calling into the module directly bypasses the lock that
+// serialises entries and the C stack would be shared with the call in
+// progress.
+func Instance() *base.Module {
+	if globalModule == nil {
+		return nil
+	}
+	return globalModule.g
+}
+
+func initModule(opts Options) (retErr error) {
 	m := &Module{}
 __WASM2GO_NEW__
+	if opts.MaxMemoryBytes > 0 {
+		wasm2go.SetMaxMemory(m.g, opts.MaxMemoryBytes)
+	}
 	// Set globalModule eagerly so the rest of the API can run even if
 	// _initialize panics partway through C++ static-initializer code.
 	globalModule = m
@@ -260,6 +298,49 @@ func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int
 	return resp, nil
 }
 
+`
+
+// wasm2goOptionsWasi is the Options type for an engine that imports
+// wasi_snapshot_preview1: the caller can substitute its own implementation of
+// the host interface and pre-size linear memory.
+const wasm2goOptionsWasi = `// Options configure the module the generated API runs on. The zero
+// value is what Init uses: the default WASI implementation (the host
+// filesystem, environment and stdio), the engine's own initial memory
+// reservation, and its wasm32 4 GiB ceiling.
+type Options struct {
+	// WASI replaces the wasi_snapshot_preview1 implementation the guest
+	// runs against. base.DefaultWASI() returns the default one, whose
+	// setters scope the filesystem to a directory (or an arbitrary
+	// base.FS), replace the environment and redirect stdio; any
+	// implementation of the interface will do. nil keeps the default.
+	WASI base.Wasi_snapshot_preview1Imports
+
+	// MemoryReserveBytes pre-reserves linear memory. A guest that grows
+	// to a size known up front — loading a large model or data file —
+	// otherwise reallocates and copies the whole linear memory as it
+	// goes. Zero keeps the engine's default headroom.
+	MemoryReserveBytes int
+
+	// MaxMemoryBytes caps linear-memory growth, so a workload bigger
+	// than expected fails inside the guest (memory.grow returns -1)
+	// instead of growing the host process. Zero keeps the engine's own
+	// ceiling.
+	MaxMemoryBytes uint64
+}
+`
+
+// wasm2goOptionsNoWasi is the Options type for an engine with no WASI import:
+// there is no host interface to substitute and no NewWithWASIReserve to
+// pre-size, so only the growth ceiling remains configurable.
+const wasm2goOptionsNoWasi = `// Options configure the module the generated API runs on. The zero
+// value is what Init uses.
+type Options struct {
+	// MaxMemoryBytes caps linear-memory growth, so a workload bigger
+	// than expected fails inside the guest (memory.grow returns -1)
+	// instead of growing the host process. Zero keeps the engine's own
+	// ceiling.
+	MaxMemoryBytes uint64
+}
 `
 
 // envStubsDeclWasm2go declares the receiver the generated env stub methods hang
@@ -377,6 +458,12 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 	// the optimizer drops that import, so we must not reference it.
 	wasm2goHasWasmify = strings.Contains(string(files["wasm2go.go"]), "WasmifyImports") ||
 		strings.Contains(string(files["base/base.go"]), "WasmifyImports")
+	// Detect the WASI-aware constructor family the same way. The transpiler
+	// emits NewWithWASIReserve only for an engine that imports
+	// wasi_snapshot_preview1 and has linear memory; that declaration is the
+	// signal that Options.WASI / Options.MemoryReserveBytes have somewhere to
+	// go.
+	wasm2goHasWasi = strings.Contains(string(files["wasm2go.go"]), "func NewWithWASIReserve(")
 
 	var envImportsSrc []byte
 	if singlePkg {
@@ -386,10 +473,20 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 		if !wasm2goHasWasmify {
 			aliasFmt = wasm2goSinglePkgBaseAliasNoCbGoFmt
 		}
-		files["base/base.go"] = []byte(fmt.Sprintf(aliasFmt, wasm2goImportPath))
+		alias := fmt.Sprintf(aliasFmt, wasm2goImportPath)
+		if wasm2goHasWasi {
+			alias += wasm2goSinglePkgBaseAliasWasiGo
+		}
+		files["base/base.go"] = []byte(alias)
 	} else {
 		envImportsSrc = files["base/base.go"]
 	}
+	// The growth ceiling is a Module field, and wasm2go names it MaxMem in
+	// multi-package mode but maxMem in single-package mode (where the field
+	// and its users share one package). Options.MaxMemoryBytes has to reach
+	// it either way, so the setter is emitted INTO the wasm2go package, where
+	// both spellings are in scope.
+	files["wasmify_maxmem.go"] = []byte(wasm2goMaxMemSetter(singlePkg, wasm2goImportPath))
 	if envImportsSrc == nil {
 		return nil, fmt.Errorf("transpileGenwasm: cannot locate EnvImports source")
 	}
@@ -453,6 +550,36 @@ import wasm2go %q
 type Module = wasm2go.Module
 type EnvImports = wasm2go.EnvImports
 `
+
+// wasm2goSinglePkgBaseAliasWasiGo re-exports the WASI host surface in
+// single-package mode, where wasm2go emits WasiStubs / DefaultWASI /
+// Wasi_snapshot_preview1Imports into the engine package instead of base/. The
+// bridge names them through base/ in both modes, so the alias keeps
+// Options.WASI spelled the same way whichever layout wasm2go chose. Appended
+// only when the engine imports wasi_snapshot_preview1 — the interface does not
+// exist otherwise.
+const wasm2goSinglePkgBaseAliasWasiGo = `
+type Wasi_snapshot_preview1Imports = wasm2go.Wasi_snapshot_preview1Imports
+type WasiStubs = wasm2go.WasiStubs
+type FS = wasm2go.FS
+
+func DefaultWASI() *WasiStubs { return wasm2go.DefaultWASI() }
+`
+
+// wasm2goMaxMemSetter returns the SetMaxMemory shim emitted into the engine
+// package. See the call site for why it cannot live in the bridge.
+func wasm2goMaxMemSetter(singlePkg bool, importPath string) string {
+	const doc = `// SetMaxMemory caps linear-memory growth: memory.grow fails (returns
+// -1) rather than taking the module past n bytes. Zero restores the
+// module's own ceiling.
+`
+	if singlePkg {
+		return "package wasm2go\n\n" + doc +
+			"func SetMaxMemory(m *Module, n uint64) { m.maxMem = n }\n"
+	}
+	return "package wasm2go\n\nimport base " + fmt.Sprintf("%q", importPath+"/base") + "\n\n" + doc +
+		"func SetMaxMemory(m *base.Module, n uint64) { m.MaxMem = n }\n"
+}
 
 // invokeArgs returns the trailing argument that a generated
 // invokeMethod / module().invoke call site needs. In wazero mode the
