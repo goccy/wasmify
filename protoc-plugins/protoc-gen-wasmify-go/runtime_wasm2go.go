@@ -235,7 +235,7 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 		if reqPtr != 0 {
 			defer wasm2go.WasmFree(m.g, reqPtr)
 		}
-		copy(wasm2go.Memory(m.g)[reqPtr:], req)
+		copy(wasmWindow(wasm2go.Memory(m.g), uint32(reqPtr), uint32(len(req))), req)
 	}
 	packed, err := call(m.g, reqPtr, reqLen)
 	if err != nil {
@@ -248,9 +248,18 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 	}
 	mem := wasm2go.Memory(m.g)
 	out := make([]byte, respLen)
-	copy(out, mem[respPtr:respPtr+respLen])
+	copy(out, wasmWindow(mem, respPtr, respLen))
 	wasm2go.WasmFree(m.g, int32(respPtr))
 	return out, nil
+}
+
+// wasmWindow returns the n-byte window at a wasm i32 pointer. Wasm
+// pointers are UNSIGNED: past the 2 GiB line the i32 bit pattern is
+// negative in Go, so a signed slice index panics; and computing
+// ptr+len in 32 bits can wrap. Widen both before slicing.
+func wasmWindow(mem []byte, ptr uint32, n uint32) []byte {
+	off := int(ptr)
+	return mem[off : off+int(n)]
 }
 
 // resolveTypeName calls the C++ bridge to get the runtime type name of
@@ -260,7 +269,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	reqPtr := wasm2go.WasmAlloc(m.g, int32(len(buf)))
-	copy(wasm2go.Memory(m.g)[reqPtr:], buf)
+	copy(wasmWindow(wasm2go.Memory(m.g), uint32(reqPtr), uint32(len(buf))), buf)
 	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, int32(len(buf)))
 	respPtr := uint32(packed >> 32)
 	respLen := uint32(packed & 0xFFFFFFFF)
@@ -269,7 +278,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 		return "", nil
 	}
 	resp := make([]byte, respLen)
-	copy(resp, wasm2go.Memory(m.g)[respPtr:respPtr+respLen])
+	copy(resp, wasmWindow(wasm2go.Memory(m.g), respPtr, respLen))
 	defer wasm2go.WasmFree(m.g, int32(respPtr))
 	if e := pbExtractError(resp); e != nil {
 		return "", e
@@ -398,7 +407,7 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	var req []byte
 	if reqLen > 0 {
 		buf := make([]byte, reqLen)
-		copy(buf, mem[reqPtr:reqPtr+reqLen])
+		copy(buf, wasmWindow(mem, uint32(reqPtr), uint32(reqLen)))
 		req = buf
 	}
 	// Release m.mu around the user handler so that nested calls
@@ -420,7 +429,7 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 		return 0
 	}
 	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	copy(wasmWindow(wasm2go.Memory(m.g), uint32(ptr), uint32(len(resp))), resp)
 	return int64(ptr)<<32 | int64(len(resp))
 }
 
