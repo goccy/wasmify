@@ -1,0 +1,66 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e3dcfd9..52cf540 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -27,6 +27,11 @@ if (CMAKE_HOST_WIN32)
+ endif()
+ 
+ set(TARGET_TRIPLE "wasm32-wasip1" CACHE STRING "WASI target to test")
++if(TARGET_TRIPLE MATCHES "^wasm64")
++  set(MUSL_ARCH "wasm64")
++else()
++  set(MUSL_ARCH "wasm32")
++endif()
+ set(CMAKE_C_COMPILER_TARGET ${TARGET_TRIPLE})
+ 
+ # We're building libc, and the compiler being used may not have a wasm sysroot
+diff --git a/libc-top-half/CMakeLists.txt b/libc-top-half/CMakeLists.txt
+index 39c175b..9f981ba 100644
+--- a/libc-top-half/CMakeLists.txt
++++ b/libc-top-half/CMakeLists.txt
+@@ -23,7 +23,7 @@ add_library(musl-top-half-interface INTERFACE)
+ target_include_directories(musl-top-half-interface INTERFACE
+   musl/src/include
+   musl/src/internal
+-  musl/arch/wasm32
++  musl/arch/${MUSL_ARCH}
+   musl/arch/generic
+   headers/private)
+ add_dependencies(musl-top-half-interface sysroot_inc)
+@@ -39,14 +39,14 @@ add_custom_command(
+   COMMAND ${CMAKE_COMMAND} -E make_directory ${SYSROOT_INC}/bits
+   COMMAND
+     ${SED} -f musl/tools/mkalltypes.sed
+-      musl/arch/wasm32/bits/alltypes.h.in
++      musl/arch/${MUSL_ARCH}/bits/alltypes.h.in
+       musl/include/alltypes.h.in
+       > ${SYSROOT_INC}/bits/alltypes.h
+   WORKING_DIRECTORY
+     ${CMAKE_CURRENT_SOURCE_DIR}
+   DEPENDS
+     musl/tools/mkalltypes.sed
+-    musl/arch/wasm32/bits/alltypes.h.in
++    musl/arch/${MUSL_ARCH}/bits/alltypes.h.in
+     musl/include/alltypes.h.in
+ )
+ add_custom_target(sysroot-bits-alltypes DEPENDS ${SYSROOT_INC}/bits/alltypes.h)
+@@ -57,7 +57,7 @@ file(GLOB_RECURSE globbed_headers RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE
+   musl/include/*.h
+   # Copy in the musl's "bits" header files.
+   musl/arch/generic/bits/*.h
+-  musl/arch/wasm32/bits/*.h
++  musl/arch/${MUSL_ARCH}/bits/*.h
+ )
+ 
+ list(REMOVE_ITEM globbed_headers
+@@ -167,8 +167,8 @@ foreach(header ${globbed_headers})
+     string(REPLACE "musl/include/" "" dst ${header})
+   elseif(${header} MATCHES "^musl/arch/generic/bits/")
+     string(REPLACE "musl/arch/generic/" "" dst ${header})
+-  elseif(${header} MATCHES "^musl/arch/wasm32/bits/")
+-    string(REPLACE "musl/arch/wasm32/" "" dst ${header})
++  elseif(${header} MATCHES "^musl/arch/${MUSL_ARCH}/bits/")
++    string(REPLACE "musl/arch/${MUSL_ARCH}/" "" dst ${header})
+   else()
+     message(FATAL_ERROR "Unhandled header file path: ${header}")
+   endif()

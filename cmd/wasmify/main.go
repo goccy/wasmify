@@ -26,6 +26,7 @@ import (
 	"github.com/goccy/wasmify/internal/state"
 	"github.com/goccy/wasmify/internal/tools"
 	"github.com/goccy/wasmify/internal/wasmbuild"
+	"github.com/goccy/wasmify/internal/wasmbuild/wasm64"
 	"github.com/goccy/wasmify/internal/wrapper"
 )
 
@@ -180,7 +181,9 @@ Commands:
   generate-build                   Generate build.json from captured build log
   validate-build                   Replay build.json to validate
   ensure-tools [--skip-wasi-sdk]   Install tools listed in arch.json (CI-friendly)
-  install-sdk [<dir>|--path <dir>] Install wasi-sdk (standalone, no config needed)
+  install-sdk [<dir>|--path <dir>] [--wasm64]
+                                  Install wasi-sdk (standalone, no config needed);
+                                  --wasm64 also builds the wasm64-wasip1 sysroot
   wasm-build [--wasi-sdk <p>] [--dry-run] [--output <dir>] [--no-cache]
              [--optimize]
                                    Transform + execute build for wasm32-wasi.
@@ -1179,6 +1182,7 @@ func cmdValidateBuild(args []string) error {
 
 func cmdInstallSDK(args []string) error {
 	installDir := ""
+	withWasm64 := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--path":
@@ -1186,6 +1190,8 @@ func cmdInstallSDK(args []string) error {
 				i++
 				installDir = args[i]
 			}
+		case "--wasm64":
+			withWasm64 = true
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				installDir = args[i]
@@ -1196,15 +1202,19 @@ func cmdInstallSDK(args []string) error {
 	sdkPath, err := wasmbuild.InstallWasiSDK(installDir)
 	if err != nil {
 		// "already installed" is not a fatal error
-		if strings.Contains(err.Error(), "already installed") {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			fmt.Fprintf(os.Stderr, "[install-sdk] Version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
-			return nil
+		if !strings.Contains(err.Error(), "already installed") {
+			return err
 		}
-		return err
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
-
 	fmt.Fprintf(os.Stderr, "[install-sdk] Version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
+
+	if withWasm64 {
+		fmt.Fprintf(os.Stderr, "[install-sdk] Provisioning the wasm64-wasip1 sysroot (wasi-libc, compiler-rt, C++ runtimes with wasm EH)...\n")
+		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

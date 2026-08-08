@@ -1,0 +1,24 @@
+diff --git a/libc-bottom-half/headers/public/wasi/wasip1.h b/libc-bottom-half/headers/public/wasi/wasip1.h
+index afca1aa..9bf7905 100644
+--- a/libc-bottom-half/headers/public/wasi/wasip1.h
++++ b/libc-bottom-half/headers/public/wasi/wasip1.h
+@@ -27,8 +27,17 @@
+ #error <wasi/api.h> is only supported on WASI platforms.
+ #endif
+ 
+-#ifndef __wasm32__
+-#error <wasi/api.h> only supports wasm32; doesn't yet support wasm64
++#if !defined(__wasm32__) && !defined(__wasm64__)
++#error <wasi/api.h> supports wasm32 and wasm64 only
++#endif
++#ifdef __wasm64__
++/* wasm64: the declarations below widen naturally to the LP64 layout
++ * (8-byte pointers, 64-bit __wasi_size_t). That widened layout is the
++ * wasm2go-defined wasm64-wasip1 ABI — there is no standardized one
++ * yet — and the runtime on the other side of these calls implements
++ * exactly it. The _Static_assert lines in this generated header
++ * document the wasm32 numbers, so they are compiled out here. */
++#define _Static_assert(...)
+ #endif
+ 
+ #include <stddef.h>

@@ -1,0 +1,23 @@
+diff --git a/libc-top-half/musl/src/env/__init_tls.c b/libc-top-half/musl/src/env/__init_tls.c
+index 8667410..be0ad78 100644
+--- a/libc-top-half/musl/src/env/__init_tls.c
++++ b/libc-top-half/musl/src/env/__init_tls.c
+@@ -49,11 +49,18 @@ static inline unsigned char *get_stack_pointer() {
+       "call __wasm_get_stack_pointer\n"
+       "local.set %0\n"
+       : "=r"(sp));
++#else
++#ifdef __wasm64__
++  __asm__(".globaltype __stack_pointer, i64\n"
++          "global.get __stack_pointer\n"
++          "local.set %0\n"
++          : "=r"(sp));
+ #else
+   __asm__(".globaltype __stack_pointer, i32\n"
+           "global.get __stack_pointer\n"
+           "local.set %0\n"
+           : "=r"(sp));
++#endif
+ #endif
+   return sp;
+ }

@@ -1,0 +1,12 @@
+--- a/libc-top-half/musl/arch/wasm64/atomic_arch.h
++++ b/libc-top-half/musl/arch/wasm64/atomic_arch.h
+@@ -4,3 +4,9 @@
+ #define a_clz_64 __builtin_clzll
+ #define a_ctz_32 __builtin_ctz
+ #define a_ctz_64 __builtin_ctzll
++
++/* wasm64: pointers are 8 bytes, so musl's generic a_cas_p (a 4-byte
++ * CAS reinterpreted as a pointer) does not apply. The __sync builtin
++ * operates at pointer width directly. */
++#define a_cas_p(p, t, s) \
++	((void *)__sync_val_compare_and_swap((void *volatile *)(p), (void *)(t), (void *)(s)))
