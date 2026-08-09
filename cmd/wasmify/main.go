@@ -1398,6 +1398,9 @@ func cmdWasmBuild(args []string) error {
 		if s.WasmBuild.Wasm64 {
 			cfg.Wasm64 = true
 		}
+		if s.WasmBuild.OptLevel != "" {
+			cfg.OptLevel = s.WasmBuild.OptLevel
+		}
 	}
 
 	// Fold the recognised WASMIFY_* environment overrides into cfg now that it
