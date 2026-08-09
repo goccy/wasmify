@@ -296,6 +296,23 @@ func executeStep(step WasmBuildStep) error {
 		}
 	}
 
+	// An archive replay must start from a clean output: build systems
+	// pair `ar q` (append) with an rm of the archive that the capture
+	// never records, so replaying the ar alone onto a leftover archive
+	// from an earlier run APPENDS — the stale members survive and the
+	// link picks whichever copy it finds first (visible as "wasm32
+	// object file can't be linked in wasm64 mode" after a target
+	// switch).
+	// ranlib is also classified StepArchive but only (re)indexes the
+	// archive the preceding ar step wrote — removing its "output" would
+	// delete that fresh archive.
+	if step.Type == buildjson.StepArchive && step.OutputFile != "" &&
+		!strings.Contains(filepath.Base(step.Executable), "ranlib") {
+		if err := os.Remove(step.OutputFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove stale archive: %w", err)
+		}
+	}
+
 	cmd := exec.Command(step.Executable, step.Args...)
 	cmd.Dir = step.WorkDir
 	cmd.Stdout = os.Stdout

@@ -5600,7 +5600,7 @@ func writeFreeFunctionDispatch(b *strings.Builder, functions []apispec.Function,
 	for i, fn := range functions {
 		exportName := fmt.Sprintf("w_%d_%d", serviceID, i)
 		fmt.Fprintf(b, "WASM_EXPORT(%s)\n", exportName)
-		fmt.Fprintf(b, "int64_t %s(void* req, int32_t req_len) { // %s\n", exportName, fn.Name)
+		fmt.Fprintf(b, "int64_t %s(void* req, size_t req_len) { // %s\n", exportName, fn.Name)
 		writeCallBody(b, &fn, "", spec, "    ")
 		b.WriteString("}\n\n")
 	}
@@ -5624,7 +5624,7 @@ func writeHandleDispatch(b *strings.Builder, c *apispec.Class, allHandles map[st
 	emit := func(methodID int, label string, body func()) {
 		exportName := fmt.Sprintf("w_%d_%d", serviceID, methodID)
 		fmt.Fprintf(b, "WASM_EXPORT(%s)\n", exportName)
-		fmt.Fprintf(b, "int64_t %s(void* req, int32_t req_len) { // %s\n", exportName, label)
+		fmt.Fprintf(b, "int64_t %s(void* req, size_t req_len) { // %s\n", exportName, label)
 		body()
 		b.WriteString("}\n\n")
 	}
@@ -6783,7 +6783,7 @@ func writeMainDispatcher(b *strings.Builder, freeFunctions []apispec.Function, c
 	b.WriteString("#include <typeinfo>\n")
 	b.WriteString("#include <cxxabi.h>\n\n")
 	b.WriteString("WASM_EXPORT(wasmify_get_type_name)\n")
-	b.WriteString("int64_t wasmify_get_type_name(void* req, int32_t req_len) {\n")
+	b.WriteString("int64_t wasmify_get_type_name(void* req, size_t req_len) {\n")
 	b.WriteString("    ProtoReader reader(req, req_len);\n")
 	b.WriteString("    uint64_t ptr = 0;\n")
 	b.WriteString("    while (reader.has_data() && reader.next()) {\n")
