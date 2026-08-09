@@ -23,7 +23,7 @@ func TestGenerateBridge(t *testing.T) {
 
 		// Wasm exports
 		{"wasm_alloc export", "WASM_EXPORT(wasm_alloc)"},
-		{"wasm_alloc func", "void* wasm_alloc(int32_t size)"},
+		{"wasm_alloc func", "void* wasm_alloc(size_t size)"},
 		{"wasm_free export", "WASM_EXPORT(wasm_free)"},
 		{"wasm_free func", "void wasm_free(void* ptr)"},
 		// The bridge no longer routes calls through a single
@@ -35,7 +35,7 @@ func TestGenerateBridge(t *testing.T) {
 
 		// Callback import
 		{"callback import", "WASM_IMPORT(wasmify, callback_invoke)"},
-		{"callback func", "int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_id, void* req, int32_t req_len)"},
+		{"callback func", "int64_t wasmify_callback_invoke(int32_t callback_id, int32_t method_id, void* req, size_t req_len)"},
 
 		// Service/method ID constants for free functions
 		{"free func service id", "SERVICE_TEST = 0"},
@@ -466,7 +466,7 @@ func TestGenerateBridgeHeader(t *testing.T) {
 		{"header guard define", "#define TEST_API_BRIDGE_H_"},
 		{"header guard endif", "#endif // TEST_API_BRIDGE_H_"},
 		{"include cstdint", "#include <cstdint>"},
-		{"wasm_alloc decl", "void* wasm_alloc(int32_t size);"},
+		{"wasm_alloc decl", "void* wasm_alloc(size_t size);"},
 		{"wasm_free decl", "void wasm_free(void* ptr);"},
 		{"wasm_init decl", "int32_t wasm_init();"},
 		{"wasm_shutdown decl", "void wasm_shutdown();"},

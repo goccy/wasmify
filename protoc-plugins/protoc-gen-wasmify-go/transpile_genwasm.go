@@ -16,7 +16,67 @@ import (
 // baseImport is the Go import path of the directory the wasm2go
 // packages will live under; for multi-package output the chunk
 // packages land at <baseImport>/base, <baseImport>/p0, ...
+// wasmDeclaresMemory64 reports whether the binary's memory section
+// declares a 64-bit (memory64) linear memory, by walking the section
+// framing of the wasm spec's binary format: 8-byte magic+version, then
+// (id byte, LEB128 size, payload) sections; in the memory section (id
+// 5) each entry starts with a limits flag whose 0x04 bit is the
+// memory64 marker. Only defined memories are inspected — every wasm
+// the wasmify pipeline builds defines its own linear memory rather
+// than importing one.
+//
+// This duplicates a check the wasm2go parser makes so the plugin can
+// choose pointer widths without requiring a wasm2go release that
+// exports it; the format is the WebAssembly spec's, not an internal
+// protocol.
+func wasmDeclaresMemory64(bin []byte) bool {
+	const headerLen = 8 // \0asm + version
+	if len(bin) < headerLen {
+		return false
+	}
+	readU32 := func(p []byte) (uint64, int) { // LEB128, bounded at u32 range
+		var v uint64
+		for i := 0; i < 5 && i < len(p); i++ {
+			v |= uint64(p[i]&0x7f) << (7 * i)
+			if p[i]&0x80 == 0 {
+				return v, i + 1
+			}
+		}
+		return 0, 0
+	}
+	for off := headerLen; off < len(bin); {
+		id := bin[off]
+		size, n := readU32(bin[off+1:])
+		if n == 0 {
+			return false
+		}
+		body := off + 1 + n
+		if body+int(size) > len(bin) {
+			return false
+		}
+		if id == 5 { // memory section
+			p := bin[body : body+int(size)]
+			count, cn := readU32(p)
+			if cn == 0 {
+				return false
+			}
+			// The first defined memory decides the module's address
+			// width (multi-memory is not in play in this pipeline).
+			if count > 0 && cn < len(p) {
+				return p[cn]&0x04 != 0
+			}
+			return false
+		}
+		off = body + int(size)
+	}
+	return false
+}
+
 func transpileGenwasm(wasmBin []byte, pkg, baseImport string) (files map[string][]byte, singlePkg bool, err error) {
+	// The bridge runtime and the transpiled package must agree on guest
+	// pointer width, so record whether this wasm declares a memory64
+	// linear memory before generating either.
+	wasm2goMem64 = wasmDeclaresMemory64(wasmBin)
 	// In single-file mode the main Go source is written to mainBuf
 	// (everything else — asm bundle, pure-Go fallback, alias.go —
 	// arrives in res.Files alongside it). In multi-package mode

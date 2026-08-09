@@ -756,7 +756,15 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 // only the -threads flavor is compiled with the atomics/bulk-memory features.
 // Linking the plain flavor into a --shared-memory module fails with e.g.
 // "--shared-memory is disallowed by call_once.cpp.o".
+//
+// Wasm64 swaps in wasm64-wasip1 the same way; the triple selects the
+// wasm64 sysroot libraries (8-byte pointers, memory64) that wasmify
+// provisions into the SDK. Wasm64 && HostThreads is rejected before any
+// build starts, so the two rewrites never compete.
 func effectiveTarget(cfg WasmConfig) string {
+	if cfg.Wasm64 && cfg.Target == "wasm32-wasip1" {
+		return "wasm64-wasip1"
+	}
 	if cfg.HostThreads && cfg.Target == "wasm32-wasip1" {
 		return "wasm32-wasip1-threads"
 	}

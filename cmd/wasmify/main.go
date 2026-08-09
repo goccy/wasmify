@@ -1395,6 +1395,9 @@ func cmdWasmBuild(args []string) error {
 			}
 			cfg.BridgeExtraIncludes = append(cfg.BridgeExtraIncludes, dir)
 		}
+		if s.WasmBuild.Wasm64 {
+			cfg.Wasm64 = true
+		}
 	}
 
 	// Fold the recognised WASMIFY_* environment overrides into cfg now that it
@@ -1403,6 +1406,14 @@ func cmdWasmBuild(args []string) error {
 	// so an option set through wasmify.json and one set through the environment
 	// behave identically.
 	cfg.ApplyEnvOverrides()
+
+	// Wasm64 and HostThreads are mutually exclusive: no toolchain produces
+	// shared (threads) wasm64 memories, and the wasm2go backend rejects
+	// atomics on a memory64 module. Refuse the combination up front rather
+	// than failing deep inside the link.
+	if cfg.Wasm64 && cfg.HostThreads {
+		return fmt.Errorf("wasm_build.wasm64 and HostThreads are mutually exclusive: there is no wasm64 threads target")
+	}
 
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
@@ -1419,6 +1430,17 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] SDK version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
 	}
 	cfg.WasiSDKPath = sdkPath
+
+	// A wasm64 build needs the wasm64-wasip1 sysroot (wasi-libc,
+	// compiler-rt, EH-enabled libc++) that the official SDK does not ship.
+	// Provision it on demand — the same stamped stages as
+	// `install-sdk --wasm64`, a no-op when already present.
+	if cfg.Wasm64 && !cfg.DryRun && !wasm64.SysrootInstalled(sdkPath) {
+		fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64-wasip1 sysroot (first wasm64 build)...\n")
+		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+			return err
+		}
+	}
 
 	// Set default build dir
 	if cfg.BuildDir == "" {

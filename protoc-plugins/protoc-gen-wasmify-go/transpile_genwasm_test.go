@@ -44,3 +44,46 @@ func TestTranspileGenwasm(t *testing.T) {
 		t.Error("no Go files produced")
 	}
 }
+
+// wasmHeader is the fixed 8-byte module preamble: \0asm magic + version 1.
+var wasmHeader = []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+
+// memSection builds a memory section (id 5) with one memory of the
+// given limits flag and a min of 1 page.
+func memSection(flags byte) []byte {
+	payload := []byte{0x01, flags, 0x01}
+	if flags&0x01 != 0 {
+		payload = append(payload, 0x02) // max, when the flag declares one
+	}
+	return append([]byte{0x05, byte(len(payload))}, payload...)
+}
+
+func TestWasmDeclaresMemory64(t *testing.T) {
+	cases := []struct {
+		name string
+		bin  []byte
+		want bool
+	}{
+		{"wasm32 min-only", append(append([]byte{}, wasmHeader...), memSection(0x00)...), false},
+		{"wasm32 min+max", append(append([]byte{}, wasmHeader...), memSection(0x01)...), false},
+		{"wasm64 min-only", append(append([]byte{}, wasmHeader...), memSection(0x04)...), true},
+		{"wasm64 min+max", append(append([]byte{}, wasmHeader...), memSection(0x05)...), true},
+		{"no memory section", wasmHeader, false},
+		{"truncated header", wasmHeader[:4], false},
+		{"empty", nil, false},
+		{
+			// A preceding section (empty type section, id 1) must be
+			// skipped, not misread as the memory section.
+			"memory after another section",
+			append(append(append([]byte{}, wasmHeader...), 0x01, 0x01, 0x00), memSection(0x04)...),
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wasmDeclaresMemory64(tc.bin); got != tc.want {
+				t.Errorf("wasmDeclaresMemory64 = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

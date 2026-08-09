@@ -215,6 +215,17 @@ type WasmBuildConfig struct {
 	// is needed for debugging or symbolication.
 	KeepSymbols bool `json:"keep_symbols,omitempty"`
 
+	// Wasm64 builds for wasm64-wasip1 (the memory64 proposal) instead of
+	// wasm32-wasip1: 8-byte guest pointers, so linear memory can grow past
+	// wasm32's 4 GiB ceiling. The wasm64 sysroot (wasi-libc, compiler-rt,
+	// EH-enabled libc++) is provisioned into wasi-sdk on demand — the first
+	// wasm64 build runs the same stages as `install-sdk --wasm64`.
+	// Requires a memory64-capable runtime (the wasm2go backend qualifies;
+	// wazero does not). Incompatible with HostThreads: no toolchain
+	// produces shared wasm64 memories, and wasm2go rejects atomics on a
+	// memory64 module. Mirrors the WASMIFY_WASM64 environment variable.
+	Wasm64 bool `json:"wasm64,omitempty"`
+
 	// PrebuiltArchives lists static libraries that are NOT produced by
 	// replaying the captured upstream build, and that the library link must
 	// nevertheless pull from. Each entry is a path to a wasm32-wasi `.a`

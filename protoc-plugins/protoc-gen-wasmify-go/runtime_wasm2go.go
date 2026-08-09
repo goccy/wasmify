@@ -40,6 +40,33 @@ var wasm2goHasWasmify bool
 // EnvImports, and referencing either would not compile.
 var wasm2goHasEnv bool
 
+// wasm2goMem64 records whether the wasm declares a 64-bit (memory64)
+// linear memory. Set by transpileGenwasm before any bridge code is
+// generated. It drives the __WPTR__ / __RESULT_CODEC__ substitutions:
+// on a memory64 module every pointer crossing the bridge is an i64 and
+// results travel as a {ptr,len} descriptor instead of a packed i64
+// (guest pointers can exceed 32 bits).
+var wasm2goMem64 bool
+
+// wptrType returns the Go type substituted for __WPTR__: the guest
+// pointer width the transpiled wasm2go package uses in its
+// export/import signatures.
+func wptrType() string {
+	if wasm2goMem64 {
+		return "int64"
+	}
+	return "int32"
+}
+
+// resultCodec returns the width-specific decodeResult /
+// encodeCallbackResult definitions substituted for __RESULT_CODEC__.
+func resultCodec() string {
+	if wasm2goMem64 {
+		return wasm64ResultCodec
+	}
+	return wasm32ResultCodec
+}
+
 // unifiedImportsWasm2go is the import block of the consolidated bridge
 // file in runtime=wasm2go mode. It drops the wazero imports of the
 // default block and pulls in the transpiled wasm2go package instead.
@@ -127,7 +154,18 @@ type Module struct {
 	cbMu      sync.RWMutex
 	callbacks map[int32]CallbackHandler
 	nextCBID  int32
+	// cbDesc is the reusable guest-memory result descriptor for callback
+	// returns on a memory64 module (see encodeCallbackResult); 0 until
+	// first use, and never touched on wasm32.
+	cbDesc wptr
 }
+
+// wptr is the guest pointer width: int32 for a wasm32 module, int64
+// for a memory64 (wasm64) one. Every pointer or length that crosses
+// the bridge boundary is a wptr; the transpiled wasm2go package's
+// export/import signatures use the same width, so the two packages
+// stay in lock-step from the one substitution the generator makes.
+type wptr = __WPTR__
 
 var (
 	globalModule *Module
@@ -178,17 +216,17 @@ __WASM2GO_NEW__
 }
 
 // invoke serializes req into wasm memory, runs the per-export caller
-// (wasm2go.Inv_<svc>_<mt>), and unpacks the (ptr<<32 | len) response.
+// (wasm2go.Inv_<svc>_<mt>), and unpacks the response via decodeResult.
 // call is the trap-safe per-export entry point: it snapshots and
 // restores the mutable wasm globals so a mid-call panic does not leak
 // an abandoned C++ activation frame.
-func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
+func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var reqPtr, reqLen int32
+	var reqPtr, reqLen wptr
 	if len(req) > 0 {
-		reqPtr = wasm2go.WasmAlloc(m.g, int32(len(req)))
-		reqLen = int32(len(req))
+		reqPtr = wasm2go.WasmAlloc(m.g, wptr(len(req)))
+		reqLen = wptr(len(req))
 		// Free reqPtr unconditionally on return so the request
 		// buffer never lingers in wasm memory when the call traps
 		// or the early-exit branches below fire. Guard against
@@ -203,15 +241,14 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 	if err != nil {
 		return nil, err
 	}
-	respPtr := uint32(packed >> 32)
-	respLen := uint32(packed & 0xFFFFFFFF)
+	respPtr, respLen := decodeResult(m.g, packed)
 	if respLen == 0 {
 		return nil, nil
 	}
 	mem := wasm2go.Memory(m.g)
 	out := make([]byte, respLen)
 	copy(out, mem[respPtr:respPtr+respLen])
-	wasm2go.WasmFree(m.g, int32(respPtr))
+	wasm2go.WasmFree(m.g, wptr(respPtr))
 	return out, nil
 }
 
@@ -221,18 +258,17 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	reqPtr := wasm2go.WasmAlloc(m.g, int32(len(buf)))
+	reqPtr := wasm2go.WasmAlloc(m.g, wptr(len(buf)))
 	copy(wasm2go.Memory(m.g)[reqPtr:], buf)
-	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, int32(len(buf)))
-	respPtr := uint32(packed >> 32)
-	respLen := uint32(packed & 0xFFFFFFFF)
+	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, wptr(len(buf)))
+	respPtr, respLen := decodeResult(m.g, packed)
 	defer wasm2go.WasmFree(m.g, reqPtr)
 	if respLen == 0 {
 		return "", nil
 	}
 	resp := make([]byte, respLen)
 	copy(resp, wasm2go.Memory(m.g)[respPtr:respPtr+respLen])
-	defer wasm2go.WasmFree(m.g, int32(respPtr))
+	defer wasm2go.WasmFree(m.g, wptr(respPtr))
 	if e := pbExtractError(resp); e != nil {
 		return "", e
 	}
@@ -249,7 +285,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 // invokeMethod fans the wasm call out into the runtime, then folds in
 // the (very common) pbExtractError check on the response. call is the
 // per-export wasm2go.Inv_<svc>_<mt> entry point.
-func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
+func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
 	resp, err := module().invoke(svc, mid, req, call)
 	if err != nil {
 		return nil, err
@@ -259,7 +295,7 @@ func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int
 	}
 	return resp, nil
 }
-
+__RESULT_CODEC__
 `
 
 // envStubsDeclWasm2go declares the receiver the generated env stub methods hang
@@ -306,7 +342,7 @@ func UnregisterCallback(id int32) {
 	m.cbMu.Unlock()
 }
 
-func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr) int64 {
 	m.cbMu.RLock()
 	handler, ok := m.callbacks[callbackID]
 	m.cbMu.RUnlock()
@@ -338,17 +374,61 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	if len(resp) == 0 {
 		return 0
 	}
-	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
-	return int64(ptr)<<32 | int64(len(resp))
+	return encodeCallbackResult(m, resp)
 }
 
 // wasmifyStubs implements wasm2go/base.WasmifyImports: the single
 // callback_invoke entry point that the C++ bridge calls back into.
 type wasmifyStubs struct{ m *Module }
 
-func (h wasmifyStubs) Callback_invoke(_ *base.Module, callbackID, methodID, reqPtr, reqLen int32) int64 {
+func (h wasmifyStubs) Callback_invoke(_ *base.Module, callbackID, methodID int32, reqPtr, reqLen wptr) int64 {
 	return h.m.handleCallback(callbackID, methodID, reqPtr, reqLen)
+}
+`
+
+// wasm32ResultCodec / wasm64ResultCodec are the width-specific halves
+// of the bridge result protocol, substituted for __RESULT_CODEC__ in
+// moduleBodyWasm2go. A result crosses the boundary as one i64: wasm32
+// packs (ptr << 32) | len; wasm64 pointers can exceed 32 bits, so the
+// i64 is instead the guest ADDRESS of a {payload_ptr, payload_len} u64
+// pair. In both cases the payload buffer transfers to the reader (who
+// frees it with wasm_free), while the descriptor belongs to the
+// returning side — the C++ bridge uses a static pair, and this side
+// reuses one per-module allocation (m.cbDesc), both safe because
+// bridge calls are serialized under m.mu. The C++ counterparts are
+// encode_result/decode_result in the generated api_bridge.cc.
+const wasm32ResultCodec = `
+func decodeResult(_ *base.Module, packed int64) (uint64, uint64) {
+	return uint64(packed) >> 32, uint64(packed) & 0xFFFFFFFF
+}
+
+func encodeCallbackResult(m *Module, resp []byte) int64 {
+	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
+	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	return int64(ptr)<<32 | int64(len(resp))
+}
+`
+
+const wasm64ResultCodec = `
+func decodeResult(g *base.Module, packed int64) (uint64, uint64) {
+	if packed == 0 {
+		return 0, 0
+	}
+	mem := wasm2go.Memory(g)
+	d := uint64(packed)
+	return binary.LittleEndian.Uint64(mem[d:]), binary.LittleEndian.Uint64(mem[d+8:])
+}
+
+func encodeCallbackResult(m *Module, resp []byte) int64 {
+	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
+	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	if m.cbDesc == 0 {
+		m.cbDesc = wasm2go.WasmAlloc(m.g, 16)
+	}
+	mem := wasm2go.Memory(m.g)
+	binary.LittleEndian.PutUint64(mem[m.cbDesc:], uint64(ptr))
+	binary.LittleEndian.PutUint64(mem[m.cbDesc+8:], uint64(len(resp)))
+	return int64(m.cbDesc)
 }
 `
 
@@ -381,7 +461,7 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 	var envImportsSrc []byte
 	if singlePkg {
 		envImportsSrc = files["wasm2go.go"]
-		files["wasm2go_compat.go"] = []byte(wasm2goSinglePkgCompatGo)
+		files["wasm2go_compat.go"] = []byte(strings.ReplaceAll(wasm2goSinglePkgCompatGo, "__WPTR__", wptrType()))
 		aliasFmt := wasm2goSinglePkgBaseAliasGoFmt
 		if !wasm2goHasWasmify {
 			aliasFmt = wasm2goSinglePkgBaseAliasNoCbGoFmt
@@ -423,10 +503,10 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 const wasm2goSinglePkgCompatGo = `package wasm2go
 
 func Memory(m *Module) []byte                                   { return m.Memory() }
-func WasmAlloc(m *Module, n int32) int32                        { return m.WasmAlloc(n) }
-func WasmFree(m *Module, ptr int32)                             { m.WasmFree(ptr) }
+func WasmAlloc(m *Module, n __WPTR__) __WPTR__                  { return m.WasmAlloc(n) }
+func WasmFree(m *Module, ptr __WPTR__)                          { m.WasmFree(ptr) }
 func WasmInit(m *Module) int32                                  { return m.WasmInit() }
-func WasmifyGetTypeName(m *Module, ptr, length int32) int64     { return m.WasmifyGetTypeName(ptr, length) }
+func WasmifyGetTypeName(m *Module, ptr, length __WPTR__) int64  { return m.WasmifyGetTypeName(ptr, length) }
 func Initialize(m *Module)                                      { m.Initialize() }
 `
 

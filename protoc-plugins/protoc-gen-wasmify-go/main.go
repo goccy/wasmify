@@ -1261,6 +1261,10 @@ func generateModule(pkg string) string {
 		if wasm2goHasWasmify {
 			body += callbackInfraWasm2go
 		}
+		// Guest pointer width and the matching result codec; see
+		// wasm2goMem64 for why these vary.
+		body = strings.ReplaceAll(body, "__RESULT_CODEC__", resultCodec())
+		body = strings.ReplaceAll(body, "__WPTR__", wptrType())
 	} else {
 		body = strings.ReplaceAll(moduleBody, "__WASM_FILE__", pkg+".wasm")
 	}

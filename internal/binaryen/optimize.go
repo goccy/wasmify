@@ -100,6 +100,10 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// unlocks stop seeing waiter bits and cross-thread futex handoffs
 		// silently deadlock. Inert for non-threaded wasm.
 		"--enable-threads",
+		// Memory64: a wasm64 build (wasm_build.wasm64) declares an i64
+		// linear memory; wasm-opt refuses to read it without this flag.
+		// Inert for wasm32.
+		"--enable-memory64",
 		"--strip-debug",
 		"--strip-producers",
 		"--strip-target-features",
