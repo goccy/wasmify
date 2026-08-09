@@ -1389,6 +1389,8 @@ func cmdWasmBuild(args []string) error {
 		}
 		cfg.ExtraCXXFlags = append(cfg.ExtraCXXFlags, s.WasmBuild.ExtraCXXFlags...)
 		cfg.ExtraLDFlags = append(cfg.ExtraLDFlags, s.WasmBuild.ExtraLDFlags...)
+		cfg.ExtraLDFlagsWasm32 = append(cfg.ExtraLDFlagsWasm32, s.WasmBuild.ExtraLDFlagsWasm32...)
+		cfg.ExtraLDFlagsWasm64 = append(cfg.ExtraLDFlagsWasm64, s.WasmBuild.ExtraLDFlagsWasm64...)
 		for _, dir := range s.WasmBuild.BridgeExtraIncludes {
 			if !filepath.IsAbs(dir) {
 				dir = filepath.Join(outDir, dir)

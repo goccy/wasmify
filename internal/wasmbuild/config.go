@@ -49,6 +49,8 @@ type WasmConfig struct {
 	NoPosixCompat       bool     // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT
 	NoEmscriptenDefine  bool     // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
 	ExtraLDFlags        []string // Extra linker flags appended to every (non-skipped) link step, e.g. -Wl,--wrap=connect; mirrors WASMIFY_EXTRA_LDFLAGS
+	ExtraLDFlagsWasm32  []string // Appended after ExtraLDFlags on wasm32 links only (wasmify.json wasm_build.extra_ldflags_wasm32) — width-specific artifacts like a vendored wasm32 -L tree
+	ExtraLDFlagsWasm64  []string // Appended after ExtraLDFlags on wasm64 links only (wasmify.json wasm_build.extra_ldflags_wasm64)
 	BridgeExtraIncludes []string // Extra -I directories for compiling the generated/custom bridge sources; mirrors WASMIFY_BRIDGE_EXTRA_INCLUDES
 	ExtraCXXFlags       []string // Extra compile flags for the bridge sources, appended last so they override wasmify's defaults (wasmify.json wasm_build.extra_cxxflags); mirrors WASMIFY_EXTRA_CXXFLAGS
 	PrebuiltArchives    []string // Absolute paths to already-compiled wasm32-wasi .a files linked after the build tree's own archives (wasmify.json wasm_build.prebuilt_archives); mirrors WASMIFY_PREBUILT_ARCHIVES
@@ -119,4 +121,17 @@ func DefaultConfig() WasmConfig {
 		AllowUndefined: true,
 		StackSize:      DefaultStackSize,
 	}
+}
+
+// EffectiveExtraLDFlags returns the link flags for the build's pointer
+// width: the common ExtraLDFlags followed by the width's own set. lld
+// applies -L search paths to every -l regardless of relative order, so
+// appending the width-specific group last still lets it override where
+// libraries resolve from.
+func (c WasmConfig) EffectiveExtraLDFlags() []string {
+	flags := append([]string(nil), c.ExtraLDFlags...)
+	if c.Wasm64 {
+		return append(flags, c.ExtraLDFlagsWasm64...)
+	}
+	return append(flags, c.ExtraLDFlagsWasm32...)
 }
