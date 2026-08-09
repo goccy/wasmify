@@ -749,6 +749,19 @@ func shouldRemoveLinkFlagPrefix(flag string) bool {
 	return false
 }
 
+// optLevel returns the validated optimization flag for every wasm
+// compile and the link: cfg.OptLevel when it names a real clang level,
+// -Oz otherwise (the size-optimal default). Validation is a whitelist —
+// a typo silently changing codegen quality is exactly the failure mode
+// an option like this invites.
+func (c WasmConfig) optLevel() string {
+	switch c.OptLevel {
+	case "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz":
+		return c.OptLevel
+	}
+	return "-Oz"
+}
+
 // effectiveTarget returns the target triple the wasm build actually compiles
 // and links for. HostThreads swaps wasm32-wasip1 for wasm32-wasip1-threads:
 // -pthread alone is not enough, because the target triple decides WHICH
@@ -836,12 +849,18 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		// differently-typed pointer), producing wrong code. Applying it to every
 		// wasm compile keeps the output faithful to what these projects expect.
 		"-fno-strict-aliasing",
-		// Force size-optimal codegen on every per-file compile. The
+		// Force one optimization level on every per-file compile. The
 		// native build (Bazel etc.) usually compiles with -O2;
 		// transformCompileStep concatenates wasmCompileFlags AFTER
 		// filterCompileFlags(step.Args) so clang's last-`-O*`-wins
-		// rule promotes every translation unit to -Oz.
-		"-Oz",
+		// rule promotes every translation unit to the chosen level —
+		// -Oz by default (size-optimal for the wasm artifact), or
+		// wasm_build.opt_level for projects where runtime speed
+		// dominates artifact size (an inference engine's kernels lose
+		// several-fold throughput at -Oz vs -O3: the vector loop
+		// shapes the downstream optimizer recognizes only come out of
+		// the speed levels).
+		cfg.optLevel(),
 	)
 	return flags
 }
@@ -863,7 +882,7 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 	// --gc-sections + --strip-all this lets wasm-ld drop everything
 	// no host caller can reach.
 	flags = append(flags,
-		"-Oz",
+		cfg.optLevel(),
 		"-Wl,--export=wasm_alloc",
 		"-Wl,--export=wasm_free",
 		"-Wl,--export=wasm_init",
@@ -950,7 +969,29 @@ func rewriteOutputPath(originalPath, buildDir, subdir, workDir, projectRoot stri
 	// archive-input reference map to the same nested path.
 	if subdir == "obj" || subdir == "lib" {
 		if ns := workDirNamespace(workDir, projectRoot); ns != "" {
-			return filepath.Join(buildDir, subdir, ns, base)
+			// Preserve the output's own path UNDER the work dir, not
+			// just its basename: one build target can compile
+			// same-named sources from sibling subdirectories (e.g.
+			// CMake emitting CMakeFiles/<t>.dir/quants.c.obj AND
+			// CMakeFiles/<t>.dir/arch/wasm/quants.c.obj from one work
+			// dir), and flattening to the basename silently overwrites
+			// one with the other — the archive then misses symbols.
+			// Both the compile's -o and the archive's member reference
+			// go through this same mapping, so they stay in agreement.
+			// A path that escapes the work dir (leading ..) cannot be
+			// mirrored inside the namespace; fall back to its basename
+			// as before.
+			rel := filepath.Clean(originalPath)
+			if filepath.IsAbs(rel) {
+				if r, err := filepath.Rel(workDir, rel); err == nil && !strings.HasPrefix(r, "..") {
+					rel = r
+				} else {
+					rel = base
+				}
+			} else if strings.HasPrefix(rel, "..") {
+				rel = base
+			}
+			return filepath.Join(buildDir, subdir, ns, rel)
 		}
 	}
 	// For .o files, derive a unique prefix from the parent directory to
@@ -1174,7 +1215,15 @@ func rewriteInputPaths(args []string, buildDir, workDir, projectRoot string) []s
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(arg)) {
-		case ".o":
+		case ".o", ".obj":
+			// .obj is CMake's object suffix in some generator setups.
+			// Without this rewrite an archive step would take the
+			// ORIGINAL build tree's objects (the capture's, compiled
+			// with the native flags and target) instead of the replayed
+			// wasm objects in obj/ — visible as "wasm32 object file
+			// can't be linked in wasm64 mode" on a wasm64 build, and as
+			// replay compile flags silently not reaching the archives on
+			// wasm32.
 			result[i] = rewriteOutputPath(arg, buildDir, "obj", workDir, projectRoot)
 		case ".a", ".lo":
 			result[i] = rewriteOutputPath(arg, buildDir, "lib", workDir, projectRoot)

@@ -215,6 +215,15 @@ type WasmBuildConfig struct {
 	// is needed for debugging or symbolication.
 	KeepSymbols bool `json:"keep_symbols,omitempty"`
 
+	// OptLevel sets the optimization flag for every wasm compile and the
+	// link: one of -O0..-O3, -Os, -Oz. Empty (default) keeps -Oz, the
+	// size-optimal choice for a shipping wasm artifact. Projects whose
+	// runtime speed dominates artifact size — an inference engine's
+	// kernels lose several-fold throughput at -Oz vs -O3, because the
+	// vector loop shapes downstream optimizers recognize only come out
+	// of the speed levels — set "-O3". Mirrors WASMIFY_OPT_LEVEL.
+	OptLevel string `json:"opt_level,omitempty"`
+
 	// Wasm64 builds for wasm64-wasip1 (the memory64 proposal) instead of
 	// wasm32-wasip1: 8-byte guest pointers, so linear memory can grow past
 	// wasm32's 4 GiB ceiling. The wasm64 sysroot (wasi-libc, compiler-rt,

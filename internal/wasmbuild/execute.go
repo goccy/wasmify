@@ -46,6 +46,8 @@ type ExecuteHandlers struct {
 // Execute runs all wasm build steps sequentially with build cache support.
 // Handlers enable interactive error recovery (missing header stubs, skip on error).
 func Execute(steps []WasmBuildStep, cfg WasmConfig, handlers ExecuteHandlers) ([]WasmBuildStep, error) {
+	logEffectiveOptLevel(steps, cfg)
+
 	// Create output directories
 	for _, dir := range []string{"obj", "lib", "src", "output"} {
 		if err := os.MkdirAll(filepath.Join(cfg.BuildDir, dir), 0o755); err != nil {
@@ -296,6 +298,23 @@ func executeStep(step WasmBuildStep) error {
 		}
 	}
 
+	// An archive replay must start from a clean output: build systems
+	// pair `ar q` (append) with an rm of the archive that the capture
+	// never records, so replaying the ar alone onto a leftover archive
+	// from an earlier run APPENDS — the stale members survive and the
+	// link picks whichever copy it finds first (visible as "wasm32
+	// object file can't be linked in wasm64 mode" after a target
+	// switch).
+	// ranlib is also classified StepArchive but only (re)indexes the
+	// archive the preceding ar step wrote — removing its "output" would
+	// delete that fresh archive.
+	if step.Type == buildjson.StepArchive && step.OutputFile != "" &&
+		!strings.Contains(filepath.Base(step.Executable), "ranlib") {
+		if err := os.Remove(step.OutputFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove stale archive: %w", err)
+		}
+	}
+
 	cmd := exec.Command(step.Executable, step.Args...)
 	cmd.Dir = step.WorkDir
 	cmd.Stdout = os.Stdout
@@ -348,4 +367,37 @@ func SaveWasmBuildJSON(dataDir string, steps []WasmBuildStep, cfg WasmConfig) er
 
 	path := filepath.Join(dataDir, "wasm-build.json")
 	return os.WriteFile(path, data, 0o644)
+}
+
+// logEffectiveOptLevel makes the build's optimization level visible up
+// front. The wasm compile/link flags append cfg.optLevel() AFTER each
+// replayed command's own flags, and clang's last-`-O*`-wins rule makes
+// the appended level the effective one — so a project whose captured
+// commands say -O3 still compiles at the -Oz default unless
+// wasm_build.opt_level pins a speed level. That silent demotion cost a
+// measured ~5x decode throughput on a llama.cpp build; this log line
+// (plus an explicit override note) is the tripwire against repeating it.
+func logEffectiveOptLevel(steps []WasmBuildStep, cfg WasmConfig) {
+	eff := cfg.optLevel()
+	src := "wasm_build.opt_level"
+	if cfg.OptLevel == "" {
+		src = "default"
+	}
+	overridden := map[string]int{}
+	for _, s := range steps {
+		if s.Skipped || s.Type != buildjson.StepCompile {
+			continue
+		}
+		for _, a := range s.Args {
+			if len(a) == 3 && strings.HasPrefix(a, "-O") && a != eff {
+				overridden[a]++
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[wasm-build] Optimization level: %s (%s)\n", eff, src)
+	for _, lvl := range []string{"-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"} {
+		if n := overridden[lvl]; n > 0 {
+			fmt.Fprintf(os.Stderr, "[wasm-build] NOTE: overriding %s from %d compile command(s) with %s; set wasm_build.opt_level to control this\n", lvl, n, eff)
+		}
+	}
 }
