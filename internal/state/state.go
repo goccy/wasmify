@@ -282,6 +282,15 @@ type WasmBuildConfig struct {
 	// toward address zero, an extra `-l` for a sysroot emulation library.
 	// Mirrors the WASMIFY_EXTRA_LDFLAGS environment variable.
 	ExtraLDFlags []string `json:"extra_ldflags,omitempty"`
+
+	// ExtraLDFlagsWasm32 / ExtraLDFlagsWasm64 are appended after
+	// ExtraLDFlags on the matching pointer width only. Use them for the
+	// flags that name width-specific artifacts — above all a -L pointing
+	// at a project-vendored wasm32 library tree (a wasm64 link hard-errors
+	// on any wasm32 archive the search path surfaces first, and the
+	// provisioned wasm64 sysroot already carries its own libraries).
+	ExtraLDFlagsWasm32 []string `json:"extra_ldflags_wasm32,omitempty"`
+	ExtraLDFlagsWasm64 []string `json:"extra_ldflags_wasm64,omitempty"`
 }
 
 // Previously serialised as bridge-config.json; now lives under the
