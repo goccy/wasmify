@@ -58,31 +58,28 @@ func memSection(flags byte) []byte {
 	return append([]byte{0x05, byte(len(payload))}, payload...)
 }
 
-func TestWasmDeclaresMemory64(t *testing.T) {
+// The guest pointer width the bridge generates against must follow the
+// input wasm's memory declaration, via the parsed module's Memory64
+// check that wasm2go exports.
+func TestTranspileGenwasmSetsMem64(t *testing.T) {
 	cases := []struct {
 		name string
 		bin  []byte
 		want bool
 	}{
-		{"wasm32 min-only", append(append([]byte{}, wasmHeader...), memSection(0x00)...), false},
-		{"wasm32 min+max", append(append([]byte{}, wasmHeader...), memSection(0x01)...), false},
-		{"wasm64 min-only", append(append([]byte{}, wasmHeader...), memSection(0x04)...), true},
-		{"wasm64 min+max", append(append([]byte{}, wasmHeader...), memSection(0x05)...), true},
-		{"no memory section", wasmHeader, false},
-		{"truncated header", wasmHeader[:4], false},
-		{"empty", nil, false},
-		{
-			// A preceding section (empty type section, id 1) must be
-			// skipped, not misread as the memory section.
-			"memory after another section",
-			append(append(append([]byte{}, wasmHeader...), 0x01, 0x01, 0x00), memSection(0x04)...),
-			true,
-		},
+		{"wasm32", append(append([]byte{}, wasmHeader...), memSection(0x00)...), false},
+		{"wasm64", append(append([]byte{}, wasmHeader...), memSection(0x04)...), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := wasmDeclaresMemory64(tc.bin); got != tc.want {
-				t.Errorf("wasmDeclaresMemory64 = %v, want %v", got, tc.want)
+			prev := wasm2goMem64
+			t.Cleanup(func() { wasm2goMem64 = prev })
+			// A header-plus-memory module has nothing to transpile;
+			// only the width recorded before translation matters here,
+			// so the translate outcome is deliberately ignored.
+			_, _, _ = transpileGenwasm(tc.bin, "enginewasm", "example.com/enginewasm")
+			if wasm2goMem64 != tc.want {
+				t.Errorf("wasm2goMem64 = %v, want %v", wasm2goMem64, tc.want)
 			}
 		})
 	}
