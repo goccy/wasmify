@@ -154,14 +154,15 @@ func InjectBridgeSteps(steps []WasmBuildStep, cfg WasmConfig, bridgeDir string, 
 // doesn't include — e.g. routing libc socket()/connect() to host-provided shims
 // in the bridge sources.
 func appendExtraLDFlags(steps []WasmBuildStep, cfg WasmConfig) []WasmBuildStep {
-	if len(cfg.ExtraLDFlags) == 0 {
+	flags := cfg.EffectiveExtraLDFlags()
+	if len(flags) == 0 {
 		return steps
 	}
 	for i := range steps {
 		if steps[i].Type != buildjson.StepLink || steps[i].Skipped {
 			continue
 		}
-		steps[i].Args = append(steps[i].Args, cfg.ExtraLDFlags...)
+		steps[i].Args = append(steps[i].Args, flags...)
 	}
 	return steps
 }

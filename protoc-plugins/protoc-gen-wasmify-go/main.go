@@ -1256,11 +1256,40 @@ func generateModule(pkg string) string {
 			}
 			newArgs += "wm"
 		}
-		body = strings.ReplaceAll(body, "__WASM2GO_NEW__",
-			prelude+"\tm.g = wasm2go.New("+newArgs+")")
+		// Construct through NewWithWASIReserve when the engine imports WASI,
+		// so Options can substitute a sandboxed implementation and pre-size
+		// linear memory. The engine's constructor takes one parameter per
+		// import module in the fixed order wasi, env, wasmify (wasm2go's
+		// knownImportModuleOrder), so prepending the WASI argument to newArgs
+		// matches the signature regardless of the wasm's declaration order.
+		// Without a WASI import there is no NewWithWASIReserve to call and no
+		// implementation to replace: fall back to plain New.
+		construct := "\tm.g = wasm2go.New(" + newArgs + ")"
+		options := wasm2goOptionsNoWasi
+		if wasm2goHasWasi {
+			reserveArgs, wasiRest := newArgs, ""
+			if reserveArgs != "" {
+				reserveArgs += ", "
+				wasiRest = ", " + newArgs
+			}
+			construct = "\twasi := opts.WASI\n" +
+				"\tif wasi == nil {\n\t\twasi = base.DefaultWASI()\n\t}\n" +
+				"\tif opts.MemoryReserveBytes > 0 {\n" +
+				"\t\tm.g = wasm2go.NewWithWASIReserve(wasi, " + reserveArgs + "opts.MemoryReserveBytes)\n" +
+				"\t} else {\n" +
+				"\t\tm.g = wasm2go.NewWithWASI(wasi" + wasiRest + ")\n" +
+				"\t}"
+			options = wasm2goOptionsWasi
+		}
+		body = strings.ReplaceAll(body, "__WASM2GO_NEW__", prelude+construct)
+		body = strings.ReplaceAll(body, "__WASM2GO_OPTIONS__", options)
 		if wasm2goHasWasmify {
 			body += callbackInfraWasm2go
 		}
+		// Guest pointer width and the matching result codec; see
+		// wasm2goMem64 for why these vary.
+		body = strings.ReplaceAll(body, "__RESULT_CODEC__", resultCodec())
+		body = strings.ReplaceAll(body, "__WPTR__", wptrType())
 	} else {
 		body = strings.ReplaceAll(moduleBody, "__WASM_FILE__", pkg+".wasm")
 	}

@@ -93,6 +93,13 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// ("exit status 1" before any pass runs). Inert for wasm that
 		// has no EH.
 		"--enable-exception-handling",
+		// SIMD: a project built with -msimd128 (vectorised compute
+		// kernels, and anything else clang vectorises) carries v128
+		// opcodes. Without
+		// this flag wasm-opt's validator rejects the module outright
+		// ("SIMD operations require SIMD [--enable-simd]") before any
+		// pass runs. Inert for wasm that has no SIMD.
+		"--enable-simd",
 		// Threads: a shared-memory wasm carries atomic rmw/wait/notify
 		// opcodes. Without this flag wasm-opt treats the module as
 		// single-threaded and is free to DOWNGRADE atomics to plain
@@ -100,6 +107,10 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// unlocks stop seeing waiter bits and cross-thread futex handoffs
 		// silently deadlock. Inert for non-threaded wasm.
 		"--enable-threads",
+		// Memory64: a wasm64 build (wasm_build.wasm64) declares an i64
+		// linear memory; wasm-opt refuses to read it without this flag.
+		// Inert for wasm32.
+		"--enable-memory64",
 		"--strip-debug",
 		"--strip-producers",
 		"--strip-target-features",

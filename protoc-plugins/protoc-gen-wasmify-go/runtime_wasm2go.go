@@ -40,6 +40,41 @@ var wasm2goHasWasmify bool
 // EnvImports, and referencing either would not compile.
 var wasm2goHasEnv bool
 
+// wasm2goMem64 records whether the wasm declares a 64-bit (memory64)
+// linear memory. Set by transpileGenwasm before any bridge code is
+// generated. It drives the __WPTR__ / __RESULT_CODEC__ substitutions:
+// on a memory64 module every pointer crossing the bridge is an i64 and
+// results travel as a {ptr,len} descriptor instead of a packed i64
+// (guest pointers can exceed 32 bits).
+var wasm2goMem64 bool
+
+// wptrType returns the Go type substituted for __WPTR__: the guest
+// pointer width the transpiled wasm2go package uses in its
+// export/import signatures.
+func wptrType() string {
+	if wasm2goMem64 {
+		return "int64"
+	}
+	return "int32"
+}
+
+// resultCodec returns the width-specific decodeResult /
+// encodeCallbackResult definitions substituted for __RESULT_CODEC__.
+func resultCodec() string {
+	if wasm2goMem64 {
+		return wasm64ResultCodec
+	}
+	return wasm32ResultCodec
+}
+
+// wasm2goHasWasi records whether the transpiled engine imports
+// wasi_snapshot_preview1, i.e. whether there is anything for a caller-supplied
+// implementation to replace. It is set by emitWasm2go and read by the
+// bridge-body generation to decide whether to emit InitWith/Options: the
+// transpiler emits NewWithWASI / NewWithWASIReserve only for an engine that
+// names that module, and Options.WASI would have nowhere to go without them.
+var wasm2goHasWasi bool
+
 // unifiedImportsWasm2go is the import block of the consolidated bridge
 // file in runtime=wasm2go mode. It drops the wazero imports of the
 // default block and pulls in the transpiled wasm2go package instead.
@@ -127,7 +162,18 @@ type Module struct {
 	cbMu      sync.RWMutex
 	callbacks map[int32]CallbackHandler
 	nextCBID  int32
+	// cbDesc is the reusable guest-memory result descriptor for callback
+	// returns on a memory64 module (see encodeCallbackResult); 0 until
+	// first use, and never touched on wasm32.
+	cbDesc wptr
 }
+
+// wptr is the guest pointer width: int32 for a wasm32 module, int64
+// for a memory64 (wasm64) one. Every pointer or length that crosses
+// the bridge boundary is a wptr; the transpiled wasm2go package's
+// export/import signatures use the same width, so the two packages
+// stay in lock-step from the one substitution the generator makes.
+type wptr = __WPTR__
 
 var (
 	globalModule *Module
@@ -143,11 +189,21 @@ type CallbackHandler interface {
 	HandleCallback(methodID int32, req []byte) ([]byte, error)
 }
 
-// Init initializes the global module. Must be called before any API
-// use. Safe to call multiple times (uses sync.Once).
-func Init() error {
+__WASM2GO_OPTIONS__
+
+// Init initializes the global module with the default Options. Must be
+// called before any API use. Safe to call multiple times (uses
+// sync.Once).
+func Init() error { return InitWith(Options{}) }
+
+// InitWith initializes the global module with opts. Like Init it runs at
+// most once per process: the module owns one linear memory and one C
+// heap, so there is exactly one instance and the first initialization
+// wins. A later call — with any Options — returns that instance's
+// initialization result without reconfiguring it.
+func InitWith(opts Options) error {
 	initOnce.Do(func() {
-		initErr = initModule()
+		initErr = initModule(opts)
 	})
 	return initErr
 }
@@ -161,9 +217,29 @@ func module() *Module {
 	return globalModule
 }
 
-func initModule() (retErr error) {
+// Instance returns the transpiled module the global API runs on, or nil
+// before initialization.
+//
+// It exists for base.AccessMemory, which is the only safe way to read or
+// write linear memory from a goroutine other than the one running a call
+// — an interrupt flag an embedder raises while a long call is in flight,
+// a progress word it polls. Everything else should go through the
+// generated API: calling into the module directly bypasses the lock that
+// serialises entries and the C stack would be shared with the call in
+// progress.
+func Instance() *base.Module {
+	if globalModule == nil {
+		return nil
+	}
+	return globalModule.g
+}
+
+func initModule(opts Options) (retErr error) {
 	m := &Module{}
 __WASM2GO_NEW__
+	if opts.MaxMemoryBytes > 0 {
+		wasm2go.SetMaxMemory(m.g, opts.MaxMemoryBytes)
+	}
 	// Set globalModule eagerly so the rest of the API can run even if
 	// _initialize panics partway through C++ static-initializer code.
 	globalModule = m
@@ -178,17 +254,17 @@ __WASM2GO_NEW__
 }
 
 // invoke serializes req into wasm memory, runs the per-export caller
-// (wasm2go.Inv_<svc>_<mt>), and unpacks the (ptr<<32 | len) response.
+// (wasm2go.Inv_<svc>_<mt>), and unpacks the response via decodeResult.
 // call is the trap-safe per-export entry point: it snapshots and
 // restores the mutable wasm globals so a mid-call panic does not leak
 // an abandoned C++ activation frame.
-func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
+func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var reqPtr, reqLen int32
+	var reqPtr, reqLen wptr
 	if len(req) > 0 {
-		reqPtr = wasm2go.WasmAlloc(m.g, int32(len(req)))
-		reqLen = int32(len(req))
+		reqPtr = wasm2go.WasmAlloc(m.g, wptr(len(req)))
+		reqLen = wptr(len(req))
 		// Free reqPtr unconditionally on return so the request
 		// buffer never lingers in wasm memory when the call traps
 		// or the early-exit branches below fire. Guard against
@@ -197,21 +273,20 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 		if reqPtr != 0 {
 			defer wasm2go.WasmFree(m.g, reqPtr)
 		}
-		copy(wasm2go.Memory(m.g)[reqPtr:], req)
+		copy(wasm2go.Memory(m.g)[wptrOff(reqPtr):], req)
 	}
 	packed, err := call(m.g, reqPtr, reqLen)
 	if err != nil {
 		return nil, err
 	}
-	respPtr := uint32(packed >> 32)
-	respLen := uint32(packed & 0xFFFFFFFF)
+	respPtr, respLen := decodeResult(m.g, packed)
 	if respLen == 0 {
 		return nil, nil
 	}
 	mem := wasm2go.Memory(m.g)
 	out := make([]byte, respLen)
 	copy(out, mem[respPtr:respPtr+respLen])
-	wasm2go.WasmFree(m.g, int32(respPtr))
+	wasm2go.WasmFree(m.g, wptr(respPtr))
 	return out, nil
 }
 
@@ -221,18 +296,17 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	reqPtr := wasm2go.WasmAlloc(m.g, int32(len(buf)))
-	copy(wasm2go.Memory(m.g)[reqPtr:], buf)
-	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, int32(len(buf)))
-	respPtr := uint32(packed >> 32)
-	respLen := uint32(packed & 0xFFFFFFFF)
+	reqPtr := wasm2go.WasmAlloc(m.g, wptr(len(buf)))
+	copy(wasm2go.Memory(m.g)[wptrOff(reqPtr):], buf)
+	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, wptr(len(buf)))
+	respPtr, respLen := decodeResult(m.g, packed)
 	defer wasm2go.WasmFree(m.g, reqPtr)
 	if respLen == 0 {
 		return "", nil
 	}
 	resp := make([]byte, respLen)
 	copy(resp, wasm2go.Memory(m.g)[respPtr:respPtr+respLen])
-	defer wasm2go.WasmFree(m.g, int32(respPtr))
+	defer wasm2go.WasmFree(m.g, wptr(respPtr))
 	if e := pbExtractError(resp); e != nil {
 		return "", e
 	}
@@ -249,7 +323,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 // invokeMethod fans the wasm call out into the runtime, then folds in
 // the (very common) pbExtractError check on the response. call is the
 // per-export wasm2go.Inv_<svc>_<mt> entry point.
-func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
+func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
 	resp, err := module().invoke(svc, mid, req, call)
 	if err != nil {
 		return nil, err
@@ -259,7 +333,50 @@ func invokeMethod(svc, mid int32, req []byte, call func(*base.Module, int32, int
 	}
 	return resp, nil
 }
+__RESULT_CODEC__
+`
 
+// wasm2goOptionsWasi is the Options type for an engine that imports
+// wasi_snapshot_preview1: the caller can substitute its own implementation of
+// the host interface and pre-size linear memory.
+const wasm2goOptionsWasi = `// Options configure the module the generated API runs on. The zero
+// value is what Init uses: the default WASI implementation (the host
+// filesystem, environment and stdio), the engine's own initial memory
+// reservation, and its wasm32 4 GiB ceiling.
+type Options struct {
+	// WASI replaces the wasi_snapshot_preview1 implementation the guest
+	// runs against. base.DefaultWASI() returns the default one, whose
+	// setters scope the filesystem to a directory (or an arbitrary
+	// base.FS), replace the environment and redirect stdio; any
+	// implementation of the interface will do. nil keeps the default.
+	WASI base.Wasi_snapshot_preview1Imports
+
+	// MemoryReserveBytes pre-reserves linear memory. A guest that grows
+	// to a size known up front — loading a large model or data file —
+	// otherwise reallocates and copies the whole linear memory as it
+	// goes. Zero keeps the engine's default headroom.
+	MemoryReserveBytes int
+
+	// MaxMemoryBytes caps linear-memory growth, so a workload bigger
+	// than expected fails inside the guest (memory.grow returns -1)
+	// instead of growing the host process. Zero keeps the engine's own
+	// ceiling.
+	MaxMemoryBytes uint64
+}
+`
+
+// wasm2goOptionsNoWasi is the Options type for an engine with no WASI import:
+// there is no host interface to substitute and no NewWithWASIReserve to
+// pre-size, so only the growth ceiling remains configurable.
+const wasm2goOptionsNoWasi = `// Options configure the module the generated API runs on. The zero
+// value is what Init uses.
+type Options struct {
+	// MaxMemoryBytes caps linear-memory growth, so a workload bigger
+	// than expected fails inside the guest (memory.grow returns -1)
+	// instead of growing the host process. Zero keeps the engine's own
+	// ceiling.
+	MaxMemoryBytes uint64
+}
 `
 
 // envStubsDeclWasm2go declares the receiver the generated env stub methods hang
@@ -306,7 +423,7 @@ func UnregisterCallback(id int32) {
 	m.cbMu.Unlock()
 }
 
-func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int64 {
+func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr) int64 {
 	m.cbMu.RLock()
 	handler, ok := m.callbacks[callbackID]
 	m.cbMu.RUnlock()
@@ -317,7 +434,7 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	var req []byte
 	if reqLen > 0 {
 		buf := make([]byte, reqLen)
-		copy(buf, mem[reqPtr:reqPtr+reqLen])
+		copy(buf, mem[wptrOff(reqPtr):wptrOff(reqPtr)+uint64(reqLen)])
 		req = buf
 	}
 	// Release m.mu around the user handler so that nested calls
@@ -338,17 +455,73 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	if len(resp) == 0 {
 		return 0
 	}
-	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
-	return int64(ptr)<<32 | int64(len(resp))
+	return encodeCallbackResult(m, resp)
 }
 
 // wasmifyStubs implements wasm2go/base.WasmifyImports: the single
 // callback_invoke entry point that the C++ bridge calls back into.
 type wasmifyStubs struct{ m *Module }
 
-func (h wasmifyStubs) Callback_invoke(_ *base.Module, callbackID, methodID, reqPtr, reqLen int32) int64 {
+func (h wasmifyStubs) Callback_invoke(_ *base.Module, callbackID, methodID int32, reqPtr, reqLen wptr) int64 {
 	return h.m.handleCallback(callbackID, methodID, reqPtr, reqLen)
+}
+`
+
+// wasm32ResultCodec / wasm64ResultCodec are the width-specific halves
+// of the bridge result protocol, substituted for __RESULT_CODEC__ in
+// moduleBodyWasm2go. A result crosses the boundary as one i64: wasm32
+// packs (ptr << 32) | len; wasm64 pointers can exceed 32 bits, so the
+// i64 is instead the guest ADDRESS of a {payload_ptr, payload_len} u64
+// pair. In both cases the payload buffer transfers to the reader (who
+// frees it with wasm_free), while the descriptor belongs to the
+// returning side — the C++ bridge uses a static pair, and this side
+// reuses one per-module allocation (m.cbDesc), both safe because
+// bridge calls are serialized under m.mu. The C++ counterparts are
+// encode_result/decode_result in the generated api_bridge.cc.
+const wasm32ResultCodec = `
+// wptrOff widens a guest pointer to an unsigned slice offset. wasm32
+// pointers are UNSIGNED i32s: past the 2 GiB line the bit pattern is
+// negative in Go, so a signed slice index would panic.
+func wptrOff(p wptr) uint64 {
+	return uint64(uint32(p))
+}
+
+func decodeResult(_ *base.Module, packed int64) (uint64, uint64) {
+	return uint64(packed) >> 32, uint64(packed) & 0xFFFFFFFF
+}
+
+func encodeCallbackResult(m *Module, resp []byte) int64 {
+	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
+	copy(wasm2go.Memory(m.g)[wptrOff(ptr):], resp)
+	return int64(ptr)<<32 | int64(len(resp))
+}
+`
+
+const wasm64ResultCodec = `
+// wptrOff widens a guest pointer to an unsigned slice offset.
+func wptrOff(p wptr) uint64 {
+	return uint64(p)
+}
+
+func decodeResult(g *base.Module, packed int64) (uint64, uint64) {
+	if packed == 0 {
+		return 0, 0
+	}
+	mem := wasm2go.Memory(g)
+	d := uint64(packed)
+	return binary.LittleEndian.Uint64(mem[d:]), binary.LittleEndian.Uint64(mem[d+8:])
+}
+
+func encodeCallbackResult(m *Module, resp []byte) int64 {
+	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
+	copy(wasm2go.Memory(m.g)[wptrOff(ptr):], resp)
+	if m.cbDesc == 0 {
+		m.cbDesc = wasm2go.WasmAlloc(m.g, 16)
+	}
+	mem := wasm2go.Memory(m.g)
+	binary.LittleEndian.PutUint64(mem[wptrOff(m.cbDesc):], uint64(ptr))
+	binary.LittleEndian.PutUint64(mem[wptrOff(m.cbDesc)+8:], uint64(len(resp)))
+	return int64(m.cbDesc)
 }
 `
 
@@ -377,19 +550,35 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 	// the optimizer drops that import, so we must not reference it.
 	wasm2goHasWasmify = strings.Contains(string(files["wasm2go.go"]), "WasmifyImports") ||
 		strings.Contains(string(files["base/base.go"]), "WasmifyImports")
+	// Detect the WASI-aware constructor family the same way. The transpiler
+	// emits NewWithWASIReserve only for an engine that imports
+	// wasi_snapshot_preview1 and has linear memory; that declaration is the
+	// signal that Options.WASI / Options.MemoryReserveBytes have somewhere to
+	// go.
+	wasm2goHasWasi = strings.Contains(string(files["wasm2go.go"]), "func NewWithWASIReserve(")
 
 	var envImportsSrc []byte
 	if singlePkg {
 		envImportsSrc = files["wasm2go.go"]
-		files["wasm2go_compat.go"] = []byte(wasm2goSinglePkgCompatGo)
+		files["wasm2go_compat.go"] = []byte(strings.ReplaceAll(wasm2goSinglePkgCompatGo, "__WPTR__", wptrType()))
 		aliasFmt := wasm2goSinglePkgBaseAliasGoFmt
 		if !wasm2goHasWasmify {
 			aliasFmt = wasm2goSinglePkgBaseAliasNoCbGoFmt
 		}
-		files["base/base.go"] = []byte(fmt.Sprintf(aliasFmt, wasm2goImportPath))
+		alias := fmt.Sprintf(aliasFmt, wasm2goImportPath)
+		if wasm2goHasWasi {
+			alias += wasm2goSinglePkgBaseAliasWasiGo
+		}
+		files["base/base.go"] = []byte(alias)
 	} else {
 		envImportsSrc = files["base/base.go"]
 	}
+	// The growth ceiling is a Module field, and wasm2go names it MaxMem in
+	// multi-package mode but maxMem in single-package mode (where the field
+	// and its users share one package). Options.MaxMemoryBytes has to reach
+	// it either way, so the setter is emitted INTO the wasm2go package, where
+	// both spellings are in scope.
+	files["wasmify_maxmem.go"] = []byte(wasm2goMaxMemSetter(singlePkg, wasm2goImportPath))
 	if envImportsSrc == nil {
 		return nil, fmt.Errorf("transpileGenwasm: cannot locate EnvImports source")
 	}
@@ -423,10 +612,10 @@ func emitWasm2go(plugin *protogen.Plugin, importPath protogen.GoImportPath) ([]b
 const wasm2goSinglePkgCompatGo = `package wasm2go
 
 func Memory(m *Module) []byte                                   { return m.Memory() }
-func WasmAlloc(m *Module, n int32) int32                        { return m.WasmAlloc(n) }
-func WasmFree(m *Module, ptr int32)                             { m.WasmFree(ptr) }
+func WasmAlloc(m *Module, n __WPTR__) __WPTR__                  { return m.WasmAlloc(n) }
+func WasmFree(m *Module, ptr __WPTR__)                          { m.WasmFree(ptr) }
 func WasmInit(m *Module) int32                                  { return m.WasmInit() }
-func WasmifyGetTypeName(m *Module, ptr, length int32) int64     { return m.WasmifyGetTypeName(ptr, length) }
+func WasmifyGetTypeName(m *Module, ptr, length __WPTR__) int64  { return m.WasmifyGetTypeName(ptr, length) }
 func Initialize(m *Module)                                      { m.Initialize() }
 `
 
@@ -453,6 +642,36 @@ import wasm2go %q
 type Module = wasm2go.Module
 type EnvImports = wasm2go.EnvImports
 `
+
+// wasm2goSinglePkgBaseAliasWasiGo re-exports the WASI host surface in
+// single-package mode, where wasm2go emits WasiStubs / DefaultWASI /
+// Wasi_snapshot_preview1Imports into the engine package instead of base/. The
+// bridge names them through base/ in both modes, so the alias keeps
+// Options.WASI spelled the same way whichever layout wasm2go chose. Appended
+// only when the engine imports wasi_snapshot_preview1 — the interface does not
+// exist otherwise.
+const wasm2goSinglePkgBaseAliasWasiGo = `
+type Wasi_snapshot_preview1Imports = wasm2go.Wasi_snapshot_preview1Imports
+type WasiStubs = wasm2go.WasiStubs
+type FS = wasm2go.FS
+
+func DefaultWASI() *WasiStubs { return wasm2go.DefaultWASI() }
+`
+
+// wasm2goMaxMemSetter returns the SetMaxMemory shim emitted into the engine
+// package. See the call site for why it cannot live in the bridge.
+func wasm2goMaxMemSetter(singlePkg bool, importPath string) string {
+	const doc = `// SetMaxMemory caps linear-memory growth: memory.grow fails (returns
+// -1) rather than taking the module past n bytes. Zero restores the
+// module's own ceiling.
+`
+	if singlePkg {
+		return "package wasm2go\n\n" + doc +
+			"func SetMaxMemory(m *Module, n uint64) { m.maxMem = n }\n"
+	}
+	return "package wasm2go\n\nimport base " + fmt.Sprintf("%q", importPath+"/base") + "\n\n" + doc +
+		"func SetMaxMemory(m *base.Module, n uint64) { m.MaxMem = n }\n"
+}
 
 // invokeArgs returns the trailing argument that a generated
 // invokeMethod / module().invoke call site needs. In wazero mode the

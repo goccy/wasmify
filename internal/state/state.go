@@ -215,6 +215,26 @@ type WasmBuildConfig struct {
 	// is needed for debugging or symbolication.
 	KeepSymbols bool `json:"keep_symbols,omitempty"`
 
+	// OptLevel sets the optimization flag for every wasm compile and the
+	// link: one of -O0..-O3, -Os, -Oz. Empty (default) keeps -Oz, the
+	// size-optimal choice for a shipping wasm artifact. Projects whose
+	// runtime speed dominates artifact size — an inference engine's
+	// kernels lose several-fold throughput at -Oz vs -O3, because the
+	// vector loop shapes downstream optimizers recognize only come out
+	// of the speed levels — set "-O3". Mirrors WASMIFY_OPT_LEVEL.
+	OptLevel string `json:"opt_level,omitempty"`
+
+	// Wasm64 builds for wasm64-wasip1 (the memory64 proposal) instead of
+	// wasm32-wasip1: 8-byte guest pointers, so linear memory can grow past
+	// wasm32's 4 GiB ceiling. The wasm64 sysroot (wasi-libc, compiler-rt,
+	// EH-enabled libc++) is provisioned into wasi-sdk on demand — the first
+	// wasm64 build runs the same stages as `install-sdk --wasm64`.
+	// Requires a memory64-capable runtime (the wasm2go backend qualifies;
+	// wazero does not). Incompatible with HostThreads: no toolchain
+	// produces shared wasm64 memories, and wasm2go rejects atomics on a
+	// memory64 module. Mirrors the WASMIFY_WASM64 environment variable.
+	Wasm64 bool `json:"wasm64,omitempty"`
+
 	// PrebuiltArchives lists static libraries that are NOT produced by
 	// replaying the captured upstream build, and that the library link must
 	// nevertheless pull from. Each entry is a path to a wasm32-wasi `.a`
@@ -262,6 +282,15 @@ type WasmBuildConfig struct {
 	// toward address zero, an extra `-l` for a sysroot emulation library.
 	// Mirrors the WASMIFY_EXTRA_LDFLAGS environment variable.
 	ExtraLDFlags []string `json:"extra_ldflags,omitempty"`
+
+	// ExtraLDFlagsWasm32 / ExtraLDFlagsWasm64 are appended after
+	// ExtraLDFlags on the matching pointer width only. Use them for the
+	// flags that name width-specific artifacts — above all a -L pointing
+	// at a project-vendored wasm32 library tree (a wasm64 link hard-errors
+	// on any wasm32 archive the search path surfaces first, and the
+	// provisioned wasm64 sysroot already carries its own libraries).
+	ExtraLDFlagsWasm32 []string `json:"extra_ldflags_wasm32,omitempty"`
+	ExtraLDFlagsWasm64 []string `json:"extra_ldflags_wasm64,omitempty"`
 }
 
 // Previously serialised as bridge-config.json; now lives under the

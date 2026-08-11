@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"github.com/goccy/wasmify/internal/state"
 	"github.com/goccy/wasmify/internal/tools"
 	"github.com/goccy/wasmify/internal/wasmbuild"
+	"github.com/goccy/wasmify/internal/wasmbuild/wasm64"
 	"github.com/goccy/wasmify/internal/wrapper"
 )
 
@@ -180,7 +182,9 @@ Commands:
   generate-build                   Generate build.json from captured build log
   validate-build                   Replay build.json to validate
   ensure-tools [--skip-wasi-sdk]   Install tools listed in arch.json (CI-friendly)
-  install-sdk [<dir>|--path <dir>] Install wasi-sdk (standalone, no config needed)
+  install-sdk [<dir>|--path <dir>] [--wasm64]
+                                  Install wasi-sdk (standalone, no config needed);
+                                  --wasm64 also builds the wasm64-wasip1 sysroot
   wasm-build [--wasi-sdk <p>] [--dry-run] [--output <dir>] [--no-cache]
              [--optimize]
                                    Transform + execute build for wasm32-wasi.
@@ -1179,6 +1183,7 @@ func cmdValidateBuild(args []string) error {
 
 func cmdInstallSDK(args []string) error {
 	installDir := ""
+	withWasm64 := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--path":
@@ -1186,6 +1191,8 @@ func cmdInstallSDK(args []string) error {
 				i++
 				installDir = args[i]
 			}
+		case "--wasm64":
+			withWasm64 = true
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				installDir = args[i]
@@ -1195,16 +1202,20 @@ func cmdInstallSDK(args []string) error {
 
 	sdkPath, err := wasmbuild.InstallWasiSDK(installDir)
 	if err != nil {
-		// "already installed" is not a fatal error
-		if strings.Contains(err.Error(), "already installed") {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			fmt.Fprintf(os.Stderr, "[install-sdk] Version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
-			return nil
+		// An existing installation is not a fatal error.
+		if !errors.Is(err, wasmbuild.ErrAlreadyInstalled) {
+			return err
 		}
-		return err
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
-
 	fmt.Fprintf(os.Stderr, "[install-sdk] Version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
+
+	if withWasm64 {
+		fmt.Fprintf(os.Stderr, "[install-sdk] Provisioning the wasm64-wasip1 sysroot (wasi-libc, compiler-rt, C++ runtimes with wasm EH)...\n")
+		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1379,11 +1390,19 @@ func cmdWasmBuild(args []string) error {
 		}
 		cfg.ExtraCXXFlags = append(cfg.ExtraCXXFlags, s.WasmBuild.ExtraCXXFlags...)
 		cfg.ExtraLDFlags = append(cfg.ExtraLDFlags, s.WasmBuild.ExtraLDFlags...)
+		cfg.ExtraLDFlagsWasm32 = append(cfg.ExtraLDFlagsWasm32, s.WasmBuild.ExtraLDFlagsWasm32...)
+		cfg.ExtraLDFlagsWasm64 = append(cfg.ExtraLDFlagsWasm64, s.WasmBuild.ExtraLDFlagsWasm64...)
 		for _, dir := range s.WasmBuild.BridgeExtraIncludes {
 			if !filepath.IsAbs(dir) {
 				dir = filepath.Join(outDir, dir)
 			}
 			cfg.BridgeExtraIncludes = append(cfg.BridgeExtraIncludes, dir)
+		}
+		if s.WasmBuild.Wasm64 {
+			cfg.Wasm64 = true
+		}
+		if s.WasmBuild.OptLevel != "" {
+			cfg.OptLevel = s.WasmBuild.OptLevel
 		}
 	}
 
@@ -1393,6 +1412,14 @@ func cmdWasmBuild(args []string) error {
 	// so an option set through wasmify.json and one set through the environment
 	// behave identically.
 	cfg.ApplyEnvOverrides()
+
+	// Wasm64 and HostThreads are mutually exclusive: no toolchain produces
+	// shared (threads) wasm64 memories, and the wasm2go backend rejects
+	// atomics on a memory64 module. Refuse the combination up front rather
+	// than failing deep inside the link.
+	if cfg.Wasm64 && cfg.HostThreads {
+		return fmt.Errorf("wasm_build.wasm64 and HostThreads are mutually exclusive: there is no wasm64 threads target")
+	}
 
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
@@ -1409,6 +1436,17 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] SDK version: %s\n", wasmbuild.WasiSDKVersion(sdkPath))
 	}
 	cfg.WasiSDKPath = sdkPath
+
+	// A wasm64 build needs the wasm64-wasip1 sysroot (wasi-libc,
+	// compiler-rt, EH-enabled libc++) that the official SDK does not ship.
+	// Provision it on demand — the same stamped stages as
+	// `install-sdk --wasm64`, a no-op when already present.
+	if cfg.Wasm64 && !cfg.DryRun && !wasm64.SysrootInstalled(sdkPath) {
+		fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64-wasip1 sysroot (first wasm64 build)...\n")
+		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+			return err
+		}
+	}
 
 	// Set default build dir
 	if cfg.BuildDir == "" {

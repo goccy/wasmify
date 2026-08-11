@@ -44,3 +44,43 @@ func TestTranspileGenwasm(t *testing.T) {
 		t.Error("no Go files produced")
 	}
 }
+
+// wasmHeader is the fixed 8-byte module preamble: \0asm magic + version 1.
+var wasmHeader = []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+
+// memSection builds a memory section (id 5) with one memory of the
+// given limits flag and a min of 1 page.
+func memSection(flags byte) []byte {
+	payload := []byte{0x01, flags, 0x01}
+	if flags&0x01 != 0 {
+		payload = append(payload, 0x02) // max, when the flag declares one
+	}
+	return append([]byte{0x05, byte(len(payload))}, payload...)
+}
+
+// The guest pointer width the bridge generates against must follow the
+// input wasm's memory declaration, via the parsed module's Memory64
+// check that wasm2go exports.
+func TestTranspileGenwasmSetsMem64(t *testing.T) {
+	cases := []struct {
+		name string
+		bin  []byte
+		want bool
+	}{
+		{"wasm32", append(append([]byte{}, wasmHeader...), memSection(0x00)...), false},
+		{"wasm64", append(append([]byte{}, wasmHeader...), memSection(0x04)...), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := wasm2goMem64
+			t.Cleanup(func() { wasm2goMem64 = prev })
+			// A header-plus-memory module has nothing to transpile;
+			// only the width recorded before translation matters here,
+			// so the translate outcome is deliberately ignored.
+			_, _, _ = transpileGenwasm(tc.bin, "enginewasm", "example.com/enginewasm")
+			if wasm2goMem64 != tc.want {
+				t.Errorf("wasm2goMem64 = %v, want %v", wasm2goMem64, tc.want)
+			}
+		})
+	}
+}

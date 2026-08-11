@@ -42,11 +42,15 @@ type WasmConfig struct {
 	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
 	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
+	Wasm64              bool     // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; incompatible with HostThreads; mirrors WASMIFY_WASM64
+	OptLevel            string   // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
 	MaxMemoryPages      int      // Threads only: the shared memory's declared maximum in the wasm binary, in 64 KiB pages (default DefaultMaxMemoryPages). Mandatory for a threads build (the WebAssembly threads proposal requires a bounded shared memory). A conventional VM enforces it as the memory.grow cap; the wasm2go backend instead honors the embedding host's own runtime cap, which overrides this baked value.
 	KeepSymbols         bool     // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
 	NoPosixCompat       bool     // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT
 	NoEmscriptenDefine  bool     // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
 	ExtraLDFlags        []string // Extra linker flags appended to every (non-skipped) link step, e.g. -Wl,--wrap=connect; mirrors WASMIFY_EXTRA_LDFLAGS
+	ExtraLDFlagsWasm32  []string // Appended after ExtraLDFlags on wasm32 links only (wasmify.json wasm_build.extra_ldflags_wasm32) — width-specific artifacts like a vendored wasm32 -L tree
+	ExtraLDFlagsWasm64  []string // Appended after ExtraLDFlags on wasm64 links only (wasmify.json wasm_build.extra_ldflags_wasm64)
 	BridgeExtraIncludes []string // Extra -I directories for compiling the generated/custom bridge sources; mirrors WASMIFY_BRIDGE_EXTRA_INCLUDES
 	ExtraCXXFlags       []string // Extra compile flags for the bridge sources, appended last so they override wasmify's defaults (wasmify.json wasm_build.extra_cxxflags); mirrors WASMIFY_EXTRA_CXXFLAGS
 	PrebuiltArchives    []string // Absolute paths to already-compiled wasm32-wasi .a files linked after the build tree's own archives (wasmify.json wasm_build.prebuilt_archives); mirrors WASMIFY_PREBUILT_ARCHIVES
@@ -75,6 +79,12 @@ func (c *WasmConfig) ApplyEnvOverrides() {
 	}
 	if envSet("WASMIFY_HOST_THREADS") {
 		c.HostThreads = true
+	}
+	if envSet("WASMIFY_WASM64") {
+		c.Wasm64 = true
+	}
+	if v := strings.TrimSpace(os.Getenv("WASMIFY_OPT_LEVEL")); v != "" {
+		c.OptLevel = v
 	}
 	if envSet("WASMIFY_NO_POSIX_COMPAT") {
 		c.NoPosixCompat = true
@@ -111,4 +121,17 @@ func DefaultConfig() WasmConfig {
 		AllowUndefined: true,
 		StackSize:      DefaultStackSize,
 	}
+}
+
+// EffectiveExtraLDFlags returns the link flags for the build's pointer
+// width: the common ExtraLDFlags followed by the width's own set. lld
+// applies -L search paths to every -l regardless of relative order, so
+// appending the width-specific group last still lets it override where
+// libraries resolve from.
+func (c WasmConfig) EffectiveExtraLDFlags() []string {
+	flags := append([]string(nil), c.ExtraLDFlags...)
+	if c.Wasm64 {
+		return append(flags, c.ExtraLDFlagsWasm64...)
+	}
+	return append(flags, c.ExtraLDFlagsWasm32...)
 }

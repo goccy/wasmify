@@ -1,6 +1,7 @@
 package wasmbuild
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,11 @@ import (
 	"runtime"
 	"strings"
 )
+
+// ErrAlreadyInstalled reports that InstallWasiSDK found a valid wasi-sdk
+// at the target directory and installed nothing. Callers that treat an
+// existing installation as success detect it with errors.Is.
+var ErrAlreadyInstalled = errors.New("wasi-sdk already installed")
 
 const (
 	wasiSDKVersion   = "31"
@@ -47,7 +53,7 @@ func InstallWasiSDK(installDir string) (string, error) {
 
 	// Check if already installed
 	if err := validateWasiSDK(installDir); err == nil {
-		return installDir, fmt.Errorf("wasi-sdk already installed at %s", installDir)
+		return installDir, fmt.Errorf("%w at %s", ErrAlreadyInstalled, installDir)
 	}
 
 	arch, osName, err := detectPlatform()

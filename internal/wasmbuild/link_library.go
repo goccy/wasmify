@@ -99,7 +99,7 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	// Extra linker flags (e.g. -Wl,--wrap=connect to route libc socket calls
 	// to host-provided shims in the bridge sources) from cfg.ExtraLDFlags. A nil
 	// slice appends nothing, so no guard is needed.
-	args = append(args, cfg.ExtraLDFlags...)
+	args = append(args, cfg.EffectiveExtraLDFlags()...)
 
 	// Add extra objects (e.g., bridge code) before archives. These
 	// objects carry the per-method `w_<svc>_<mid>` and
