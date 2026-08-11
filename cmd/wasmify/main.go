@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1201,8 +1202,8 @@ func cmdInstallSDK(args []string) error {
 
 	sdkPath, err := wasmbuild.InstallWasiSDK(installDir)
 	if err != nil {
-		// "already installed" is not a fatal error
-		if !strings.Contains(err.Error(), "already installed") {
+		// An existing installation is not a fatal error.
+		if !errors.Is(err, wasmbuild.ErrAlreadyInstalled) {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "%v\n", err)
