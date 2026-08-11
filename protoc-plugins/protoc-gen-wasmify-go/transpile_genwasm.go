@@ -41,6 +41,9 @@ func transpilerOptions(opts *transpile.Options) error {
 	if err := num("WASM2GO_FUSE_LOOP_UNROLL", &opts.FuseLoopUnroll); err != nil {
 		return err
 	}
+	if err := num("WASM2GO_VEC_DOT_PAIR_ENTRY", &opts.VecDotPairEntry); err != nil {
+		return err
+	}
 	opts.FuseLoops = os.Getenv("WASM2GO_FUSE_LOOP") != ""
 	if v := os.Getenv("WASM2GO_F16_TABLE"); v != "" {
 		n, err := strconv.ParseUint(v, 0, 32)
