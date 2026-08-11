@@ -273,7 +273,7 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 		if reqPtr != 0 {
 			defer wasm2go.WasmFree(m.g, reqPtr)
 		}
-		copy(wasm2go.Memory(m.g)[reqPtr:], req)
+		copy(wasm2go.Memory(m.g)[wptrOff(reqPtr):], req)
 	}
 	packed, err := call(m.g, reqPtr, reqLen)
 	if err != nil {
@@ -297,7 +297,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	reqPtr := wasm2go.WasmAlloc(m.g, wptr(len(buf)))
-	copy(wasm2go.Memory(m.g)[reqPtr:], buf)
+	copy(wasm2go.Memory(m.g)[wptrOff(reqPtr):], buf)
 	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, wptr(len(buf)))
 	respPtr, respLen := decodeResult(m.g, packed)
 	defer wasm2go.WasmFree(m.g, reqPtr)
@@ -434,7 +434,7 @@ func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr)
 	var req []byte
 	if reqLen > 0 {
 		buf := make([]byte, reqLen)
-		copy(buf, mem[reqPtr:reqPtr+reqLen])
+		copy(buf, mem[wptrOff(reqPtr):wptrOff(reqPtr)+uint64(reqLen)])
 		req = buf
 	}
 	// Release m.mu around the user handler so that nested calls
@@ -479,18 +479,30 @@ func (h wasmifyStubs) Callback_invoke(_ *base.Module, callbackID, methodID int32
 // bridge calls are serialized under m.mu. The C++ counterparts are
 // encode_result/decode_result in the generated api_bridge.cc.
 const wasm32ResultCodec = `
+// wptrOff widens a guest pointer to an unsigned slice offset. wasm32
+// pointers are UNSIGNED i32s: past the 2 GiB line the bit pattern is
+// negative in Go, so a signed slice index would panic.
+func wptrOff(p wptr) uint64 {
+	return uint64(uint32(p))
+}
+
 func decodeResult(_ *base.Module, packed int64) (uint64, uint64) {
 	return uint64(packed) >> 32, uint64(packed) & 0xFFFFFFFF
 }
 
 func encodeCallbackResult(m *Module, resp []byte) int64 {
 	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	copy(wasm2go.Memory(m.g)[wptrOff(ptr):], resp)
 	return int64(ptr)<<32 | int64(len(resp))
 }
 `
 
 const wasm64ResultCodec = `
+// wptrOff widens a guest pointer to an unsigned slice offset.
+func wptrOff(p wptr) uint64 {
+	return uint64(p)
+}
+
 func decodeResult(g *base.Module, packed int64) (uint64, uint64) {
 	if packed == 0 {
 		return 0, 0
@@ -502,13 +514,13 @@ func decodeResult(g *base.Module, packed int64) (uint64, uint64) {
 
 func encodeCallbackResult(m *Module, resp []byte) int64 {
 	ptr := wasm2go.WasmAlloc(m.g, wptr(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	copy(wasm2go.Memory(m.g)[wptrOff(ptr):], resp)
 	if m.cbDesc == 0 {
 		m.cbDesc = wasm2go.WasmAlloc(m.g, 16)
 	}
 	mem := wasm2go.Memory(m.g)
-	binary.LittleEndian.PutUint64(mem[m.cbDesc:], uint64(ptr))
-	binary.LittleEndian.PutUint64(mem[m.cbDesc+8:], uint64(len(resp)))
+	binary.LittleEndian.PutUint64(mem[wptrOff(m.cbDesc):], uint64(ptr))
+	binary.LittleEndian.PutUint64(mem[wptrOff(m.cbDesc)+8:], uint64(len(resp)))
 	return int64(m.cbDesc)
 }
 `
