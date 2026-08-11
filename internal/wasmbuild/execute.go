@@ -375,7 +375,7 @@ func SaveWasmBuildJSON(dataDir string, steps []WasmBuildStep, cfg WasmConfig) er
 // the appended level the effective one — so a project whose captured
 // commands say -O3 still compiles at the -Oz default unless
 // wasm_build.opt_level pins a speed level. That silent demotion cost a
-// measured ~5x decode throughput on a llama.cpp build; this log line
+// measured ~5x throughput on an inference-engine build; this log line
 // (plus an explicit override note) is the tripwire against repeating it.
 func logEffectiveOptLevel(steps []WasmBuildStep, cfg WasmConfig) {
 	eff := cfg.optLevel()

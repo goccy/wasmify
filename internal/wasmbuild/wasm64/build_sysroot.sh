@@ -14,7 +14,7 @@
 #      resource directory.
 #   3. libunwind + libc++abi + libc++ built WITH wasm exception handling
 #      (-fwasm-exceptions), because wasm64 C++ has no upstream runtime
-#      at all and llama-class C++ code throws.
+#      at all and real-world C++ code throws.
 #
 # Idempotent: each stage stamps a .tag with its input pin and is skipped
 # when the stamp matches. Host requirements: cmake, ninja, python3, curl.

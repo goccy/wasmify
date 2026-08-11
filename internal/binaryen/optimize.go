@@ -93,8 +93,9 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// ("exit status 1" before any pass runs). Inert for wasm that
 		// has no EH.
 		"--enable-exception-handling",
-		// SIMD: a project built with -msimd128 (ggml's wasm kernels, and
-		// anything else that vectorises) carries v128 opcodes. Without
+		// SIMD: a project built with -msimd128 (vectorised compute
+		// kernels, and anything else clang vectorises) carries v128
+		// opcodes. Without
 		// this flag wasm-opt's validator rejects the module outright
 		// ("SIMD operations require SIMD [--enable-simd]") before any
 		// pass runs. Inert for wasm that has no SIMD.
