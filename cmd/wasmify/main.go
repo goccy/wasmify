@@ -2403,7 +2403,7 @@ func checkUmbrellaCompiles(clangPath string, headers []string, compileFlags []st
 	}
 	defer func() { _ = os.Remove(umbrellaFile) }()
 
-	args := clangast.BuildSyntaxCheckArgs(umbrellaFile, compileFlags)
+	args := clangast.BuildSyntaxCheckArgs(clangPath, umbrellaFile, compileFlags)
 	cmd := exec.Command(clangPath, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
