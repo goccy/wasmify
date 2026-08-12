@@ -183,7 +183,7 @@ func TestSaveWasmBuildJSON(t *testing.T) {
 
 func TestBuildCache_Update(t *testing.T) {
 	tmp := t.TempDir()
-	bc := LoadBuildCache(tmp)
+	bc := LoadBuildCache(tmp, "wasm32-wasip1")
 	step := WasmBuildStep{
 		OriginalID: 42,
 		OutputFile: "/build/out.o",
@@ -202,7 +202,7 @@ func TestBuildCache_Update(t *testing.T) {
 
 func TestBuildCache_IsCached_Edge(t *testing.T) {
 	tmp := t.TempDir()
-	bc := LoadBuildCache(tmp)
+	bc := LoadBuildCache(tmp, "wasm32-wasip1")
 
 	// Empty output file → not cached
 	step := WasmBuildStep{OutputFile: ""}
@@ -213,7 +213,7 @@ func TestBuildCache_IsCached_Edge(t *testing.T) {
 
 func TestBuildCache_DebugIsCached(t *testing.T) {
 	tmp := t.TempDir()
-	bc := LoadBuildCache(tmp)
+	bc := LoadBuildCache(tmp, "wasm32-wasip1")
 
 	// Empty output: no-op
 	bc.DebugIsCached(WasmBuildStep{})
@@ -244,7 +244,7 @@ func TestBuildCache_DebugIsCached(t *testing.T) {
 func TestLoadBuildCache_BadJSON(t *testing.T) {
 	tmp := t.TempDir()
 	_ = os.WriteFile(filepath.Join(tmp, "build-cache.json"), []byte("not-json"), 0o644)
-	bc := LoadBuildCache(tmp)
+	bc := LoadBuildCache(tmp, "wasm32-wasip1")
 	if bc.Entries == nil {
 		t.Error("expected fresh cache when JSON is malformed")
 	}

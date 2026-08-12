@@ -21,7 +21,7 @@ func TestBuildCache_IsCached(t *testing.T) {
 		OutputFile: outputFile,
 	}
 
-	bc := LoadBuildCache(tmpDir)
+	bc := LoadBuildCache(tmpDir, "wasm32-wasip1")
 
 	// Not cached initially
 	if bc.IsCached(step) {
@@ -57,14 +57,14 @@ func TestBuildCache_SaveLoad(t *testing.T) {
 	}
 
 	// Save
-	bc := LoadBuildCache(tmpDir)
+	bc := LoadBuildCache(tmpDir, "wasm32-wasip1")
 	bc.Update(step)
 	if err := bc.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
 	// Load in new instance
-	bc2 := LoadBuildCache(tmpDir)
+	bc2 := LoadBuildCache(tmpDir, "wasm32-wasip1")
 	if !bc2.IsCached(step) {
 		t.Fatal("expected cached after load")
 	}
@@ -82,7 +82,7 @@ func TestBuildCache_MissingOutput(t *testing.T) {
 		OutputFile: outputFile,
 	}
 
-	bc := LoadBuildCache(tmpDir)
+	bc := LoadBuildCache(tmpDir, "wasm32-wasip1")
 	bc.Update(step)
 
 	// Remove output → not cached
