@@ -47,7 +47,7 @@ func TestBuildSyntaxCheckArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := BuildSyntaxCheckArgs(tt.headerFile, tt.flags)
+			got := BuildSyntaxCheckArgs("/nonexistent/clang", tt.headerFile, tt.flags)
 			joined := strings.Join(got, " ")
 			for _, want := range tt.wantSubstr {
 				if !strings.Contains(joined, want) {
@@ -67,7 +67,7 @@ func TestBuildSyntaxCheckArgs(t *testing.T) {
 }
 
 func TestBuildClangArgsAddsCppModeForHeader(t *testing.T) {
-	args := buildClangArgs("foo.h", []string{"-I/x"})
+	args := buildClangArgs("/nonexistent/clang", "foo.h", []string{"-I/x"})
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-ast-dump=json") {
 		t.Errorf("missing -ast-dump=json: %v", args)
@@ -84,7 +84,7 @@ func TestBuildClangArgsAddsCppModeForHeader(t *testing.T) {
 }
 
 func TestBuildClangArgsNonHeaderFile(t *testing.T) {
-	args := buildClangArgs("foo.cpp", nil)
+	args := buildClangArgs("/nonexistent/clang", "foo.cpp", nil)
 	for i := range args {
 		if args[i] == "-x" {
 			// For .cpp source, we should not force c++ mode (already implicit)

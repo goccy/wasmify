@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/goccy/wasmify/internal/apispec"
 )
@@ -108,7 +109,7 @@ type CtorInfo struct {
 // For small headers, this loads the entire AST into memory. For large
 // headers, use DumpASTStream + ParseStream instead.
 func DumpAST(clangPath string, headerFile string, flags []string) (*Node, error) {
-	args := buildClangArgs(headerFile, flags)
+	args := buildClangArgs(clangPath, headerFile, flags)
 
 	cmd := exec.Command(clangPath, args...)
 	cmd.Stderr = os.Stderr
@@ -128,7 +129,7 @@ func DumpAST(clangPath string, headerFile string, flags []string) (*Node, error)
 // DumpASTStream runs clang and returns a streaming reader for the AST JSON.
 // The caller must call the returned cleanup function when done.
 func DumpASTStream(clangPath string, headerFile string, flags []string) (io.ReadCloser, func() error, error) {
-	args := buildClangArgs(headerFile, flags)
+	args := buildClangArgs(clangPath, headerFile, flags)
 
 	cmd := exec.Command(clangPath, args...)
 	cmd.Stderr = os.Stderr
@@ -151,8 +152,9 @@ func DumpASTStream(clangPath string, headerFile string, flags []string) (io.Read
 
 // BuildSyntaxCheckArgs constructs clang arguments for syntax-only validation
 // (no AST dump). Used to pre-validate umbrella headers for conflicts before
-// the full AST parse.
-func BuildSyntaxCheckArgs(headerFile string, flags []string) []string {
+// the full AST parse. clangPath is the compiler that will run the args; it
+// decides whether the host SDK sysroot may be injected (see hostSDKFlags).
+func BuildSyntaxCheckArgs(clangPath, headerFile string, flags []string) []string {
 	args := []string{
 		"-fsyntax-only",
 		"-w", // suppress warnings
@@ -163,19 +165,14 @@ func BuildSyntaxCheckArgs(headerFile string, flags []string) []string {
 		args = append(args, "-x", "c++")
 	}
 
-	if runtime.GOOS == "darwin" && !hasSysrootFlag(flags) {
-		if sdkFlags := detectMacOSSDKFlags(); len(sdkFlags) > 0 {
-			args = append(args, sdkFlags...)
-		}
-	}
-
+	args = append(args, hostSDKFlags(clangPath, flags)...)
 	args = append(args, flags...)
 	args = append(args, headerFile)
 	return args
 }
 
 // buildClangArgs constructs the clang arguments for AST dumping.
-func buildClangArgs(headerFile string, flags []string) []string {
+func buildClangArgs(clangPath, headerFile string, flags []string) []string {
 	args := []string{
 		"-Xclang", "-ast-dump=json",
 		"-fsyntax-only",
@@ -193,16 +190,64 @@ func buildClangArgs(headerFile string, flags []string) []string {
 		args = append(args, "-x", "c++")
 	}
 
-	// On macOS, auto-detect SDK sysroot if not already specified in flags
-	if runtime.GOOS == "darwin" && !hasSysrootFlag(flags) {
-		if sdkFlags := detectMacOSSDKFlags(); len(sdkFlags) > 0 {
-			args = append(args, sdkFlags...)
-		}
-	}
-
+	args = append(args, hostSDKFlags(clangPath, flags)...)
 	args = append(args, flags...)
 	args = append(args, headerFile)
 	return args
+}
+
+// hostSDKFlags returns the macOS SDK sysroot flags to inject, or nil.
+// On macOS a bare host clang needs `-isysroot $(xcrun --show-sdk-path)`
+// to find the system headers when the captured flags carry no sysroot.
+// That injection is only meaningful when the compiler being driven
+// actually targets the host: a cross compiler (wasi-sdk's clang
+// defaults to wasm32-wasi) resolves its own sysroot, and handing it
+// the macOS SDK mixes two standard libraries in one include path.
+// The compiler's own default target triple decides.
+func hostSDKFlags(clangPath string, flags []string) []string {
+	if runtime.GOOS != "darwin" || hasSysrootFlag(flags) {
+		return nil
+	}
+	if !tripleTargetsDarwin(compilerDefaultTriple(clangPath)) {
+		return nil
+	}
+	return detectMacOSSDKFlags()
+}
+
+// compilerTriples caches each compiler's default target triple; the
+// AST parse runs clang once per umbrella batch and the answer never
+// changes for a given binary within one wasmify invocation.
+var compilerTriples sync.Map // clangPath string -> triple string
+
+// compilerDefaultTriple reports the target the compiler at clangPath
+// builds for when no -target flag is given (`clang -print-target-triple`).
+// An empty string means the compiler could not say — callers treat
+// that as "not the host".
+func compilerDefaultTriple(clangPath string) string {
+	if v, ok := compilerTriples.Load(clangPath); ok {
+		return v.(string)
+	}
+	out, err := exec.Command(clangPath, "-print-target-triple").Output()
+	triple := ""
+	if err == nil {
+		triple = strings.TrimSpace(string(out))
+	}
+	compilerTriples.Store(clangPath, triple)
+	return triple
+}
+
+// tripleTargetsDarwin reports whether an LLVM target triple
+// (<arch>-<vendor>-<os>[-<abi>]) names the host Darwin toolchain,
+// by its vendor ("apple") or OS ("darwin*"/"macos*") component.
+func tripleTargetsDarwin(triple string) bool {
+	parts := strings.Split(triple, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	if parts[1] == "apple" {
+		return true
+	}
+	return strings.HasPrefix(parts[2], "darwin") || strings.HasPrefix(parts[2], "macos")
 }
 
 // Parser converts a clang AST tree into an APISpec.

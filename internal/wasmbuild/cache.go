@@ -14,7 +14,17 @@ import (
 // BuildCache tracks input/output hashes for incremental builds.
 type BuildCache struct {
 	Entries map[string]CacheEntry `json:"entries"` // key = cache key (step ID based)
-	path    string                // file path for save
+	// Target is the effective target triple every cached output was
+	// built for. The triple is a global property of the build
+	// directory — obj files, archives and the link must all agree on
+	// pointer width and sysroot flavor — so a triple change (e.g.
+	// wasm_build.wasm64 flipped, HostThreads toggled) invalidates the
+	// whole cache rather than relying on per-step arg hashes: steps
+	// whose command lines never mention the target (llvm-ar archives)
+	// would otherwise keep serving outputs of the previous width and
+	// the link fails with a mixed-width object set.
+	Target string `json:"target,omitempty"`
+	path   string // file path for save
 }
 
 // CacheEntry stores the state of a single build step's inputs and output.
@@ -25,25 +35,48 @@ type CacheEntry struct {
 }
 
 // LoadBuildCache loads the build cache from buildDir/build-cache.json.
-func LoadBuildCache(buildDir string) *BuildCache {
-	bc := &BuildCache{
-		Entries: make(map[string]CacheEntry),
-		path:    filepath.Join(buildDir, "build-cache.json"),
-	}
-
-	data, err := os.ReadFile(bc.path)
-	if err != nil {
-		return bc
-	}
-
-	if err := json.Unmarshal(data, bc); err != nil {
+// target is the effective target triple this build compiles for; a
+// cache recorded for a different triple is discarded wholesale (see
+// BuildCache.Target).
+func LoadBuildCache(buildDir, target string) *BuildCache {
+	fresh := func() *BuildCache {
 		return &BuildCache{
 			Entries: make(map[string]CacheEntry),
-			path:    bc.path,
+			Target:  target,
+			path:    filepath.Join(buildDir, "build-cache.json"),
 		}
 	}
 
-	return bc
+	data, err := os.ReadFile(fresh().path)
+	if err != nil {
+		return fresh()
+	}
+
+	// Unmarshal into a zero value: a cache written before the target
+	// field existed must read back as unrecorded, not inherit the
+	// current target and masquerade as a match.
+	loaded := &BuildCache{path: fresh().path}
+	if err := json.Unmarshal(data, loaded); err != nil {
+		return fresh()
+	}
+	if loaded.Target != target {
+		fmt.Fprintf(os.Stderr, "[wasm-build] target changed (%s -> %s): rebuilding everything\n",
+			orUnrecorded(loaded.Target), target)
+		return fresh()
+	}
+	if loaded.Entries == nil {
+		loaded.Entries = make(map[string]CacheEntry)
+	}
+
+	return loaded
+}
+
+// orUnrecorded names an absent cache field in the target-change log.
+func orUnrecorded(s string) string {
+	if s == "" {
+		return "unrecorded"
+	}
+	return s
 }
 
 // Save writes the cache to disk.

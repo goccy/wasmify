@@ -55,7 +55,7 @@ func Execute(steps []WasmBuildStep, cfg WasmConfig, handlers ExecuteHandlers) ([
 		}
 	}
 
-	bc := LoadBuildCache(cfg.BuildDir)
+	bc := LoadBuildCache(cfg.BuildDir, effectiveTarget(cfg))
 
 	// Execute in order: compile, archive, link
 	phases := []buildjson.StepType{
