@@ -23,12 +23,18 @@
 #   WASI_SDK_PATH   (required) wasi-sdk installation to install into
 #   PATCH_DIR       (required) directory holding the wasi-libc wasm64 patches
 #   WASM64_WORK     workspace (default ${XDG_CACHE_HOME:-~/.cache}/wasmify/wasm64)
+#   WASM64_THREADS  1 builds the wasm64-wasip1-threads flavor: wasi-libc with
+#                   its posix thread model (real pthreads over
+#                   wasi_thread_spawn), and every archive compiled with
+#                   -pthread so its objects carry the atomics/bulk-memory
+#                   features a --shared-memory link demands.
 #   WASI_LIBC_COMMIT / LLVM_VERSION  override the pins (testing only)
 set -euo pipefail
 
 : "${WASI_SDK_PATH:?WASI_SDK_PATH is required}"
 : "${PATCH_DIR:?PATCH_DIR is required}"
 : "${WASM64_WORK:=${XDG_CACHE_HOME:-$HOME/.cache}/wasmify/wasm64}"
+: "${WASM64_THREADS:=0}"
 
 # wasi-libc pin: last verified against the wasm2go widened-ABI runtime.
 : "${WASI_LIBC_COMMIT:=8d8348ec24253d0638a693b8af82445c13d92d32}"
@@ -44,6 +50,11 @@ if [ -z "$LLVM_VERSION" ]; then
 fi
 
 TRIPLE=wasm64-wasip1
+THREAD_CFLAGS=""
+if [ "$WASM64_THREADS" = "1" ]; then
+  TRIPLE=wasm64-wasip1-threads
+  THREAD_CFLAGS="-pthread"
+fi
 SYSROOT="$WASI_SDK_PATH/share/wasi-sysroot"
 CLANG="$WASI_SDK_PATH/bin/clang"
 RESDIR="$("$CLANG" -print-resource-dir)"
@@ -79,7 +90,7 @@ else
         echo "patch failed: $p" >&2; exit 1; }
     }
   done
-  BUILD="$LIBC_SRC/build-wasm64"
+  BUILD="$LIBC_SRC/build-$TRIPLE"
   rm -rf "$BUILD"
   cmake -S "$LIBC_SRC" -B "$BUILD" -G Ninja \
     -DTARGET_TRIPLE="$TRIPLE" \
@@ -115,16 +126,18 @@ need_llvm_src() {
 
 # ── stage 2: compiler-rt builtins ───────────────────────────────────────
 RT_DIR="$RESDIR/lib/wasm64-unknown-wasip1"
+if [ "$WASM64_THREADS" = "1" ]; then RT_DIR="$RESDIR/lib/wasm64-unknown-wasip1-threads"; fi
 RT_TAG="$RT_DIR/.wasmify-tag"
 if [ -f "$RT_TAG" ] && [ "$(cat "$RT_TAG")" = "$LLVM_VERSION" ]; then
   echo "== wasm64 compiler-rt builtins already installed ($LLVM_VERSION)"
 else
   echo "== building compiler-rt builtins for $TRIPLE (LLVM $LLVM_VERSION)"
   need_llvm_src
-  BUILD="$WASM64_WORK/build-rt"
+  BUILD="$WASM64_WORK/build-rt-$TRIPLE"
   rm -rf "$BUILD"
   cmake -S "$LLVM_SRC/compiler-rt/lib/builtins" -B "$BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="$THREAD_CFLAGS" \
     -DCMAKE_C_COMPILER="$CLANG" \
     -DCMAKE_C_COMPILER_TARGET="$TRIPLE" \
     -DCMAKE_ASM_COMPILER="$CLANG" \
@@ -174,8 +187,8 @@ if old not in src:
     sys.exit("copy_file_range guard not found in " + path)
 open(path, "w").write(src.replace(old, new, 1))
 PATCH
-  BUILD="$WASM64_WORK/build-cxx"
-  PREFIX="$WASM64_WORK/install-cxx"
+  BUILD="$WASM64_WORK/build-cxx-$TRIPLE"
+  PREFIX="$WASM64_WORK/install-cxx-$TRIPLE"
   rm -rf "$BUILD" "$PREFIX"
   # Non-obvious options (shared with the wasm32 EH recipe):
   #   UNIX=ON       HandleLLVMOptions bails on the wasi triple otherwise.
@@ -198,8 +211,9 @@ PATCH
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DUNIX:BOOL=ON \
     -DLLVM_ENABLE_RUNTIMES="libunwind;libcxxabi;libcxx" \
-    -DCMAKE_C_FLAGS="-fwasm-exceptions -fdeclspec" \
-    -DCMAKE_CXX_FLAGS="-fwasm-exceptions -fdeclspec" \
+    -DCMAKE_C_FLAGS="-fwasm-exceptions -fdeclspec $THREAD_CFLAGS" \
+    -DCMAKE_CXX_FLAGS="-fwasm-exceptions -fdeclspec $THREAD_CFLAGS" \
+    -DCMAKE_ASM_FLAGS="$THREAD_CFLAGS" \
     -DLIBCXX_ENABLE_EXCEPTIONS=ON -DLIBCXXABI_ENABLE_EXCEPTIONS=ON \
     -DLIBCXX_ENABLE_THREADS=ON -DLIBCXXABI_ENABLE_THREADS=ON -DLIBUNWIND_ENABLE_THREADS=ON \
     -DLIBCXX_HAS_PTHREAD_API=ON -DLIBCXXABI_HAS_PTHREAD_API=ON \

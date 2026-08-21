@@ -20,9 +20,12 @@ import (
 var assets embed.FS
 
 // InstallSysroot builds and installs the wasm64-wasip1 sysroot into
-// sdkPath. Idempotent: completed stages are stamped and skipped. The
-// build needs cmake, ninja, python3 and curl on the host.
-func InstallSysroot(sdkPath string) error {
+// sdkPath; threads selects the wasm64-wasip1-threads flavor (wasi-libc's
+// posix thread model over wasi_thread_spawn, every archive compiled with
+// -pthread so a --shared-memory link accepts it). Idempotent: completed
+// stages are stamped and skipped. The build needs cmake, ninja, python3
+// and curl on the host.
+func InstallSysroot(sdkPath string, threads bool) error {
 	for _, tool := range []string{"cmake", "ninja", "python3", "curl", "patch"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			return fmt.Errorf("wasm64 sysroot build needs %q on PATH", tool)
@@ -58,6 +61,9 @@ func InstallSysroot(sdkPath string) error {
 		"WASI_SDK_PATH="+sdkPath,
 		"PATCH_DIR="+filepath.Join(stage, "patches"),
 	)
+	if threads {
+		cmd.Env = append(cmd.Env, "WASM64_THREADS=1")
+	}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -67,9 +73,13 @@ func InstallSysroot(sdkPath string) error {
 }
 
 // SysrootInstalled reports whether sdkPath already carries a complete
-// wasm64-wasip1 sysroot (all three stage stamps present).
-func SysrootInstalled(sdkPath string) bool {
-	libDir := filepath.Join(sdkPath, "share", "wasi-sysroot", "lib", "wasm64-wasip1")
+// wasm64 sysroot of the requested flavor (all stage stamps present).
+func SysrootInstalled(sdkPath string, threads bool) bool {
+	triple := "wasm64-wasip1"
+	if threads {
+		triple = "wasm64-wasip1-threads"
+	}
+	libDir := filepath.Join(sdkPath, "share", "wasi-sysroot", "lib", triple)
 	for _, stamp := range []string{".wasmify-libc-tag", ".wasmify-cxx-tag"} {
 		if _, err := os.Stat(filepath.Join(libDir, stamp)); err != nil {
 			return false
