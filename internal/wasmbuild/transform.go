@@ -772,13 +772,19 @@ func (c WasmConfig) optLevel() string {
 //
 // Wasm64 swaps in wasm64-wasip1 the same way; the triple selects the
 // wasm64 sysroot libraries (8-byte pointers, memory64) that wasmify
-// provisions into the SDK. Wasm64 && HostThreads is rejected before any
-// build starts, so the two rewrites never compete.
+// provisions into the SDK. Wasm64 && HostThreads combines both: the
+// wasm64-wasip1-threads sysroot flavor carries 8-byte pointers AND the
+// atomics/bulk-memory features plus real pthreads.
 func effectiveTarget(cfg WasmConfig) string {
-	if cfg.Wasm64 && cfg.Target == "wasm32-wasip1" {
-		return "wasm64-wasip1"
+	if cfg.Target != "wasm32-wasip1" {
+		return cfg.Target
 	}
-	if cfg.HostThreads && cfg.Target == "wasm32-wasip1" {
+	switch {
+	case cfg.Wasm64 && cfg.HostThreads:
+		return "wasm64-wasip1-threads"
+	case cfg.Wasm64:
+		return "wasm64-wasip1"
+	case cfg.HostThreads:
 		return "wasm32-wasip1-threads"
 	}
 	return cfg.Target
@@ -829,6 +835,15 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	// to keep their wasi code paths.
 	if !cfg.NoEmscriptenDefine {
 		flags = append(flags, "-D__EMSCRIPTEN__")
+		// Emscripten's own -pthread defines __EMSCRIPTEN_PTHREADS__, and
+		// portable code guards its threaded paths on the PAIR: without it,
+		// e.g. ggml's graph planner clamps n_threads to 1
+		// ("Emscripten without pthreads support can only use a single
+		// thread"). A HostThreads build must therefore complete the
+		// emulation or silently lose its parallelism.
+		if cfg.HostThreads {
+			flags = append(flags, "-D__EMSCRIPTEN_PTHREADS__")
+		}
 	}
 	flags = append(flags,
 		"-D_WASI_EMULATED_SIGNAL",

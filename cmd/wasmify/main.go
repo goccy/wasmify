@@ -1212,7 +1212,7 @@ func cmdInstallSDK(args []string) error {
 
 	if withWasm64 {
 		fmt.Fprintf(os.Stderr, "[install-sdk] Provisioning the wasm64-wasip1 sysroot (wasi-libc, compiler-rt, C++ runtimes with wasm EH)...\n")
-		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+		if err := wasm64.InstallSysroot(sdkPath, false); err != nil {
 			return err
 		}
 	}
@@ -1413,14 +1413,6 @@ func cmdWasmBuild(args []string) error {
 	// behave identically.
 	cfg.ApplyEnvOverrides()
 
-	// Wasm64 and HostThreads are mutually exclusive: no toolchain produces
-	// shared (threads) wasm64 memories, and the wasm2go backend rejects
-	// atomics on a memory64 module. Refuse the combination up front rather
-	// than failing deep inside the link.
-	if cfg.Wasm64 && cfg.HostThreads {
-		return fmt.Errorf("wasm_build.wasm64 and HostThreads are mutually exclusive: there is no wasm64 threads target")
-	}
-
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
 	// once per machine and reused across every project wasmify builds.
@@ -1437,13 +1429,15 @@ func cmdWasmBuild(args []string) error {
 	}
 	cfg.WasiSDKPath = sdkPath
 
-	// A wasm64 build needs the wasm64-wasip1 sysroot (wasi-libc,
-	// compiler-rt, EH-enabled libc++) that the official SDK does not ship.
+	// A wasm64 build needs the wasm64 sysroot flavor matching the target
+	// (wasi-libc, compiler-rt, EH-enabled libc++; with HostThreads the
+	// -threads flavor, whose archives carry the atomics features a
+	// --shared-memory link demands) that the official SDK does not ship.
 	// Provision it on demand — the same stamped stages as
 	// `install-sdk --wasm64`, a no-op when already present.
-	if cfg.Wasm64 && !cfg.DryRun && !wasm64.SysrootInstalled(sdkPath) {
-		fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64-wasip1 sysroot (first wasm64 build)...\n")
-		if err := wasm64.InstallSysroot(sdkPath); err != nil {
+	if cfg.Wasm64 && !cfg.DryRun && !wasm64.SysrootInstalled(sdkPath, cfg.HostThreads) {
+		fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64 sysroot (first wasm64 build of this flavor)...\n")
+		if err := wasm64.InstallSysroot(sdkPath, cfg.HostThreads); err != nil {
 			return err
 		}
 	}

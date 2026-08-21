@@ -65,3 +65,21 @@ func TestHostThreadsDefaultMaxMemory(t *testing.T) {
 		t.Errorf("default max-memory missing: %s", link)
 	}
 }
+
+// Wasm64 and HostThreads compose: the combined flavor selects the
+// wasm64-wasip1-threads sysroot, whose archives carry both the 8-byte
+// pointer ABI and the atomics/bulk-memory features a --shared-memory
+// link demands.
+func TestWasm64ThreadsTargetSwap(t *testing.T) {
+	cfg := WasmConfig{Target: "wasm32-wasip1", Wasm64: true, HostThreads: true}
+	if got := effectiveTarget(cfg); got != "wasm64-wasip1-threads" {
+		t.Errorf("effectiveTarget with Wasm64+HostThreads = %q, want wasm64-wasip1-threads", got)
+	}
+	// The threads link flags apply unchanged in the wasm64 flavor.
+	flags := strings.Join(wasmLinkFlags(cfg), " ")
+	for _, want := range []string{"-pthread", "--shared-memory", "wasi_thread_start"} {
+		if !strings.Contains(flags, want) {
+			t.Errorf("wasm64+threads link flags missing %q in %q", want, flags)
+		}
+	}
+}
