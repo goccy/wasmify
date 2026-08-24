@@ -44,6 +44,14 @@ func transpilerOptions(opts *transpile.Options) error {
 	if err := num("WASM2GO_VEC_DOT_PAIR_ENTRY", &opts.VecDotPairEntry); err != nil {
 		return err
 	}
+	// Same off-values as WASM2GO_FAST_MATH: "0" and "false" read as
+	// off so a Make-level `VAR ?= 1` default can be overridden on the
+	// command line without unsetting the variable.
+	switch os.Getenv("WASM2GO_VEC_DOT_ROWS") {
+	case "", "0", "false":
+	default:
+		opts.VecDotRows = true
+	}
 	opts.FuseLoops = os.Getenv("WASM2GO_FUSE_LOOP") != ""
 	if v := os.Getenv("WASM2GO_F16_TABLE"); v != "" {
 		n, err := strconv.ParseUint(v, 0, 32)
