@@ -53,12 +53,13 @@ func transpilerOptions(opts *transpile.Options) error {
 		opts.VecDotRows = true
 	}
 	opts.FuseLoops = os.Getenv("WASM2GO_FUSE_LOOP") != ""
-	if v := os.Getenv("WASM2GO_F16_TABLE"); v != "" {
-		n, err := strconv.ParseUint(v, 0, 32)
-		if err != nil {
-			return fmt.Errorf("invalid WASM2GO_F16_TABLE=%q: %w", v, err)
-		}
-		opts.F16TableAddr = uint32(n)
+	// The f16 table address is auto-detected by wasm2go v0.5.5+ (no
+	// address input exists anymore); the only knob left is the
+	// opt-out that disables the table-keyed rewrites outright.
+	switch os.Getenv("WASM2GO_NO_F16_TABLE") {
+	case "", "0", "false":
+	default:
+		opts.DisableF16Table = true
 	}
 	switch os.Getenv("WASM2GO_FAST_MATH") {
 	case "", "0", "false":
