@@ -1080,6 +1080,11 @@ func cmdGenerateBuild(args []string) error {
 		carryOverWasmSkip(prev.Steps, steps)
 	}
 
+	// Drop probe/scratch steps the captured build itself deleted (e.g. a
+	// Makefile.PL feature test compiling tmp$$.c): their sources are gone,
+	// so replaying them can only fail, and their outputs feed nothing.
+	buildjson.MarkTransientSteps(steps, os.Stderr)
+
 	// Load arch.json (outDir in external mode, dataDir in XDG mode)
 	a, _ := arch.Load(outDir)
 	if a == nil {
