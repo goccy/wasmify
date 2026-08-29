@@ -1089,6 +1089,33 @@ func TestResolveObjectRefs_RenamedObject(t *testing.T) {
 	}
 }
 
+// TestResolveObjectRefs_IncompleteCaptureNotPapered models an INCOMPLETE
+// capture: an incremental make skipped the up-to-date core compiles, so the
+// archive references many objects with no recorded producer while the work
+// dir still holds one unreferenced compile output (a file regenerated every
+// build). The renamed-object fallback must NOT pair that lone orphan with
+// every unresolved reference — that would archive the same object under many
+// names and silently drop the rest of the library. All producerless
+// references stay as-is so the archive step fails loudly on the missing file.
+func TestResolveObjectRefs_IncompleteCaptureNotPapered(t *testing.T) {
+	const wd = "/src/proj"
+	steps := []WasmBuildStep{
+		// The only compile the incremental make re-ran (always regenerated).
+		{ID: 1, Type: buildjson.StepCompile, WorkDir: wd,
+			OutputFile: "/build/obj/perlmini.o"},
+		// The archive still lists the full member set from the Makefile.
+		{ID: 2, Type: buildjson.StepArchive, WorkDir: wd,
+			Args: []string{"rc", "/build/lib/libcore.a", "/build/obj/op.o", "/build/obj/sv.o"}},
+	}
+	resolveObjectRefs(steps)
+	if got := steps[1].Args[2]; got != "/build/obj/op.o" {
+		t.Errorf("op.o ref = %q, want it left unresolved (not papered over with the orphan)", got)
+	}
+	if got := steps[1].Args[3]; got != "/build/obj/sv.o" {
+		t.Errorf("sv.o ref = %q, want it left unresolved (not papered over with the orphan)", got)
+	}
+}
+
 // TestResolveObjectRefs_ExternalLibKept: a reference to something wasmify did
 // not build (no producer, no lone orphan) is left untouched.
 func TestResolveObjectRefs_ExternalLibKept(t *testing.T) {
