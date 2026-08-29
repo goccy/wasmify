@@ -56,7 +56,7 @@ func MarkTransientSteps(steps []BuildStep, progress io.Writer) {
 				s.WasmSkip = true
 				s.WasmSkipReason = "transient probe artifact: output deleted by the captured build and consumed by no other step"
 				if progress != nil {
-					fmt.Fprintf(progress, "[generate-build] step %d (%s %s): output %s was deleted by the build; marking wasm_skip (probe/scratch artifact)\n",
+					_, _ = fmt.Fprintf(progress, "[generate-build] step %d (%s %s): output %s was deleted by the build; marking wasm_skip (probe/scratch artifact)\n",
 						s.ID, s.Type, filepath.Base(s.Executable), s.OutputFile)
 				}
 				continue
