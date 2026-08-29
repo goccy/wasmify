@@ -199,6 +199,31 @@ func resolveObjectRefs(steps []WasmBuildStep) {
 			}
 		}
 	}
+	// Unresolved .o basenames per referencing work dir. The renamed-object
+	// fallback below is only sound when a work dir has exactly ONE reference
+	// with no producer: one rename, one orphan, an unambiguous pairing. With
+	// several producerless references (the signature of an INCOMPLETE capture,
+	// e.g. an incremental make that skipped up-to-date compiles), pairing them
+	// all onto one orphan would silently archive the same object under many
+	// names — better to leave them unresolved and let the archive step fail
+	// loudly on the missing file.
+	unresolvedByWD := map[string]map[string]bool{}
+	for i := range steps {
+		s := &steps[i]
+		if s.Type != buildjson.StepArchive && s.Type != buildjson.StepLink {
+			continue
+		}
+		for _, a := range s.Args {
+			if !strings.HasPrefix(a, "-") && strings.ToLower(filepath.Ext(a)) == ".o" && len(reg[filepath.Base(a)]) == 0 {
+				set := unresolvedByWD[s.WorkDir]
+				if set == nil {
+					set = map[string]bool{}
+					unresolvedByWD[s.WorkDir] = set
+				}
+				set[filepath.Base(a)] = true
+			}
+		}
+	}
 	resolve := func(arg, workDir string) string {
 		cands := reg[filepath.Base(arg)]
 		switch len(cands) {
@@ -218,9 +243,13 @@ func resolveObjectRefs(steps []WasmBuildStep) {
 		// after compiling it via a shell step wasmify does not wrap — e.g.
 		// MakeMaker compiles FooBar.c to FooBar.o and then `mv FooBar.o Bar.o`,
 		// so the archive references Bar.o but only FooBar.o was recorded. If the
-		// referencing work dir has exactly ONE compile output that no archive/
-		// link references, it is that renamed-away object; resolve to it.
-		if strings.ToLower(filepath.Ext(arg)) == ".o" {
+		// referencing work dir has exactly ONE such producerless reference AND
+		// exactly ONE compile output that no archive/link references, they are
+		// that rename pair; resolve to it. Several producerless references mean
+		// the capture is incomplete, not renamed — leave them so the archive
+		// step fails on the missing file instead of silently multiplying one
+		// object under many names.
+		if strings.ToLower(filepath.Ext(arg)) == ".o" && len(unresolvedByWD[workDir]) == 1 {
 			var orphans []string
 			for _, out := range compileOutByWD[workDir] {
 				if !referenced[filepath.Base(out)] {

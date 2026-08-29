@@ -617,6 +617,14 @@ func WasmFree(m *Module, ptr __WPTR__)                          { m.WasmFree(ptr
 func WasmInit(m *Module) int32                                  { return m.WasmInit() }
 func WasmifyGetTypeName(m *Module, ptr, length __WPTR__) int64  { return m.WasmifyGetTypeName(ptr, length) }
 func Initialize(m *Module)                                      { m.Initialize() }
+
+// AccessMemory runs f over the module's linear memory under the same
+// lock memory.grow takes to mutate or relocate the backing array, so
+// out-of-band writers (e.g. an interrupt watchdog flipping a flag word
+// in guest memory from another goroutine) observe the array the guest
+// does. Multi-package output exports this as base.AccessMemory; this
+// shim gives single-package output the same surface.
+func AccessMemory(m *Module, f func(mem []byte)) { accessMemory(m, f) }
 `
 
 // wasm2goSinglePkgBaseAliasGoFmt is the file emitted at <pkg>/base/base.go
