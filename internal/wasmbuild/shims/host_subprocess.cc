@@ -24,6 +24,7 @@
 
 #include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <cerrno>
 #include <sys/types.h>
 
@@ -32,13 +33,45 @@ extern "C" {
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_spawn")))
 extern int __wasmify_host_proc_spawn(const char *path, char *const argv[],
                                      char *const envp[], int stdin_fd,
-                                     int stdout_fd, int stderr_fd, int *pid_out);
+                                     int stdout_fd, int stderr_fd,
+                                     const char *cwd, int *pid_out);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait")))
 extern int __wasmify_host_proc_wait(int pid, int options, int *status_out);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("pipe")))
 extern int __wasmify_host_pipe(int *fds_out);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup")))
+extern int __wasmify_host_fd_dup(int fd, int *fd_out);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup2")))
+extern int __wasmify_host_fd_dup2(int from, int to);
+
+/* dup()/dup2()/dup3(): wasi-libc has neither (WASI preview1 has only
+ * fd_renumber, whose move semantics close the source). The host imports
+ * implement true sharing semantics: the descriptor closes only when the
+ * last fd referencing it does. The subprocess redirection dance
+ * (save stdio, point it at a pipe or log, spawn, restore) depends on
+ * them. */
+int dup(int fd) {
+    int nfd = -1;
+    int rc = __wasmify_host_fd_dup(fd, &nfd);
+    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+    return nfd;
+}
+
+int dup2(int from, int to) {
+    int rc = __wasmify_host_fd_dup2(from, to);
+    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+    return to;
+}
+
+int dup3(int from, int to, int flags) {
+    (void)flags;
+    if (from == to) { errno = EINVAL; return -1; }
+    return dup2(from, to);
+}
 
 int posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa) {
     if (fa != nullptr) { fa->__fd[0] = fa->__fd[1] = fa->__fd[2] = -1; }
@@ -81,8 +114,14 @@ static int __wasmify_host_spawn(pid_t *pid, const char *path,
         out_fd = fa->__fd[1];
         err_fd = fa->__fd[2];
     }
+    /* The guest tracks its working directory in libc (WASI has no chdir
+     * syscall), so the host cannot see it; hand it over so the child runs
+     * where the guest believes it is. */
+    char cwdbuf[4096];
+    const char *cwd = getcwd(cwdbuf, sizeof(cwdbuf));
     int p = 0;
-    int rc = __wasmify_host_proc_spawn(path, argv, envp, in_fd, out_fd, err_fd, &p);
+    int rc = __wasmify_host_proc_spawn(path, argv, envp, in_fd, out_fd, err_fd,
+                                       cwd != nullptr ? cwd : "", &p);
     if (rc != 0) {
         /* posix_spawn reports failure as a positive errno return value. */
         return (rc < 0) ? -rc : rc;
