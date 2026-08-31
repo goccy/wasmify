@@ -394,6 +394,17 @@ type BridgeConfig struct {
 	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
 	HostSubprocess bool `json:"HostSubprocess,omitempty"`
 
+	// HostFS opts into host-backed filesystem fidelity. WASI preview1 can
+	// neither change file modes nor report permission bits, and wasi-libc's
+	// cwd bookkeeping keeps ".." components live; when this is true the
+	// compile is given -DWASMIFY_HOST_FS and every link gets -Wl,--wrap=
+	// flags for chmod/stat/lstat/chdir, activating the shim that backs
+	// chmod and stat-mode reporting with path_chmod/path_filestat_mode
+	// host imports and normalizes chdir lexically. The resulting wasm
+	// requires a host that implements those imports (e.g. the wasm2go
+	// runtime). Off by default to keep the wasm portable.
+	HostFS bool `json:"HostFS,omitempty"`
+
 	// HostThreads opts into threads. The wasm is built for wasi-threads
 	// (-pthread, shared memory, atomics), which makes it import
 	// wasi_thread_spawn and export wasi_thread_start — and wasm2go runs each

@@ -22,9 +22,19 @@ var hostSocketsShim []byte
 //go:embed shims/host_subprocess.cc
 var hostSubprocessShim []byte
 
+// hostFSShim is the generic filesystem-fidelity shim. It provides __wrap_
+// definitions for chmod/stat/lstat/chdir backed by the path_chmod/
+// path_filestat_mode host imports (plus lexical chdir normalization) and is
+// gated internally on WASMIFY_HOST_FS; the matching -Wl,--wrap= flags come
+// from EffectiveExtraLDFlags.
+//
+//go:embed shims/host_fs.cc
+var hostFSShim []byte
+
 const (
 	hostSocketsShimName    = "host_sockets.cc"
 	hostSubprocessShimName = "host_subprocess.cc"
+	hostFSShimName         = "host_fs.cc"
 )
 
 // HostSubprocessStubHeaders lists the stub headers the subprocess shim needs to
@@ -73,8 +83,8 @@ func DeployHostSubprocessHeaders(buildDir string) (string, error) {
 // portable). The shim bodies are additionally guarded by their respective
 // WASMIFY_HOST_* macros, which wasmify defines for the compile only when the
 // flag is on.
-func DeployHostShims(buildDir string, hostSockets, hostSubprocess bool) ([]string, error) {
-	if !hostSockets && !hostSubprocess {
+func DeployHostShims(buildDir string, hostSockets, hostSubprocess, hostFS bool) ([]string, error) {
+	if !hostSockets && !hostSubprocess && !hostFS {
 		return nil, nil
 	}
 
@@ -100,6 +110,11 @@ func DeployHostShims(buildDir string, hostSockets, hostSubprocess bool) ([]strin
 	}
 	if hostSubprocess {
 		if err := write(hostSubprocessShimName, hostSubprocessShim); err != nil {
+			return nil, err
+		}
+	}
+	if hostFS {
+		if err := write(hostFSShimName, hostFSShim); err != nil {
 			return nil, err
 		}
 	}
