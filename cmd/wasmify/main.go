@@ -1353,6 +1353,9 @@ func cmdWasmBuild(args []string) error {
 		if s.Bridge.HostSubprocess {
 			cfg.HostSubprocess = true
 		}
+		if s.Bridge.HostFS {
+			cfg.HostFS = true
+		}
 		if s.Bridge.HostThreads {
 			cfg.HostThreads = true
 		}
@@ -1483,7 +1486,7 @@ func cmdWasmBuild(args []string) error {
 	// subprocess capability adds stub headers + a -D macro to EVERY wasm-build
 	// compile (via wasmCompileFlags), so cfg must carry the include dir before
 	// TransformSteps runs.
-	hostSockets, hostSubprocess := cfg.HostSockets, cfg.HostSubprocess
+	hostSockets, hostSubprocess, hostFS := cfg.HostSockets, cfg.HostSubprocess, cfg.HostFS
 	if hostSubprocess {
 		// Materialize spawn.h/sys/wait.h into a build-local include dir and put
 		// it on every compile's -I (see wasmCompileFlags). Paired with the
@@ -1517,15 +1520,15 @@ func cmdWasmBuild(args []string) error {
 	// With both capabilities off, nothing is deployed and the wasm stays
 	// portable (standard wasi imports only).
 	var shimSrcs []string
-	if hostSockets || hostSubprocess {
+	if hostSockets || hostSubprocess || hostFS {
 		// The subprocess shim #includes <spawn.h>/<sys/wait.h>; it resolves them
 		// from the build-local host-include dir already on every compile's -I
 		// (deployed above, before TransformSteps). No sysroot mutation.
-		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, hostSockets, hostSubprocess)
+		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, hostSockets, hostSubprocess, hostFS)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability shims deployed (sockets=%v subprocess=%v)\n", hostSockets, hostSubprocess)
+		fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability shims deployed (sockets=%v subprocess=%v fs=%v)\n", hostSockets, hostSubprocess, hostFS)
 	}
 
 	wasmSteps = wasmbuild.InjectBridgeSteps(wasmSteps, cfg, bridgeDir, shimSrcs)
@@ -1685,7 +1688,7 @@ func cmdWasmBuild(args []string) error {
 			base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
 			extraNames = append(extraNames, "wasmify_bridge_"+base+".o")
 		}
-		extraNames = append(extraNames, "wasmify_shim_host_sockets.o", "wasmify_shim_host_subprocess.o")
+		extraNames = append(extraNames, "wasmify_shim_host_sockets.o", "wasmify_shim_host_subprocess.o", "wasmify_shim_host_fs.o")
 		var extraObjects []string
 		for _, name := range extraNames {
 			obj := filepath.Join(cfg.BuildDir, "obj", name)

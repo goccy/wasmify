@@ -850,6 +850,9 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 			flags = append(flags, "-I", cfg.HostIncludeDir)
 		}
 	}
+	if cfg.HostFS {
+		flags = append(flags, "-DWASMIFY_HOST_FS")
+	}
 	flags = append(flags,
 		"--target="+effectiveTarget(cfg),
 		"--sysroot="+Sysroot(cfg.WasiSDKPath),

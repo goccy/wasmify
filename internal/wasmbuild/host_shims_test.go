@@ -11,19 +11,21 @@ func TestDeployHostShims(t *testing.T) {
 		name           string
 		hostSockets    bool
 		hostSubprocess bool
+		hostFS         bool
 		wantNames      []string
 	}{
-		{name: "neither", hostSockets: false, hostSubprocess: false, wantNames: nil},
-		{name: "sockets only", hostSockets: true, hostSubprocess: false, wantNames: []string{hostSocketsShimName}},
-		{name: "subprocess only", hostSockets: false, hostSubprocess: true, wantNames: []string{hostSubprocessShimName}},
-		{name: "both", hostSockets: true, hostSubprocess: true, wantNames: []string{hostSocketsShimName, hostSubprocessShimName}},
+		{name: "none", wantNames: nil},
+		{name: "sockets only", hostSockets: true, wantNames: []string{hostSocketsShimName}},
+		{name: "subprocess only", hostSubprocess: true, wantNames: []string{hostSubprocessShimName}},
+		{name: "fs only", hostFS: true, wantNames: []string{hostFSShimName}},
+		{name: "all", hostSockets: true, hostSubprocess: true, hostFS: true, wantNames: []string{hostSocketsShimName, hostSubprocessShimName, hostFSShimName}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			buildDir := t.TempDir()
 
-			paths, err := DeployHostShims(buildDir, tt.hostSockets, tt.hostSubprocess)
+			paths, err := DeployHostShims(buildDir, tt.hostSockets, tt.hostSubprocess, tt.hostFS)
 			if err != nil {
 				t.Fatalf("DeployHostShims error: %v", err)
 			}
@@ -45,7 +47,7 @@ func TestDeployHostShims(t *testing.T) {
 
 			// When neither flag is set, nothing must be written (the dir is not
 			// even created) so the wasm stays portable.
-			if !tt.hostSockets && !tt.hostSubprocess {
+			if !tt.hostSockets && !tt.hostSubprocess && !tt.hostFS {
 				if _, err := os.Stat(shimDir); !os.IsNotExist(err) {
 					t.Fatalf("host-shims dir should not exist when no capability is opted in")
 				}
@@ -60,6 +62,11 @@ func TestDeployHostShims(t *testing.T) {
 			if !tt.hostSubprocess {
 				if _, err := os.Stat(filepath.Join(shimDir, hostSubprocessShimName)); err == nil {
 					t.Fatalf("subprocess shim deployed but not requested")
+				}
+			}
+			if !tt.hostFS {
+				if _, err := os.Stat(filepath.Join(shimDir, hostFSShimName)); err == nil {
+					t.Fatalf("fs shim deployed but not requested")
 				}
 			}
 		})

@@ -41,6 +41,7 @@ type WasmConfig struct {
 	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
 	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
+	HostFS              bool     // Opt-in: define WASMIFY_HOST_FS for every wasm-build compile + wrap chmod/stat/lstat/chdir at link (host-backed file modes, normalized cwd)
 	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
 	Wasm64              bool     // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; incompatible with HostThreads; mirrors WASMIFY_WASM64
 	OptLevel            string   // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
@@ -76,6 +77,9 @@ func (c *WasmConfig) ApplyEnvOverrides() {
 	}
 	if envSet("WASMIFY_HOST_SUBPROCESS") {
 		c.HostSubprocess = true
+	}
+	if envSet("WASMIFY_HOST_FS") {
+		c.HostFS = true
 	}
 	if envSet("WASMIFY_HOST_THREADS") {
 		c.HostThreads = true
@@ -130,6 +134,19 @@ func DefaultConfig() WasmConfig {
 // libraries resolve from.
 func (c WasmConfig) EffectiveExtraLDFlags() []string {
 	flags := append([]string(nil), c.ExtraLDFlags...)
+	if c.HostFS {
+		// The host-fs shim provides __wrap_ definitions for these; the
+		// wrap flags route every libc caller through them (see
+		// shims/host_fs.cc for why plain symbol shadowing cannot work
+		// for chdir, whose libc definition shares an object with the
+		// cwd bookkeeping globals).
+		flags = append(flags,
+			"-Wl,--wrap=chmod",
+			"-Wl,--wrap=stat",
+			"-Wl,--wrap=lstat",
+			"-Wl,--wrap=chdir",
+		)
+	}
 	if c.Wasm64 {
 		return append(flags, c.ExtraLDFlagsWasm64...)
 	}
