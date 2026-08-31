@@ -20,7 +20,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -35,24 +37,14 @@ extern int __wasmify_host_sock_connect(int fd, unsigned int ip_be, int port);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getaddrinfo")))
 extern int __wasmify_host_getaddrinfo(const char *node, int len, unsigned int *out_ip_be);
 
-/* struct addrinfo in the RFC2553 layout (canonname before addr). A consuming
- * libc socket module reads ai_addr/ai_addrlen from the struct this
- * getaddrinfo() allocates, so the field order must match the standard. */
-struct addrinfo {
-    int ai_flags;
-    int ai_family;
-    int ai_socktype;
-    int ai_protocol;
-    size_t ai_addrlen;
-    char *ai_canonname;
-    struct sockaddr *ai_addr;
-    struct addrinfo *ai_next;
-};
-
-/* Standard EAI_* error values. */
-#define WASMIFY_EAI_FAIL 4
-#define WASMIFY_EAI_MEMORY 6
-#define WASMIFY_EAI_NONAME 8
+/* struct addrinfo, the EAI_* values, and the prototypes this file
+ * implements all come from wasmify's <netdb.h> stub header (included
+ * above) — the SAME header a consuming libc socket module compiles
+ * against, so the struct layout the module reads is the layout built
+ * here by construction. */
+#define WASMIFY_EAI_FAIL EAI_FAIL
+#define WASMIFY_EAI_MEMORY EAI_MEMORY
+#define WASMIFY_EAI_NONAME EAI_NONAME
 
 /* getaddrinfo(): resolve node via the host (numeric IPs pass straight
  * through), returning a single IPv4 result. The port comes from a numeric
@@ -107,12 +99,27 @@ const char *gai_strerror(int ecode) {
     return "getaddrinfo failed";
 }
 
-/* getnameinfo(): reverse lookup is not supported by this bridge. */
+/* getnameinfo(): numeric-only — reverse DNS is not supported by this
+ * bridge, so the address and port are always rendered numerically (the
+ * NI_NUMERICHOST/NI_NUMERICSERV result), which is what callers like
+ * IO::Socket libraries use it for here (stringifying peers). */
 int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
                 socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
-    (void)sa; (void)salen; (void)host; (void)hostlen;
-    (void)serv; (void)servlen; (void)flags;
-    return WASMIFY_EAI_FAIL;
+    (void)salen; (void)flags;
+    if (sa == nullptr || sa->sa_family != AF_INET) return EAI_FAMILY;
+    const struct sockaddr_in *in = reinterpret_cast<const struct sockaddr_in *>(sa);
+    if (host != nullptr && hostlen > 0) {
+        unsigned int ip = ntohl(in->sin_addr.s_addr);
+        int n = snprintf(host, hostlen, "%u.%u.%u.%u",
+                         (ip >> 24) & 0xff, (ip >> 16) & 0xff,
+                         (ip >> 8) & 0xff, ip & 0xff);
+        if (n < 0 || (socklen_t)n >= hostlen) return EAI_OVERFLOW;
+    }
+    if (serv != nullptr && servlen > 0) {
+        int n = snprintf(serv, servlen, "%u", (unsigned int)ntohs(in->sin_port));
+        if (n < 0 || (socklen_t)n >= servlen) return EAI_OVERFLOW;
+    }
+    return 0;
 }
 
 /* socket(): allocate a host-managed socket fd. Host returns the fd, or a
@@ -124,6 +131,16 @@ int socket(int domain, int type, int protocol) {
     if (r < 0) { errno = -r; return -1; }
     return r;
 }
+
+/* Peer bookkeeping for getpeername(): connect() records the address each
+ * fd dialed, so getpeername() answers from this table without a host
+ * round-trip. Host socket fds are allocated monotonically and never
+ * reused, so a stale entry for a closed fd can never alias a live one;
+ * when the ring is full the oldest entry is evicted. */
+#define WASMIFY_SOCK_PEER_MAX 64
+static struct { int fd; struct sockaddr_in peer; } __wasmify_peers[WASMIFY_SOCK_PEER_MAX];
+static int __wasmify_peer_next = 0;
+static int __wasmify_peer_used = 0;
 
 /* connect(): parse the IPv4 sockaddr and ask the host to dial. sin_addr.s_addr
  * is already network byte order (host decodes it); sin_port is network order,
@@ -139,6 +156,41 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
                                         static_cast<unsigned int>(in->sin_addr.s_addr),
                                         static_cast<int>(ntohs(in->sin_port)));
     if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    __wasmify_peers[__wasmify_peer_next].fd = fd;
+    __wasmify_peers[__wasmify_peer_next].peer = *in;
+    __wasmify_peer_next = (__wasmify_peer_next + 1) % WASMIFY_SOCK_PEER_MAX;
+    if (__wasmify_peer_used < WASMIFY_SOCK_PEER_MAX) __wasmify_peer_used++;
+    return 0;
+}
+
+/* getpeername(): the address connect() dialed for this fd. */
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
+    for (int i = 0; i < __wasmify_peer_used; i++) {
+        if (__wasmify_peers[i].fd != fd) continue;
+        socklen_t n = *addrlen;
+        if (n > (socklen_t)sizeof(struct sockaddr_in)) n = sizeof(struct sockaddr_in);
+        memcpy(addr, &__wasmify_peers[i].peer, n);
+        *addrlen = sizeof(struct sockaddr_in);
+        return 0;
+    }
+    errno = ENOTCONN;
+    return -1;
+}
+
+/* getsockname(): the host does not expose the local endpoint of its dialed
+ * connections, so report the IPv4 unspecified address. Callers here use
+ * this only to stringify the local end. */
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    (void)fd;
+    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    socklen_t n = *addrlen;
+    if (n > (socklen_t)sizeof(in)) n = sizeof(in);
+    memcpy(addr, &in, n);
+    *addrlen = sizeof(in);
     return 0;
 }
 
