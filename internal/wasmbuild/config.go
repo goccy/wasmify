@@ -45,6 +45,7 @@ type WasmConfig struct {
 	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
 	Wasm64              bool     // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; incompatible with HostThreads; mirrors WASMIFY_WASM64
 	OptLevel            string   // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
+	NoInline            []string // Function-name patterns the post-link wasm-opt pass must not inline (wasmify.json wasm_build.no_inline)
 	MaxMemoryPages      int      // Threads only: the shared memory's declared maximum in the wasm binary, in 64 KiB pages (default DefaultMaxMemoryPages). Mandatory for a threads build (the WebAssembly threads proposal requires a bounded shared memory). A conventional VM enforces it as the memory.grow cap; the wasm2go backend instead honors the embedding host's own runtime cap, which overrides this baked value.
 	KeepSymbols         bool     // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
 	NoPosixCompat       bool     // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT

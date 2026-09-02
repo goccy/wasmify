@@ -224,6 +224,12 @@ type WasmBuildConfig struct {
 	// of the speed levels — set "-O3". Mirrors WASMIFY_OPT_LEVEL.
 	OptLevel string `json:"opt_level,omitempty"`
 
+	// NoInline lists function-name patterns the post-link wasm-opt
+	// pass must not inline (Binaryen --no-inline). Clang's noinline
+	// does not survive into wasm, so exported retarget anchors need
+	// this to stay out-of-line.
+	NoInline []string `json:"no_inline,omitempty"`
+
 	// Wasm64 builds for wasm64-wasip1 (the memory64 proposal) instead of
 	// wasm32-wasip1: 8-byte guest pointers, so linear memory can grow past
 	// wasm32's 4 GiB ceiling. The wasm64 sysroot (wasi-libc, compiler-rt,

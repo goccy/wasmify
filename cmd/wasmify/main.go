@@ -1412,6 +1412,9 @@ func cmdWasmBuild(args []string) error {
 		if s.WasmBuild.OptLevel != "" {
 			cfg.OptLevel = s.WasmBuild.OptLevel
 		}
+		if len(s.WasmBuild.NoInline) > 0 {
+			cfg.NoInline = append([]string{}, s.WasmBuild.NoInline...)
+		}
 	}
 
 	// Fold the recognised WASMIFY_* environment overrides into cfg now that it
@@ -1707,7 +1710,7 @@ func cmdWasmBuild(args []string) error {
 			// standalone `wasmify optimize` subcommand. Auto-installs
 			// Binaryen on first use; failure here is fatal because
 			// the user explicitly asked for the optimised artifact.
-			res, err := binaryen.Optimize(wasmPath, wasmPath, binaryen.OptimizeOptions{})
+			res, err := binaryen.Optimize(wasmPath, wasmPath, binaryen.OptimizeOptions{NoInline: cfg.NoInline})
 			if err != nil {
 				return fmt.Errorf("--optimize failed: %w", err)
 			}

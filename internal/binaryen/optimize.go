@@ -22,6 +22,13 @@ type OptimizeOptions struct {
 	// Verbose mirrors the CLI flag; when true, wasm-opt's stdout/
 	// stderr is plumbed through so users can see the pass list.
 	Verbose bool
+
+	// NoInline lists function-name patterns wasm-opt must not inline
+	// (--no-inline). Clang's noinline attribute does not survive into
+	// the wasm binary, so without this Binaryen freely inlines
+	// functions a project exports precisely to keep them out-of-line
+	// (e.g. kernels a downstream transpiler retargets by name).
+	NoInline []string
 }
 
 // Result captures what Optimize did so callers can format reports.
@@ -73,6 +80,11 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 	tmpOut := outputPath + ".tmp"
 	args := []string{
 		"-Oz",
+	}
+	for _, pat := range opts.NoInline {
+		args = append(args, "--no-inline="+pat)
+	}
+	args = append(args,
 		// wasi-sdk emits wasm with these post-MVP features turned
 		// on (memory.copy, sign-ext, mutable globals, multivalue,
 		// reference types). wasm-opt refuses to read the binary
@@ -117,7 +129,7 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		"--converge",
 		"-o", tmpOut,
 		inputPath,
-	}
+	)
 	cmd := exec.Command(wasmOpt, args...)
 	// Always capture stderr so a failure surfaces wasm-opt's own diagnostic
 	// (e.g. "Fatal: ... requires <feature>") instead of a bare "exit status 1".
