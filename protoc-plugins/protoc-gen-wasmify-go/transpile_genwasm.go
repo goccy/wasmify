@@ -41,17 +41,11 @@ func transpilerOptions(opts *transpile.Options) error {
 	if err := num("WASM2GO_FUSE_LOOP_UNROLL", &opts.FuseLoopUnroll); err != nil {
 		return err
 	}
-	if err := num("WASM2GO_VEC_DOT_PAIR_ENTRY", &opts.VecDotPairEntry); err != nil {
-		return err
-	}
-	// Same off-values as WASM2GO_FAST_MATH: "0" and "false" read as
-	// off so a Make-level `VAR ?= 1` default can be overridden on the
-	// command line without unsetting the variable.
-	switch os.Getenv("WASM2GO_VEC_DOT_ROWS") {
-	case "", "0", "false":
-	default:
-		opts.VecDotRows = true
-	}
+	// Assembly overrides: the project's manifest of assembly bodies for
+	// exported functions (wasm2go -asm-overrides). A relative path
+	// resolves against the plugin's working directory, which buf runs
+	// at the project root.
+	opts.AsmOverrides = os.Getenv("WASM2GO_ASM_OVERRIDES")
 	opts.FuseLoops = os.Getenv("WASM2GO_FUSE_LOOP") != ""
 	// The f16 table address is auto-detected by wasm2go v0.5.5+ (no
 	// address input exists anymore); the only knob left is the
