@@ -41,11 +41,11 @@ func transpilerOptions(opts *transpile.Options) error {
 	if err := num("WASM2GO_FUSE_LOOP_UNROLL", &opts.FuseLoopUnroll); err != nil {
 		return err
 	}
-	// Kernel overrides: the project's manifest of assembly bodies for
-	// exported leaf functions (wasm2go -kernel-overrides). A relative
-	// path resolves against the plugin's working directory, which buf
-	// runs at the project root.
-	opts.KernelOverrides = os.Getenv("WASM2GO_KERNEL_OVERRIDES")
+	// Assembly overrides: the project's manifest of assembly bodies for
+	// exported functions (wasm2go -asm-overrides). A relative path
+	// resolves against the plugin's working directory, which buf runs
+	// at the project root.
+	opts.AsmOverrides = os.Getenv("WASM2GO_ASM_OVERRIDES")
 	opts.FuseLoops = os.Getenv("WASM2GO_FUSE_LOOP") != ""
 	// The f16 table address is auto-detected by wasm2go v0.5.5+ (no
 	// address input exists anymore); the only knob left is the
