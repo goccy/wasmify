@@ -1230,7 +1230,12 @@ func collectInputFiles(args []string) []string {
 		}
 		ext := strings.ToLower(filepath.Ext(arg))
 		switch ext {
-		case ".c", ".cc", ".cpp", ".cxx", ".o", ".a", ".s", ".h", ".hpp":
+		// .obj / .lo: the object suffixes CMake's non-Unix generators and
+		// libtool use. An archive step whose members carry one of these
+		// used to record NO inputs, so its cached archive was reused
+		// after the members were recompiled and the link picked up
+		// stale code — the artifact no longer reflected the sources.
+		case ".c", ".cc", ".cpp", ".cxx", ".o", ".obj", ".lo", ".a", ".s", ".h", ".hpp":
 			inputs = append(inputs, arg)
 		}
 	}
