@@ -385,7 +385,6 @@ func TestWasmCompileFlagsWithPosixCompat(t *testing.T) {
 	}
 }
 
-
 // TestWasmFlagsLTOToggle pins the contract that --lto adds
 // `-flto=thin` to BOTH the per-file compile and the link, and that
 // the flag is absent when LTO is off. Mismatched compile/link LTO
@@ -1171,5 +1170,21 @@ func TestTransformStep_Archive(t *testing.T) {
 	ws := transformStep(step, cfg)
 	if ws.Type != buildjson.StepArchive {
 		t.Errorf("expected archive, got %s", ws.Type)
+	}
+}
+
+// Archive members with CMake's .obj suffix must be tracked as inputs:
+// otherwise a cached archive survives a recompile of its members and
+// the link consumes stale code.
+func TestCollectInputFilesTracksObjSuffixes(t *testing.T) {
+	got := collectInputFiles([]string{"qc", "libx.a", "a/foo.cpp.obj", "b/bar.c.o", "c/baz.lo", "-o", "skip.obj"})
+	want := []string{"libx.a", "a/foo.cpp.obj", "b/bar.c.o", "c/baz.lo"}
+	if len(got) != len(want) {
+		t.Fatalf("collectInputFiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("collectInputFiles = %v, want %v", got, want)
+		}
 	}
 }
