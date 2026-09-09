@@ -231,10 +231,36 @@ func resolveObjectRefs(steps []WasmBuildStep) {
 			return cands[0].path
 		default:
 			if len(cands) > 1 {
+				// The reference already went through rewriteOutputPath with
+				// the same (path, work dir) mapping as the compile that
+				// produced it, so an EXACT producer match is authoritative.
+				// One work dir can compile several same-named sources from
+				// sibling directories (CPython's Python/gc.c and
+				// Modules/_testcapi/gc.c both land in libpython3.14.a), and
+				// picking "any producer from this work dir" would archive
+				// the test module's gc.o twice and drop the interpreter's —
+				// the link then imports _PyObject_GC_New from the host.
 				for _, c := range cands {
-					if c.workDir == workDir {
+					if c.path == arg {
 						return c.path
 					}
+				}
+				// No exact match (the reference came from another work
+				// dir, so it was nested under that dir's namespace): among
+				// this work dir's producers prefer the one whose trailing
+				// path components agree with the reference's.
+				var best string
+				bestScore := -1
+				for _, c := range cands {
+					if c.workDir != workDir {
+						continue
+					}
+					if score := commonPathSuffix(c.path, arg); score > bestScore {
+						best, bestScore = c.path, score
+					}
+				}
+				if best != "" {
+					return best
 				}
 				return cands[0].path // best effort when no same-work-dir producer
 			}
@@ -277,6 +303,20 @@ func resolveObjectRefs(steps []WasmBuildStep) {
 			}
 		}
 	}
+}
+
+// commonPathSuffix counts how many trailing path components a and b share
+// (gc.o vs Python/gc.o -> 1; Python/gc.o vs obj/ns/Python/gc.o -> 2). It
+// ranks same-basename producers by how much of the reference's directory
+// structure they reproduce.
+func commonPathSuffix(a, b string) int {
+	as := strings.Split(filepath.ToSlash(filepath.Clean(a)), "/")
+	bs := strings.Split(filepath.ToSlash(filepath.Clean(b)), "/")
+	n := 0
+	for i, j := len(as)-1, len(bs)-1; i >= 0 && j >= 0 && as[i] == bs[j]; i, j = i-1, j-1 {
+		n++
+	}
+	return n
 }
 
 func transformStep(step buildjson.BuildStep, cfg WasmConfig) WasmBuildStep {
@@ -844,14 +884,16 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	}
 	if cfg.HostSubprocess {
 		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
-		if cfg.HostIncludeDir != "" {
-			// Carries spawn.h/sys/wait.h that wasi-libc omits; gated behind the
-			// macro above so its presence is inert when the feature is off.
-			flags = append(flags, "-I", cfg.HostIncludeDir)
-		}
 	}
 	if cfg.HostFS {
 		flags = append(flags, "-DWASMIFY_HOST_FS")
+	}
+	if cfg.HostIncludeDir != "" && (cfg.HostSockets || cfg.HostSubprocess) {
+		// Carries the headers wasi-libc omits for the opted-in capabilities:
+		// spawn.h/sys/wait.h for host subprocess, netdb.h for host sockets.
+		// Gated behind the macros above so its presence is inert when the
+		// features are off. Added once, whichever capabilities populated it.
+		flags = append(flags, "-I", cfg.HostIncludeDir)
 	}
 	flags = append(flags,
 		"--target="+effectiveTarget(cfg),

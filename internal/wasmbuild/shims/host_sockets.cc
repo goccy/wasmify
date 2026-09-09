@@ -12,9 +12,12 @@
  * imports the WASI host implements in Go (e.g. via net.Dial). The resulting fd
  * is host-managed; send()/recv()/close() keep flowing through the standard wasi
  * sock_send/sock_recv/fd_close path the host already implements. Only IPv4 TCP
- * is handled. The matching declarations come from wasmify's POSIX-compat
- * headers, so a libc socket module compiled with HAVE_SOCKET/HAVE_CONNECT sees
- * them. */
+ * is handled. The matching declarations come from wasmify's <netdb.h> stub,
+ * deployed into the build-local host-include dir that every wasm-build compile
+ * gets on its -I whenever host sockets are opted in (independent of the
+ * POSIX-compat overlay), so a libc socket module compiled with
+ * HAVE_SOCKET/HAVE_CONNECT sees the same struct addrinfo layout this file
+ * fills in. */
 #ifdef WASMIFY_HOST_SOCKETS
 
 #include <sys/socket.h>

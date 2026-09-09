@@ -38,14 +38,42 @@ const (
 )
 
 // HostSubprocessStubHeaders lists the stub headers the subprocess shim needs to
-// compile (resolved from the stub registry against cfg.PosixCompatDir). The
-// socket shim's headers are part of the always-deployed POSIX-compat set, so
-// only the subprocess shim contributes here.
+// compile (resolved from the stub registry against cfg.PosixCompatDir).
 var HostSubprocessStubHeaders = []string{"spawn.h", "sys/wait.h"}
+
+// hostSocketsHeader is the header the socket shim and its consumers share:
+// struct addrinfo, the AI_*/EAI_* values, and the getaddrinfo family
+// prototypes. It is the same file the POSIX-compat overlay ships as <netdb.h>,
+// deployed separately so the socket capability does not depend on the overlay
+// being enabled (a wasi-native project builds with NoPosixCompat and still
+// opts in to host sockets).
+const hostSocketsHeader = "netdb.h"
 
 // HostIncludeSubdir is the build-local directory (under the wasm-build
 // BuildDir) where wasmify materializes the host-capability stub headers.
 const HostIncludeSubdir = "host-include"
+
+// DeployHostSocketsHeaders writes the host-sockets contract header (netdb.h)
+// into <buildDir>/host-include and returns that directory. The wasip1 sysroot
+// has no netdb.h; the socket shim #includes it for struct addrinfo and the
+// EAI_* values, and every upstream translation unit that calls getaddrinfo()
+// must see the SAME layout, so the header goes on every wasm-build compile's
+// -I (see wasmCompileFlags) rather than only on the shim's. Under the
+// POSIX-compat overlay the identical file is also reachable via -isystem; the
+// include guard makes the duplicate harmless. The build-local dir keeps the
+// shared wasi-sdk sysroot pristine, and the capability stays gated by the
+// -DWASMIFY_HOST_SOCKETS macro wasmify defines only at wasm-build.
+func DeployHostSocketsHeaders(buildDir string) (string, error) {
+	incDir := filepath.Join(buildDir, HostIncludeSubdir)
+	data, err := posixCompatFS.ReadFile("stubs/include/" + hostSocketsHeader)
+	if err != nil {
+		return "", fmt.Errorf("missing embedded host sockets header <%s>: %w", hostSocketsHeader, err)
+	}
+	if err := DeployStubHeader(incDir, hostSocketsHeader, string(data)); err != nil {
+		return "", fmt.Errorf("failed to deploy host sockets header <%s>: %w", hostSocketsHeader, err)
+	}
+	return incDir, nil
+}
 
 // DeployHostSubprocessHeaders writes the host-subprocess stub headers (spawn.h,
 // sys/wait.h) into <buildDir>/host-include and returns that directory. wasi-libc
