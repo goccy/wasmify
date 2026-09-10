@@ -35,11 +35,11 @@ type WasmConfig struct {
 	DryRun              bool     // Only generate wasm-build.json without executing
 	NoCache             bool     // Disable build cache
 	PosixCompatDir      string   // Path to POSIX compatibility headers (injected via -isystem)
-	HostIncludeDir      string   // Path to build-local host-capability stub headers (spawn.h/sys/wait.h), injected via -I on every compile when HostSubprocess is on
+	HostIncludeDir      string   // Path to build-local host-capability stub headers (spawn.h/sys/wait.h for HostSubprocess, netdb.h for HostSockets), injected via -I on every compile when either is on
 	ProjectRoot         string   // Absolute project root; added to the bridge compile -I so generated api_bridge.cc's project-relative includes (e.g. "embed/foo.h") resolve
 	CustomBridgeSources []string // Absolute paths to the project's hand-written bridge implementation sources (declared in wasmify.json bridge.CustomBridgeSources); each is compiled and linked, with -I of its own dir so its sibling-relative includes resolve
 	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
-	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile (host-provided outbound sockets)
+	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile + add HostIncludeDir (netdb.h) to -I (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
 	HostFS              bool     // Opt-in: define WASMIFY_HOST_FS for every wasm-build compile + wrap chmod/stat/lstat/chdir at link (host-backed file modes, normalized cwd)
 	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)

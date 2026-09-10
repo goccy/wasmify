@@ -742,10 +742,12 @@ func cmdClassify(args []string) error {
 // hostCaptureInjectFlags returns the extra compile flags (as one shell-split
 // string) to inject into the capture build's C/C++ compiles when wasmify.json's
 // bridge config opts into host sockets/subprocess: the POSIX-compat stub
-// headers (sys/socket.h, netdb.h, ...) and, for subprocess, the host-subprocess
-// stub headers (spawn.h, sys/wait.h) plus the -DWASMIFY_HOST_* macros the stubs
-// gate their declarations on. Returns "" when neither capability is opted in.
-// Mirrors what cmdWasmBuild deploys, so both phases see the same declarations.
+// headers (sys/socket.h, netdb.h, ...) unless opted out, the host-sockets
+// contract header (netdb.h, also without the overlay), the host-subprocess
+// stub headers (spawn.h, sys/wait.h), plus the -DWASMIFY_HOST_* macros the
+// stubs gate their declarations on. Returns "" when neither capability is
+// opted in. Mirrors what cmdWasmBuild deploys, so both phases see the same
+// declarations.
 func hostCaptureInjectFlags(dataDir, outDir string) string {
 	s, err := state.Load(outDir)
 	if err != nil || s == nil || s.Bridge == nil {
@@ -772,6 +774,12 @@ func hostCaptureInjectFlags(dataDir, outDir string) string {
 		}
 	}
 	if s.Bridge.HostSockets {
+		// netdb.h is the socket shim's layout contract; the captured build must
+		// compile the upstream's getaddrinfo() callers against the same header
+		// the replay does, whether or not the POSIX-compat overlay is on.
+		if incDir, herr := wasmbuild.DeployHostSocketsHeaders(buildDir); herr == nil {
+			flags = append(flags, "-isystem", incDir)
+		}
 		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
 	}
 	if s.Bridge.HostThreads {
@@ -1500,6 +1508,18 @@ func cmdWasmBuild(args []string) error {
 		}
 		cfg.HostIncludeDir = incDir
 		fmt.Fprintf(os.Stderr, "[wasm-build] Host-subprocess headers: %s\n", incDir)
+	}
+	if hostSockets {
+		// Materialize netdb.h — the layout contract between the socket shim and
+		// every getaddrinfo() caller — into the same build-local include dir.
+		// Independent of the POSIX-compat overlay: a wasi-native project builds
+		// with NoPosixCompat and still opts in to host sockets.
+		incDir, herr := wasmbuild.DeployHostSocketsHeaders(cfg.BuildDir)
+		if herr != nil {
+			return herr
+		}
+		cfg.HostIncludeDir = incDir
+		fmt.Fprintf(os.Stderr, "[wasm-build] Host-sockets headers: %s\n", incDir)
 	}
 
 	// Transform steps
