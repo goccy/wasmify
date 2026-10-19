@@ -15,6 +15,12 @@ import (
 // where any speed regression at runtime is dwarfed by the wasm-load
 // cost.
 type OptimizeOptions struct {
+	// KeepNames keeps the wasm name section through the size pass
+	// (--strip-dwarf instead of --strip-debug), so a function index in
+	// the transpiled Go (FnNNNN) or in a profile can be mapped back to
+	// its C symbol. wasm-build passes the project's keep_symbols here.
+	KeepNames bool
+
 	// InstallDir is the Binaryen install root (a directory whose
 	// `bin/wasm-opt` exists). Empty means DetectOrInstall.
 	InstallDir string
@@ -71,6 +77,14 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 	// Always write to a tmp file first so a wasm-opt failure (or a
 	// size regression) leaves the original untouched.
 	tmpOut := outputPath + ".tmp"
+	// --strip-debug removes every debug custom section, the name section
+	// included; --strip-dwarf keeps the names and drops only DWARF.
+	// wasm-opt only writes a name section when asked (-g); without it the
+	// optimised module comes out unnamed whatever the input carried.
+	stripDebug := "--strip-debug"
+	if opts.KeepNames {
+		stripDebug = "--strip-dwarf"
+	}
 	args := []string{
 		"-Oz",
 		// wasi-sdk emits wasm with these post-MVP features turned
@@ -111,13 +125,18 @@ func Optimize(inputPath, outputPath string, opts OptimizeOptions) (Result, error
 		// linear memory; wasm-opt refuses to read it without this flag.
 		// Inert for wasm32.
 		"--enable-memory64",
-		"--strip-debug",
+		stripDebug,
+	}
+	if opts.KeepNames {
+		args = append(args, "-g")
+	}
+	args = append(args,
 		"--strip-producers",
 		"--strip-target-features",
 		"--converge",
 		"-o", tmpOut,
 		inputPath,
-	}
+	)
 	cmd := exec.Command(wasmOpt, args...)
 	// Always capture stderr so a failure surfaces wasm-opt's own diagnostic
 	// (e.g. "Fatal: ... requires <feature>") instead of a bare "exit status 1".
