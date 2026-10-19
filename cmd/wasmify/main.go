@@ -1707,7 +1707,7 @@ func cmdWasmBuild(args []string) error {
 			// standalone `wasmify optimize` subcommand. Auto-installs
 			// Binaryen on first use; failure here is fatal because
 			// the user explicitly asked for the optimised artifact.
-			res, err := binaryen.Optimize(wasmPath, wasmPath, binaryen.OptimizeOptions{})
+			res, err := binaryen.Optimize(wasmPath, wasmPath, binaryen.OptimizeOptions{KeepNames: cfg.KeepSymbols})
 			if err != nil {
 				return fmt.Errorf("--optimize failed: %w", err)
 			}
