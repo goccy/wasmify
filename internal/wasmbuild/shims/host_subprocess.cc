@@ -39,6 +39,9 @@ extern int __wasmify_host_proc_spawn(const char *path, char *const argv[],
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait")))
 extern int __wasmify_host_proc_wait(int pid, int options, int *status_out);
 
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait_any")))
+extern int __wasmify_host_proc_wait_any(int options, int *pid_out, int *status_out);
+
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("pipe")))
 extern int __wasmify_host_pipe(int *fds_out);
 
@@ -166,25 +169,26 @@ int pipe2(int fildes[2], int flags) {
 
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     int st = 0;
-    int rc = __wasmify_host_proc_wait(static_cast<int>(pid), options, &st);
+    int reaped = static_cast<int>(pid);
+    /* pid -1 (and the process-group forms, which have no meaning here: the
+     * host tracks children, not groups) waits for any child. */
+    int rc = pid > 0
+        ? __wasmify_host_proc_wait(static_cast<int>(pid), options, &st)
+        : __wasmify_host_proc_wait_any(options, &reaped, &st);
     if (rc == 0) {
         if (wstatus != nullptr) *wstatus = st;
-        return pid;
+        return static_cast<pid_t>(reaped);
     }
     int e = (rc < 0) ? -rc : rc;
     if (e == EAGAIN) {
-        return 0; /* WNOHANG: child still running */
+        return 0; /* WNOHANG: no child has finished yet */
     }
     errno = e;
     return static_cast<pid_t>(-1);
 }
 
 pid_t wait(int *wstatus) {
-    /* Reaping an arbitrary child is unsupported; the consumer always waits on a
-     * specific pid via waitpid(). */
-    (void)wstatus;
-    errno = ECHILD;
-    return static_cast<pid_t>(-1);
+    return waitpid(static_cast<pid_t>(-1), wstatus, 0);
 }
 
 } /* extern "C" */
