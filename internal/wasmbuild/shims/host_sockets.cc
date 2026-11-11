@@ -1,4 +1,4 @@
-/* host_sockets.cc — generic host-provided outbound socket shim.
+/* host_sockets.cc — generic host-provided socket shim.
  *
  * This translation unit is deployed and compiled by wasmify itself, and only
  * when host socket support is opted in (bridge.HostSockets in wasmify.json,
@@ -6,13 +6,22 @@
  * that opt-in the file is excluded entirely and the wasm imports only standard
  * wasi, staying portable to any wasi runtime.
  *
- * WASI preview1 has no way to create or connect an outbound socket, and
+ * WASI preview1 has no way to create, connect or bind a socket, and
  * wasi-libc under __wasip1__ does not even declare or define socket()/connect()
  * (the prototypes are guarded out). So we DEFINE them here, backed by host
- * imports the WASI host implements in Go (e.g. via net.Dial). The resulting fd
- * is host-managed; send()/recv()/close() keep flowing through the standard wasi
- * sock_send/sock_recv/fd_close path the host already implements. Only IPv4 TCP
- * is handled. The matching declarations come from wasmify's <netdb.h> stub,
+ * imports the WASI host implements in Go (e.g. via net.Dial / net.Listen). The
+ * resulting fd is host-managed; send()/recv()/close() keep flowing through the
+ * standard wasi sock_send/sock_recv/fd_close path the host already implements.
+ *
+ * What is handled: IPv4 TCP sockets — clients (connect) and servers (bind,
+ * listen, accept) — their names (getsockname, getpeername), a fixed set of
+ * socket options, and socketpair() for a pair of connected AF_UNIX stream
+ * sockets. Everything else fails with the errno the missing feature has: a
+ * datagram socket cannot be created (EPROTONOSUPPORT), another address family
+ * is EAFNOSUPPORT, an option outside the set is ENOPROTOOPT. Nothing here
+ * reports success for something it did not do.
+ *
+ * The matching declarations come from wasmify's <netdb.h> stub,
  * deployed into the build-local host-include dir that every wasm-build compile
  * gets on its -I whenever host sockets are opted in (independent of the
  * POSIX-compat overlay), so a libc socket module compiled with
@@ -22,12 +31,17 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <fcntl.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
+#include <wasi/api.h>
 
 extern "C" {
 
@@ -39,6 +53,45 @@ extern int __wasmify_host_sock_connect(int fd, unsigned int ip_be, int port);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getaddrinfo")))
 extern int __wasmify_host_getaddrinfo(const char *node, int len, unsigned int *out_ip_be);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_bind")))
+extern int __wasmify_host_sock_bind(int fd, unsigned int ip_be, int port);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_listen")))
+extern int __wasmify_host_sock_listen(int fd, int backlog);
+
+/* A socket name from the host: family (1 IPv4, 2 Unix), the IPv4 address as
+ * it sits in sin_addr.s_addr, and the port in host byte order. */
+struct __wasmify_sock_name { uint32_t family; uint32_t ip_be; uint32_t port; };
+#define WASMIFY_SOCK_FAMILY_IPV4 1
+#define WASMIFY_SOCK_FAMILY_UNIX 2
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getsockname")))
+extern int __wasmify_host_sock_getsockname(int fd, struct __wasmify_sock_name *out);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getpeername")))
+extern int __wasmify_host_sock_getpeername(int fd, struct __wasmify_sock_name *out);
+
+/* The socket options the host knows, by the host's own numbering: libc's
+ * numbers for them differ from libc to libc. */
+#define WASMIFY_SOCKOPT_REUSEADDR 1
+#define WASMIFY_SOCKOPT_REUSEPORT 2
+#define WASMIFY_SOCKOPT_KEEPALIVE 3
+#define WASMIFY_SOCKOPT_NODELAY 4
+#define WASMIFY_SOCKOPT_RCVBUF 5
+#define WASMIFY_SOCKOPT_SNDBUF 6
+#define WASMIFY_SOCKOPT_LINGER 7 /* seconds, or -1 for off */
+#define WASMIFY_SOCKOPT_ERROR 8  /* read only */
+#define WASMIFY_SOCKOPT_TYPE 9   /* read only: 1 for a stream socket */
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_setopt")))
+extern int __wasmify_host_sock_setopt(int fd, int option, int value);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getopt")))
+extern int __wasmify_host_sock_getopt(int fd, int option, int *value);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_pair")))
+extern int __wasmify_host_sock_pair(int fds[2]);
 
 /* struct addrinfo, the EAI_* values, and the prototypes this file
  * implements all come from wasmify's <netdb.h> stub header (included
@@ -125,32 +178,32 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
     return 0;
 }
 
-/* socket(): allocate a host-managed socket fd. Host returns the fd, or a
- * negative errno on failure. */
+/* socket(): allocate a host-managed socket fd. Only a TCP socket over IPv4
+ * can be made. Host returns the fd, or a negative errno on failure. */
 int socket(int domain, int type, int protocol) {
-    (void)protocol;
     if (domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
-    int r = __wasmify_host_sock_socket(domain, type);
+    const int flags = type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if ((type & ~flags) != SOCK_STREAM || (protocol != 0 && protocol != IPPROTO_TCP)) {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+    int r = __wasmify_host_sock_socket(domain, SOCK_STREAM);
     if (r < 0) { errno = -r; return -1; }
+    if ((flags & SOCK_NONBLOCK) && fcntl(r, F_SETFL, O_NONBLOCK) != 0) {
+        const int e = errno;
+        close(r);
+        errno = e;
+        return -1;
+    }
     return r;
 }
-
-/* Peer bookkeeping for getpeername(): connect() records the address each
- * fd dialed, so getpeername() answers from this table without a host
- * round-trip. Host socket fds are allocated monotonically and never
- * reused, so a stale entry for a closed fd can never alias a live one;
- * when the ring is full the oldest entry is evicted. */
-#define WASMIFY_SOCK_PEER_MAX 64
-static struct { int fd; struct sockaddr_in peer; } __wasmify_peers[WASMIFY_SOCK_PEER_MAX];
-static int __wasmify_peer_next = 0;
-static int __wasmify_peer_used = 0;
 
 /* connect(): parse the IPv4 sockaddr and ask the host to dial. sin_addr.s_addr
  * is already network byte order (host decodes it); sin_port is network order,
  * converted to host order here. */
 int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
-    (void)addrlen;
-    if (addr == nullptr || addr->sa_family != AF_INET) {
+    if (addr == nullptr || addrlen < (socklen_t)sizeof(struct sockaddr_in) ||
+        addr->sa_family != AF_INET) {
         errno = EAFNOSUPPORT;
         return -1;
     }
@@ -159,42 +212,215 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
                                         static_cast<unsigned int>(in->sin_addr.s_addr),
                                         static_cast<int>(ntohs(in->sin_port)));
     if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
-    __wasmify_peers[__wasmify_peer_next].fd = fd;
-    __wasmify_peers[__wasmify_peer_next].peer = *in;
-    __wasmify_peer_next = (__wasmify_peer_next + 1) % WASMIFY_SOCK_PEER_MAX;
-    if (__wasmify_peer_used < WASMIFY_SOCK_PEER_MAX) __wasmify_peer_used++;
     return 0;
 }
 
-/* getpeername(): the address connect() dialed for this fd. */
-int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen) {
-    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
-    for (int i = 0; i < __wasmify_peer_used; i++) {
-        if (__wasmify_peers[i].fd != fd) continue;
-        socklen_t n = *addrlen;
-        if (n > (socklen_t)sizeof(struct sockaddr_in)) n = sizeof(struct sockaddr_in);
-        memcpy(addr, &__wasmify_peers[i].peer, n);
-        *addrlen = sizeof(struct sockaddr_in);
-        return 0;
+/* bind(): give the socket a local IPv4 address; port 0 lets the host pick. */
+int bind(int fd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (addr == nullptr || addrlen < (socklen_t)sizeof(struct sockaddr_in) ||
+        addr->sa_family != AF_INET) {
+        errno = EAFNOSUPPORT;
+        return -1;
     }
-    errno = ENOTCONN;
-    return -1;
+    const struct sockaddr_in *in = reinterpret_cast<const struct sockaddr_in *>(addr);
+    int r = __wasmify_host_sock_bind(fd,
+                                     static_cast<unsigned int>(in->sin_addr.s_addr),
+                                     static_cast<int>(ntohs(in->sin_port)));
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    return 0;
 }
 
-/* getsockname(): the host does not expose the local endpoint of its dialed
- * connections, so report the IPv4 unspecified address. Callers here use
- * this only to stringify the local end. */
-int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
-    (void)fd;
-    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
+int listen(int fd, int backlog) {
+    int r = __wasmify_host_sock_listen(fd, backlog);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    return 0;
+}
+
+/* Renders a socket name from the host as a sockaddr, the way getsockname()
+ * and friends return one: as much of it as fits is copied, and *addrlen is
+ * the full size. */
+static void __wasmify_fill_sockaddr(const struct __wasmify_sock_name *name,
+                                    struct sockaddr *addr, socklen_t *addrlen) {
+    if (name->family == WASMIFY_SOCK_FAMILY_UNIX) {
+        /* an unnamed Unix-domain socket: the family and no path */
+        struct sockaddr un;
+        memset(&un, 0, sizeof(un));
+        un.sa_family = AF_UNIX;
+        socklen_t n = *addrlen;
+        if (n > (socklen_t)sizeof(sa_family_t)) n = sizeof(sa_family_t);
+        memcpy(addr, &un, n);
+        *addrlen = sizeof(sa_family_t);
+        return;
+    }
     struct sockaddr_in in;
     memset(&in, 0, sizeof(in));
     in.sin_family = AF_INET;
+    in.sin_port = htons(static_cast<unsigned short>(name->port));
+    in.sin_addr.s_addr = name->ip_be;
     socklen_t n = *addrlen;
     if (n > (socklen_t)sizeof(in)) n = sizeof(in);
     memcpy(addr, &in, n);
     *addrlen = sizeof(in);
+}
+
+/* getsockname(): the socket's local name, from the host. */
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
+    struct __wasmify_sock_name name;
+    int r = __wasmify_host_sock_getsockname(fd, &name);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    __wasmify_fill_sockaddr(&name, addr, addrlen);
     return 0;
+}
+
+/* getpeername(): the name of the socket's peer, from the host. */
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (addr == nullptr || addrlen == nullptr) { errno = EFAULT; return -1; }
+    struct __wasmify_sock_name name;
+    int r = __wasmify_host_sock_getpeername(fd, &name);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    __wasmify_fill_sockaddr(&name, addr, addrlen);
+    return 0;
+}
+
+/* accept4() / accept(): take a connection off a listening socket (the
+ * standard wasi sock_accept) and report who connected. wasi-libc's own
+ * accept cannot do the second part: it knows no peer and hands back an
+ * address without a family. */
+int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
+    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) { errno = EINVAL; return -1; }
+    __wasi_fd_t conn = 0;
+    __wasi_errno_t e = __wasi_sock_accept(
+        fd, (flags & SOCK_NONBLOCK) ? __WASI_FDFLAGS_NONBLOCK : 0, &conn);
+    if (e != 0) { errno = e; return -1; }
+    if (addr != nullptr && addrlen != nullptr) {
+        struct __wasmify_sock_name name;
+        int r = __wasmify_host_sock_getpeername(static_cast<int>(conn), &name);
+        if (r != 0) {
+            /* the peer went away already: an address of no family */
+            *addrlen = 0;
+        } else {
+            __wasmify_fill_sockaddr(&name, addr, addrlen);
+        }
+    }
+    return static_cast<int>(conn);
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    return accept4(fd, addr, addrlen, 0);
+}
+
+/* Maps a (level, option) of setsockopt/getsockopt to the host's option, or
+ * 0 for one the host does not know. */
+static int __wasmify_sock_option(int level, int optname) {
+    if (level == SOL_SOCKET) {
+        switch (optname) {
+        case SO_REUSEADDR: return WASMIFY_SOCKOPT_REUSEADDR;
+        case SO_REUSEPORT: return WASMIFY_SOCKOPT_REUSEPORT;
+        case SO_KEEPALIVE: return WASMIFY_SOCKOPT_KEEPALIVE;
+        case SO_RCVBUF:    return WASMIFY_SOCKOPT_RCVBUF;
+        case SO_SNDBUF:    return WASMIFY_SOCKOPT_SNDBUF;
+        case SO_LINGER:    return WASMIFY_SOCKOPT_LINGER;
+        case SO_ERROR:     return WASMIFY_SOCKOPT_ERROR;
+        case SO_TYPE:      return WASMIFY_SOCKOPT_TYPE;
+        }
+    } else if (level == IPPROTO_TCP) {
+        if (optname == TCP_NODELAY) return WASMIFY_SOCKOPT_NODELAY;
+    }
+    return 0;
+}
+
+int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
+    const int option = __wasmify_sock_option(level, optname);
+    if (option == 0) { errno = ENOPROTOOPT; return -1; }
+    if (optval == nullptr) { errno = EFAULT; return -1; }
+    int value = 0;
+    if (option == WASMIFY_SOCKOPT_LINGER) {
+        if (optlen < (socklen_t)sizeof(struct linger)) { errno = EINVAL; return -1; }
+        struct linger l;
+        memcpy(&l, optval, sizeof(l));
+        value = l.l_onoff ? l.l_linger : -1;
+    } else {
+        if (optlen < (socklen_t)sizeof(int)) { errno = EINVAL; return -1; }
+        memcpy(&value, optval, sizeof(value));
+    }
+    int r = __wasmify_host_sock_setopt(fd, option, value);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    return 0;
+}
+
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    const int option = __wasmify_sock_option(level, optname);
+    if (option == 0) { errno = ENOPROTOOPT; return -1; }
+    if (optval == nullptr || optlen == nullptr) { errno = EFAULT; return -1; }
+    int value = 0;
+    int r = __wasmify_host_sock_getopt(fd, option, &value);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    if (option == WASMIFY_SOCKOPT_LINGER) {
+        if (*optlen < (socklen_t)sizeof(struct linger)) { errno = EINVAL; return -1; }
+        struct linger l;
+        l.l_onoff = value >= 0;
+        l.l_linger = value >= 0 ? value : 0;
+        memcpy(optval, &l, sizeof(l));
+        *optlen = sizeof(l);
+        return 0;
+    }
+    if (option == WASMIFY_SOCKOPT_TYPE) value = SOCK_STREAM; /* the host's 1 */
+    if (*optlen < (socklen_t)sizeof(int)) { errno = EINVAL; return -1; }
+    memcpy(optval, &value, sizeof(value));
+    *optlen = sizeof(value);
+    return 0;
+}
+
+/* socketpair(): a pair of connected AF_UNIX stream sockets. */
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+    if (domain != AF_UNIX) { errno = EAFNOSUPPORT; return -1; }
+    const int flags = type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if ((type & ~flags) != SOCK_STREAM || protocol != 0) {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+    if (sv == nullptr) { errno = EFAULT; return -1; }
+    int fds[2] = {-1, -1};
+    int r = __wasmify_host_sock_pair(fds);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    if (flags & SOCK_NONBLOCK) {
+        for (int i = 0; i < 2; i++) {
+            if (fcntl(fds[i], F_SETFL, O_NONBLOCK) != 0) {
+                const int e = errno;
+                close(fds[0]);
+                close(fds[1]);
+                errno = e;
+                return -1;
+            }
+        }
+    }
+    sv[0] = fds[0];
+    sv[1] = fds[1];
+    return 0;
+}
+
+/* sendto() / recvfrom(): every socket here is a stream socket, on which the
+ * address argument carries nothing — the peer is the connection's. sendto
+ * is send (a destination is ignored, as for any connected stream socket),
+ * and recvfrom is recv plus the peer's name. */
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *addr, socklen_t addrlen) {
+    (void)addr; (void)addrlen;
+    return send(fd, buf, len, flags);
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *addr, socklen_t *addrlen) {
+    ssize_t n = recv(fd, buf, len, flags);
+    if (n >= 0 && addr != nullptr && addrlen != nullptr) {
+        struct __wasmify_sock_name name;
+        if (__wasmify_host_sock_getpeername(fd, &name) != 0)
+            *addrlen = 0;
+        else
+            __wasmify_fill_sockaddr(&name, addr, addrlen);
+    }
+    return n;
 }
 
 } /* extern "C" */
