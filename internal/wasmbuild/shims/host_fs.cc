@@ -205,6 +205,12 @@ __attribute__((weak)) int futimes(int fd, const struct timeval tv[2]) {
  * values are the WASI oflags and fdflags, shifted into one word): the host
  * needs the read/write rights, the lookup flag, and both flag sets. */
 int __wrap_open(const char *path, int oflag, ...) {
+    /* An open without any access mode is a read-only open. Where O_RDONLY
+     * is 0 — every common system — that is simply what such flags say, and
+     * programs written there pass a literal 0 for "read only". wasi-libc's
+     * O_RDONLY is a bit of its own, and its open rejects flags that have
+     * none of the access bits (EINVAL). */
+    if ((oflag & O_ACCMODE) == 0) oflag |= O_RDONLY;
     if ((oflag & O_CREAT) == 0) return __real_open(path, oflag);
     if (path == nullptr) {
         errno = EFAULT;
