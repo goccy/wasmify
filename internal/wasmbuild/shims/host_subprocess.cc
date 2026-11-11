@@ -26,6 +26,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <sys/types.h>
 
 extern "C" {
@@ -141,12 +144,53 @@ int posix_spawn(pid_t *pid, const char *path,
     return __wasmify_host_spawn(pid, path, argv, envp, fa);
 }
 
+/* posix_spawnp: a name without a slash is searched for in the directories
+ * of the CALLING process's PATH — the guest's, which the host cannot see —
+ * the way execvp does it: each directory is tried in turn, a missing file
+ * moves on to the next, and a file that exists but cannot be executed is
+ * remembered so that the search reports EACCES rather than ENOENT. */
 int posix_spawnp(pid_t *pid, const char *file,
                  const posix_spawn_file_actions_t *fa,
                  const posix_spawnattr_t *attr,
                  char *const argv[], char *const envp[]) {
     (void)attr;
-    return __wasmify_host_spawn(pid, file, argv, envp, fa);
+    if (file == nullptr || *file == '\0') return ENOENT;
+    if (strchr(file, '/') != nullptr)
+        return __wasmify_host_spawn(pid, file, argv, envp, fa);
+
+    const char *path = getenv("PATH");
+    if (path == nullptr) path = "/usr/local/bin:/bin:/usr/bin";
+    const size_t file_len = strlen(file);
+    bool seen_eacces = false;
+    for (const char *dir = path;;) {
+        const char *end = dir;
+        while (*end != '\0' && *end != ':') end++;
+        const size_t dir_len = static_cast<size_t>(end - dir);
+        /* An empty entry names the current directory. */
+        std::string candidate;
+        candidate.reserve(dir_len + 1 + file_len);
+        if (dir_len > 0) {
+            candidate.append(dir, dir_len);
+            candidate.push_back('/');
+        }
+        candidate.append(file, file_len);
+        const int rc = __wasmify_host_spawn(pid, candidate.c_str(), argv, envp, fa);
+        switch (rc) {
+        case 0:
+            return 0;
+        case EACCES:
+            seen_eacces = true;
+            break;
+        case ENOENT:
+        case ENOTDIR:
+            break;
+        default:
+            return rc;
+        }
+        if (*end == '\0') break;
+        dir = end + 1;
+    }
+    return seen_eacces ? EACCES : ENOENT;
 }
 
 /* pipe()/pipe2(): host-backed pipe for subprocess capture_output. The host
