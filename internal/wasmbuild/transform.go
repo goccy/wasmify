@@ -954,8 +954,28 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	return flags
 }
 
-// wasmLinkFlags returns the flags to add for wasm linking.
+// wasmLinkFlags returns the flags to add for wasm linking: the options, then
+// the WASI emulation libraries. It is for a link whose inputs come first on
+// the command line.
 func wasmLinkFlags(cfg WasmConfig) []string {
+	return append(wasmLinkOptions(cfg), wasiEmulationLibs()...)
+}
+
+// wasiEmulationLibs returns the wasi-libc emulation libraries every wasm link
+// gets. Like any library they belong AFTER the objects and archives of the
+// link: an object that defines a function such a library also has (a project
+// replacing the emulated signal() and raise() with its own) must be seen
+// first, or the library's copy is pulled in by the first reference and wins.
+func wasiEmulationLibs() []string {
+	return []string{
+		"-lwasi-emulated-signal",
+		"-lwasi-emulated-process-clocks",
+		"-lwasi-emulated-mman",
+	}
+}
+
+// wasmLinkOptions returns the options of a wasm link, without any library.
+func wasmLinkOptions(cfg WasmConfig) []string {
 	flags := []string{
 		"--target=" + effectiveTarget(cfg),
 		"--sysroot=" + Sysroot(cfg.WasiSDKPath),
@@ -1019,12 +1039,6 @@ func wasmLinkFlags(cfg WasmConfig) []string {
 			"-Wl,--export=wasi_thread_start",
 		)
 	}
-	// WASI emulation libraries
-	flags = append(flags,
-		"-lwasi-emulated-signal",
-		"-lwasi-emulated-process-clocks",
-		"-lwasi-emulated-mman",
-	)
 	return flags
 }
 

@@ -91,7 +91,7 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	}
 
 	compiler := filepath.Join(cfg.WasiSDKPath, "bin", "clang++")
-	args := wasmLinkFlags(cfg)
+	args := wasmLinkOptions(cfg)
 	args = append(args,
 		"-Wl,--allow-multiple-definition",
 		"-o", outputFile,
@@ -107,6 +107,9 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	// the archive libraries are what pull the needed code in.
 	args = append(args, extraObjects...)
 	args = append(args, archives...)
+	// Libraries last (see wasiEmulationLibs): the bridge objects and the
+	// project's archives take precedence over what wasi-libc emulates.
+	args = append(args, wasiEmulationLibs()...)
 
 	// Resolve the LLVM SjLj runtime last. Code compiled with
 	// `-mllvm -wasm-enable-sjlj` lowers every setjmp/longjmp to calls into
