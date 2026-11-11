@@ -1,10 +1,43 @@
 package wasmbuild
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// The linker only reports a --wrap flag without a __wrap_ definition, or a
+// __wrap_ definition without its flag (the wrapper is then dead code and
+// libc's version stays in use), when a real project is linked. Both sides
+// are written by hand in different files, so they are held together here.
+func TestHostFSWrapFlagsMatchShim(t *testing.T) {
+	const flagPrefix = "-Wl,--wrap="
+	wrapped := map[string]bool{}
+	for _, flag := range (WasmConfig{HostFS: true}).EffectiveExtraLDFlags() {
+		name, ok := strings.CutPrefix(flag, flagPrefix)
+		if !ok {
+			continue
+		}
+		wrapped[name] = true
+		for _, symbol := range []string{"__wrap_" + name + "(", "__real_" + name + "("} {
+			if !bytes.Contains(hostFSShim, []byte(symbol)) {
+				t.Errorf("%s is passed to the linker but the shim has no %s", flag, strings.TrimSuffix(symbol, "("))
+			}
+		}
+	}
+	for _, name := range []string{"chmod", "fchmod", "stat", "lstat", "fstat", "open", "mkdir", "chdir"} {
+		if !wrapped[name] {
+			t.Errorf("%s is not wrapped under HostFS", name)
+		}
+	}
+	for _, flag := range (WasmConfig{}).EffectiveExtraLDFlags() {
+		if strings.HasPrefix(flag, flagPrefix) {
+			t.Errorf("%s is passed to the linker without HostFS", flag)
+		}
+	}
+}
 
 func TestDeployHostShims(t *testing.T) {
 	tests := []struct {

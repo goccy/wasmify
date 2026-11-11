@@ -23,10 +23,11 @@ var hostSocketsShim []byte
 var hostSubprocessShim []byte
 
 // hostFSShim is the generic filesystem-fidelity shim. It provides __wrap_
-// definitions for chmod/stat/lstat/chdir backed by the path_chmod/
-// path_filestat_mode host imports (plus lexical chdir normalization) and is
-// gated internally on WASMIFY_HOST_FS; the matching -Wl,--wrap= flags come
-// from EffectiveExtraLDFlags.
+// definitions for chmod/fchmod/stat/lstat/fstat/open/mkdir/chdir and
+// definitions of umask/flock/futimes, backed by the host's file mode, owner,
+// umask and lock imports (plus lexical chdir normalization), and is gated
+// internally on WASMIFY_HOST_FS; the matching -Wl,--wrap= flags come from
+// EffectiveExtraLDFlags.
 //
 //go:embed shims/host_fs.cc
 var hostFSShim []byte

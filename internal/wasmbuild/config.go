@@ -41,7 +41,7 @@ type WasmConfig struct {
 	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
 	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile + add HostIncludeDir (netdb.h) to -I (host-provided outbound sockets)
 	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
-	HostFS              bool     // Opt-in: define WASMIFY_HOST_FS for every wasm-build compile + wrap chmod/stat/lstat/chdir at link (host-backed file modes, normalized cwd)
+	HostFS              bool     // Opt-in: define WASMIFY_HOST_FS for every wasm-build compile + wrap chmod/fchmod/stat/lstat/fstat/open/mkdir/chdir at link (host-backed file modes, owners, umask and flock; normalized cwd)
 	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
 	Wasm64              bool     // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; incompatible with HostThreads; mirrors WASMIFY_WASM64
 	OptLevel            string   // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
@@ -142,8 +142,12 @@ func (c WasmConfig) EffectiveExtraLDFlags() []string {
 		// cwd bookkeeping globals).
 		flags = append(flags,
 			"-Wl,--wrap=chmod",
+			"-Wl,--wrap=fchmod",
 			"-Wl,--wrap=stat",
 			"-Wl,--wrap=lstat",
+			"-Wl,--wrap=fstat",
+			"-Wl,--wrap=open",
+			"-Wl,--wrap=mkdir",
 			"-Wl,--wrap=chdir",
 		)
 	}
