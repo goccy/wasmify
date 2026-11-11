@@ -14,12 +14,13 @@
  * standard wasi sock_send/sock_recv/fd_close path the host already implements.
  *
  * What is handled: IPv4 TCP sockets — clients (connect) and servers (bind,
- * listen, accept) — their names (getsockname, getpeername), a fixed set of
- * socket options, and socketpair() for a pair of connected AF_UNIX stream
- * sockets. Everything else fails with the errno the missing feature has: a
- * datagram socket cannot be created (EPROTONOSUPPORT), another address family
- * is EAFNOSUPPORT, an option outside the set is ENOPROTOOPT. Nothing here
- * reports success for something it did not do.
+ * listen, accept) — and IPv4 UDP sockets (bind, connect, sendto, recvfrom,
+ * and send/recv once connected); their names (getsockname, getpeername), a
+ * fixed set of socket options, and socketpair() for a pair of connected
+ * AF_UNIX stream sockets. Everything else fails with the errno the missing
+ * feature has: a socket of another type cannot be created (EPROTONOSUPPORT),
+ * another address family is EAFNOSUPPORT, an option outside the set is
+ * ENOPROTOOPT. Nothing here reports success for something it did not do.
  *
  * The matching declarations come from wasmify's <netdb.h> stub,
  * deployed into the build-local host-include dir that every wasm-build compile
@@ -44,6 +45,11 @@
 #include <wasi/api.h>
 
 extern "C" {
+
+/* The socket types, by the host's own numbering (libc's SOCK_* numbers
+ * differ from libc to libc). */
+#define WASMIFY_SOCK_TYPE_STREAM 1
+#define WASMIFY_SOCK_TYPE_DGRAM 2
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_socket")))
 extern int __wasmify_host_sock_socket(int domain, int type);
@@ -72,6 +78,18 @@ extern int __wasmify_host_sock_getsockname(int fd, struct __wasmify_sock_name *o
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getpeername")))
 extern int __wasmify_host_sock_getpeername(int fd, struct __wasmify_sock_name *out);
 
+/* sendto: with has_addr, a datagram to ip_be:port; without, a send to the
+ * socket's peer. *sent receives the count. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_sendto")))
+extern int __wasmify_host_sock_sendto(int fd, const void *buf, int len, int flags,
+                                      int has_addr, unsigned int ip_be, int port, int *sent);
+
+/* recvfrom: one datagram (or, on a stream socket, what there is) into buf;
+ * *from receives the sender's name, with family 0 when there is none. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_recvfrom")))
+extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
+                                        struct __wasmify_sock_name *from, int *received);
+
 /* The socket options the host knows, by the host's own numbering: libc's
  * numbers for them differ from libc to libc. */
 #define WASMIFY_SOCKOPT_REUSEADDR 1
@@ -82,7 +100,7 @@ extern int __wasmify_host_sock_getpeername(int fd, struct __wasmify_sock_name *o
 #define WASMIFY_SOCKOPT_SNDBUF 6
 #define WASMIFY_SOCKOPT_LINGER 7 /* seconds, or -1 for off */
 #define WASMIFY_SOCKOPT_ERROR 8  /* read only */
-#define WASMIFY_SOCKOPT_TYPE 9   /* read only: 1 for a stream socket */
+#define WASMIFY_SOCKOPT_TYPE 9   /* read only: a WASMIFY_SOCK_TYPE_* */
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_setopt")))
 extern int __wasmify_host_sock_setopt(int fd, int option, int value);
@@ -222,16 +240,21 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
     return nullptr;
 }
 
-/* socket(): allocate a host-managed socket fd. Only a TCP socket over IPv4
- * can be made. Host returns the fd, or a negative errno on failure. */
+/* socket(): allocate a host-managed socket fd: a TCP or a UDP socket over
+ * IPv4. Host returns the fd, or a negative errno on failure. */
 int socket(int domain, int type, int protocol) {
     if (domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
     const int flags = type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if ((type & ~flags) != SOCK_STREAM || (protocol != 0 && protocol != IPPROTO_TCP)) {
+    int host_type;
+    if ((type & ~flags) == SOCK_STREAM && (protocol == 0 || protocol == IPPROTO_TCP)) {
+        host_type = WASMIFY_SOCK_TYPE_STREAM;
+    } else if ((type & ~flags) == SOCK_DGRAM && (protocol == 0 || protocol == IPPROTO_UDP)) {
+        host_type = WASMIFY_SOCK_TYPE_DGRAM;
+    } else {
         errno = EPROTONOSUPPORT;
         return -1;
     }
-    int r = __wasmify_host_sock_socket(domain, SOCK_STREAM);
+    int r = __wasmify_host_sock_socket(domain, host_type);
     if (r < 0) { errno = -r; return -1; }
     if ((flags & SOCK_NONBLOCK) && fcntl(r, F_SETFL, O_NONBLOCK) != 0) {
         const int e = errno;
@@ -409,7 +432,8 @@ int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) 
         *optlen = sizeof(l);
         return 0;
     }
-    if (option == WASMIFY_SOCKOPT_TYPE) value = SOCK_STREAM; /* the host's 1 */
+    if (option == WASMIFY_SOCKOPT_TYPE)
+        value = (value == WASMIFY_SOCK_TYPE_DGRAM) ? SOCK_DGRAM : SOCK_STREAM;
     if (*optlen < (socklen_t)sizeof(int)) { errno = EINVAL; return -1; }
     memcpy(optval, &value, sizeof(value));
     *optlen = sizeof(value);
@@ -444,27 +468,48 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
     return 0;
 }
 
-/* sendto() / recvfrom(): every socket here is a stream socket, on which the
- * address argument carries nothing — the peer is the connection's. sendto
- * is send (a destination is ignored, as for any connected stream socket),
+/* sendto() / recvfrom(): the host knows what kind of socket fd is. On a
+ * datagram socket the address is the datagram's destination, and recvfrom
+ * reports who sent the datagram it hands over. On a stream socket the
+ * address carries nothing — the peer is the connection's: sendto is send,
  * and recvfrom is recv plus the peer's name. */
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen) {
-    (void)addr; (void)addrlen;
-    return send(fd, buf, len, flags);
+    int has_addr = 0;
+    unsigned int ip_be = 0;
+    int port = 0;
+    if (addr != nullptr) {
+        if (addrlen < (socklen_t)sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+            errno = EAFNOSUPPORT;
+            return -1;
+        }
+        const struct sockaddr_in *in = reinterpret_cast<const struct sockaddr_in *>(addr);
+        has_addr = 1;
+        ip_be = static_cast<unsigned int>(in->sin_addr.s_addr);
+        port = static_cast<int>(ntohs(in->sin_port));
+    }
+    if (len > 0x7fffffff) { errno = EMSGSIZE; return -1; }
+    int sent = 0;
+    int r = __wasmify_host_sock_sendto(fd, buf, static_cast<int>(len), flags, has_addr,
+                                       ip_be, port, &sent);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    return sent;
 }
 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen) {
-    ssize_t n = recv(fd, buf, len, flags);
-    if (n >= 0 && addr != nullptr && addrlen != nullptr) {
-        struct __wasmify_sock_name name;
-        if (__wasmify_host_sock_getpeername(fd, &name) != 0)
+    if (len > 0x7fffffff) len = 0x7fffffff;
+    struct __wasmify_sock_name name;
+    int received = 0;
+    int r = __wasmify_host_sock_recvfrom(fd, buf, static_cast<int>(len), flags, &name, &received);
+    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    if (addr != nullptr && addrlen != nullptr) {
+        if (name.family == 0)
             *addrlen = 0;
         else
             __wasmify_fill_sockaddr(&name, addr, addrlen);
     }
-    return n;
+    return received;
 }
 
 } /* extern "C" */
