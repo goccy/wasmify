@@ -149,6 +149,7 @@ func (c WasmConfig) EffectiveExtraLDFlags() []string {
 			"-Wl,--wrap=open",
 			"-Wl,--wrap=mkdir",
 			"-Wl,--wrap=chdir",
+			"-Wl,--wrap=__wasilibc_find_relpath_alloc",
 		)
 	}
 	if c.Wasm64 {

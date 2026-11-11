@@ -10,7 +10,8 @@
  * can change a mode, filestat carries neither permission bits nor an owner,
  * path_open and path_create_directory take no mode argument, and there is
  * no flock. wasi-libc also stores chdir's argument verbatim (".." included)
- * as its cwd. Each of these breaks real-world tooling:
+ * as its cwd, and resolves the empty path to the current directory. Each of
+ * these breaks real-world tooling:
  *
  *   - chmod() and fchmod() fail outright (wasi-libc's are ENOSYS stubs);
  *   - stat()/lstat()/fstat() report st_mode with the file type only and no
@@ -25,7 +26,11 @@
  *   - futimes() is missing although futimens() exists;
  *   - after `chdir("b"); chdir("..")` the cwd string keeps a live reference
  *     through b, and deleting b then breaks every cwd-relative operation
- *     (a recursive-delete's chdir-down/up dance does exactly this).
+ *     (a recursive-delete's chdir-down/up dance does exactly this);
+ *   - open(""), stat(""), opendir("") and the rest succeed on the current
+ *     directory, where POSIX path resolution fails with ENOENT, so code
+ *     that relies on a missing name being an error carries on with a
+ *     directory handle.
  *
  * The wrappers below fix each: chmod/fchmod go to the host via the
  * path_chmod/fd_chmod imports; stat/lstat/fstat merge the real permission
@@ -35,7 +40,10 @@
  * kept by the host, set through proc_umask — is taken out of it; flock is
  * fd_flock; and chdir collapses "." and ".." lexically before wasi-libc
  * records it (wasi-libc's own resolution is lexical, so nothing is lost).
- * Paths cross the imports preopen-relative, like path_open's. */
+ * Paths cross the imports preopen-relative, like path_open's. The empty
+ * path is refused where every libc path function resolves its argument
+ * (__wasilibc_find_relpath_alloc), and in the wrappers here that resolve a
+ * path themselves. */
 #ifdef WASMIFY_HOST_FS
 
 #include <fcntl.h>
@@ -97,6 +105,9 @@ extern int __real_fstat(int fd, struct stat *st);
 extern int __real_open(const char *path, int oflag, ...);
 extern int __real_mkdir(const char *path, mode_t mode);
 extern int __real_chdir(const char *path);
+extern int __real___wasilibc_find_relpath_alloc(const char *path, const char **abs_prefix,
+                                                char **relative, size_t *relative_len,
+                                                int can_realloc);
 
 /* Every import above returns 0 or a negative errno. */
 static int __wasmify_fs_result(int rc) {
@@ -107,8 +118,35 @@ static int __wasmify_fs_result(int rc) {
     return 0;
 }
 
+/* Reports whether a path argument names nothing at all, with errno set:
+ * a null pointer (EFAULT), or the empty string (ENOENT) — which POSIX path
+ * resolution never takes for the current directory. */
+static int __wasmify_fs_no_path(const char *path) {
+    if (path == nullptr) {
+        errno = EFAULT;
+        return 1;
+    }
+    if (path[0] == '\0') {
+        errno = ENOENT;
+        return 1;
+    }
+    return 0;
+}
+
+/* The one place wasi-libc turns a path into a preopened directory and a
+ * path relative to it: open, stat, opendir, unlink, rename, ... all come
+ * through here. Its own code makes the empty path the current directory. */
+int __wrap___wasilibc_find_relpath_alloc(const char *path, const char **abs_prefix,
+                                         char **relative, size_t *relative_len,
+                                         int can_realloc) {
+    if (__wasmify_fs_no_path(path)) return -1;
+    return __real___wasilibc_find_relpath_alloc(path, abs_prefix, relative, relative_len,
+                                                can_realloc);
+}
+
 /* Absolutize against the guest cwd and strip the leading '/' so the path
- * crosses the imports preopen-relative. Returns path or buf. */
+ * crosses the imports preopen-relative. Returns path or buf. The callers
+ * have refused the empty path, which would come out as the cwd itself. */
 static const char *__wasmify_fs_import_path(const char *path, char *buf,
                                             size_t bufsz) {
     const char *p = path;
@@ -124,10 +162,7 @@ static const char *__wasmify_fs_import_path(const char *path, char *buf,
 }
 
 int __wrap_chmod(const char *path, mode_t mode) {
-    if (path == nullptr) {
-        errno = EFAULT;
-        return -1;
-    }
+    if (__wasmify_fs_no_path(path)) return -1;
     char buf[4096];
     const char *p = __wasmify_fs_import_path(path, buf, sizeof(buf));
     return __wasmify_fs_result(
@@ -212,10 +247,7 @@ int __wrap_open(const char *path, int oflag, ...) {
      * none of the access bits (EINVAL). */
     if ((oflag & O_ACCMODE) == 0) oflag |= O_RDONLY;
     if ((oflag & O_CREAT) == 0) return __real_open(path, oflag);
-    if (path == nullptr) {
-        errno = EFAULT;
-        return -1;
-    }
+    if (__wasmify_fs_no_path(path)) return -1;
     va_list ap;
     va_start(ap, oflag);
     mode_t mode = va_arg(ap, mode_t);
@@ -235,10 +267,7 @@ int __wrap_open(const char *path, int oflag, ...) {
 }
 
 int __wrap_mkdir(const char *path, mode_t mode) {
-    if (path == nullptr) {
-        errno = EFAULT;
-        return -1;
-    }
+    if (__wasmify_fs_no_path(path)) return -1;
     char buf[4096];
     const char *p = __wasmify_fs_import_path(path, buf, sizeof(buf));
     return __wasmify_fs_result(__wasmify_host_path_create_directory_mode(
@@ -254,10 +283,7 @@ int __wrap_lstat(const char *path, struct stat *st) {
 }
 
 int __wrap_chdir(const char *path) {
-    if (path == nullptr) {
-        errno = EFAULT;
-        return -1;
-    }
+    if (__wasmify_fs_no_path(path)) return -1;
     char joined[4096];
     if (path[0] != '/') {
         char cwd[3584];
