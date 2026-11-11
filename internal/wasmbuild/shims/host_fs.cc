@@ -15,7 +15,9 @@
  *
  *   - chmod() and fchmod() fail outright (wasi-libc's are ENOSYS stubs);
  *   - stat()/lstat()/fstat() report st_mode with the file type only and no
- *     owner, so code that round-trips modes (chmod((stat(f)).st_mode | 0111)
+ *     owner — and the type is wrong for what WASI has no type for: a FIFO or
+ *     a pipe comes out as a socket or as nothing — so code that round-trips
+ *     modes (chmod((stat(f)).st_mode | 0111)
  *     to mark a file executable) strips every permission, and code that
  *     compares fstat() with stat() to make sure a handle and a name are the
  *     same file is told they differ as soon as only one of them is fixed;
@@ -65,8 +67,9 @@ extern int __wasmify_host_path_chmod(const char *path, int len, unsigned int mod
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_chmod")))
 extern int __wasmify_host_fd_chmod(int fd, unsigned int mode);
 
-/* What the host adds to a WASI filestat: the low twelve mode bits and the
- * owner. */
+/* What the host adds to a WASI filestat: the POSIX mode — the file type in
+ * the bits every Unix uses for it (0170000) and the low twelve mode bits —
+ * and the owner. */
 struct __wasmify_filestat_ext {
     unsigned int mode;
     unsigned int uid;
@@ -173,10 +176,27 @@ int __wrap_fchmod(int fd, mode_t mode) {
     return __wasmify_fs_result(__wasmify_host_fd_chmod(fd, (unsigned int)mode));
 }
 
+/* The libc's constant for the file type in a host mode, or 0 when the host
+ * named none (the type WASI reported then stands). */
+static mode_t __wasmify_stat_type(unsigned int host_mode) {
+    switch (host_mode & 0170000) {
+    case 0010000: return S_IFIFO;
+    case 0020000: return S_IFCHR;
+    case 0040000: return S_IFDIR;
+    case 0060000: return S_IFBLK;
+    case 0100000: return S_IFREG;
+    case 0120000: return S_IFLNK;
+    case 0140000: return S_IFSOCK;
+    }
+    return 0;
+}
+
 /* Complete a libc stat result with what the host knows beyond WASI. */
 static void __wasmify_stat_merge(struct stat *st,
                                  const struct __wasmify_filestat_ext *ext) {
-    st->st_mode = (st->st_mode & S_IFMT) | (mode_t)(ext->mode & 07777);
+    mode_t type = __wasmify_stat_type(ext->mode);
+    if (type == 0) type = st->st_mode & S_IFMT;
+    st->st_mode = type | (mode_t)(ext->mode & 07777);
     st->st_uid = (uid_t)ext->uid;
     st->st_gid = (gid_t)ext->gid;
 }
@@ -192,8 +212,8 @@ static int __wasmify_stat_common(const char *path, struct stat *st, int follow) 
     return 0;
 }
 
-/* An fd the host has nothing to add for (a standard stream, a socket) keeps
- * the libc result as it is. */
+/* The host describes every descriptor, standard streams, pipes and sockets
+ * included; should it have nothing to say, the libc result stands. */
 int __wrap_fstat(int fd, struct stat *st) {
     int rc = __real_fstat(fd, st);
     if (rc != 0) return rc;
