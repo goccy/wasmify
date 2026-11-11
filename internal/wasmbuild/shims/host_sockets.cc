@@ -102,13 +102,26 @@ extern int __wasmify_host_sock_pair(int fds[2]);
 #define WASMIFY_EAI_MEMORY EAI_MEMORY
 #define WASMIFY_EAI_NONAME EAI_NONAME
 
-/* getaddrinfo(): resolve node via the host (numeric IPs pass straight
- * through), returning a single IPv4 result. The port comes from a numeric
+/* Resolves a host name to one IPv4 address, as it sits in s_addr. An
+ * address written in numbers is converted here: that is no name lookup,
+ * and the host's lookup policy is not asked about it. Returns 0 or the
+ * host's negative errno. */
+static int __wasmify_resolve_ipv4(const char *node, unsigned int *ip_be) {
+    struct in_addr literal;
+    if (node != nullptr && inet_pton(AF_INET, node, &literal) == 1) {
+        *ip_be = literal.s_addr;
+        return 0;
+    }
+    return __wasmify_host_getaddrinfo(node, node ? (int)strlen(node) : 0, ip_be);
+}
+
+/* getaddrinfo(): resolve node via the host (numeric IPs are converted
+ * here), returning a single IPv4 result. The port comes from a numeric
  * service string; named services are not resolved (port 0). */
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res) {
     unsigned int ip_be = 0;
-    int rc = __wasmify_host_getaddrinfo(node, node ? (int)strlen(node) : 0, &ip_be);
+    int rc = __wasmify_resolve_ipv4(node, &ip_be);
     if (rc != 0) {
         return WASMIFY_EAI_NONAME;
     }
@@ -176,6 +189,37 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
         if (n < 0 || (socklen_t)n >= servlen) return EAI_OVERFLOW;
     }
     return 0;
+}
+
+/* gethostbyname(): the host's lookup, one IPv4 address. The result lives
+ * in static storage, as the interface has it. */
+struct hostent *gethostbyname(const char *name) {
+    static struct hostent ent;
+    static struct in_addr addr;
+    static char *addr_list[2];
+    static char *no_aliases[1];
+    static char canonical[256];
+    if (name == nullptr || strlen(name) >= sizeof(canonical)) return nullptr;
+    unsigned int ip_be = 0;
+    if (__wasmify_resolve_ipv4(name, &ip_be) != 0) return nullptr;
+    addr.s_addr = ip_be;
+    strcpy(canonical, name);
+    addr_list[0] = reinterpret_cast<char *>(&addr);
+    addr_list[1] = nullptr;
+    no_aliases[0] = nullptr;
+    ent.h_name = canonical;
+    ent.h_aliases = no_aliases;
+    ent.h_addrtype = AF_INET;
+    ent.h_length = sizeof(addr);
+    ent.h_addr_list = addr_list;
+    return &ent;
+}
+
+/* gethostbyaddr(): the host offers no reverse lookup, so no address has a
+ * name. */
+struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
+    (void)addr; (void)len; (void)type;
+    return nullptr;
 }
 
 /* socket(): allocate a host-managed socket fd. Only a TCP socket over IPv4
