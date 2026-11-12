@@ -69,11 +69,16 @@ extern int __wasmify_host_fd_chmod(int fd, unsigned int mode);
 
 /* What the host adds to a WASI filestat: the POSIX mode — the file type in
  * the bits every Unix uses for it (0170000) and the low twelve mode bits —
- * and the owner. */
+ * the owner, the preferred block size for I/O (0 when the host names none),
+ * the device a special file stands for, and the number of 512-byte blocks
+ * allocated to the file. */
 struct __wasmify_filestat_ext {
     unsigned int mode;
     unsigned int uid;
     unsigned int gid;
+    unsigned int blksize;
+    unsigned long long rdev;
+    unsigned long long blocks;
 };
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("path_filestat_ext")))
@@ -204,6 +209,9 @@ static void __wasmify_stat_merge(struct stat *st,
     st->st_mode = type | (mode_t)(ext->mode & 07777);
     st->st_uid = (uid_t)ext->uid;
     st->st_gid = (gid_t)ext->gid;
+    st->st_rdev = (dev_t)ext->rdev;
+    st->st_blocks = (blkcnt_t)ext->blocks;
+    if (ext->blksize != 0) st->st_blksize = (blksize_t)ext->blksize;
 }
 
 static int __wasmify_stat_common(const char *path, struct stat *st, int follow) {
