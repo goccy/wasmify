@@ -65,6 +65,22 @@ extern int __wasmify_host_getaddrinfo(const char *node, int len, unsigned int *o
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_bind")))
 extern int __wasmify_host_sock_bind(int fd, unsigned int ip_be, int port);
 
+/* The name of the host with an IPv4 address (as it sits in s_addr), not
+ * NUL-terminated: *needed receives its length, also when buf is too small
+ * (-ERANGE). -ENOENT when the address has no name. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_reverse")))
+extern int __wasmify_host_sock_reverse(unsigned int ip_be, char *buf, int buf_len,
+                                       unsigned int *needed);
+
+/* An entry of the host's services database, by name (by_port 0) or by
+ * port, for the protocol proto when it is not empty. The record is the port
+ * (u32), then the name and the protocol, each a u32 length and the bytes,
+ * then the aliases. -ENOENT when there is no such service. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_service")))
+extern int __wasmify_host_sock_service(const char *name, int name_len, int port, int by_port,
+                                       const char *proto, int proto_len, void *buf,
+                                       int buf_len, unsigned int *needed);
+
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_listen")))
 extern int __wasmify_host_sock_listen(int fd, int backlog);
 
@@ -212,25 +228,67 @@ const char *gai_strerror(int ecode) {
     return "getaddrinfo failed";
 }
 
-/* getnameinfo(): numeric-only — reverse DNS is not supported by this
- * bridge, so the address and port are always rendered numerically (the
- * NI_NUMERICHOST/NI_NUMERICSERV result), which is what callers like
- * IO::Socket libraries use it for here (stringifying peers). */
+/* The name of the host with an IPv4 address, into buf as a C string.
+ * Returns 0, or the host's negative errno (-ERANGE for a name that does not
+ * fit). */
+static int __wasmify_reverse_ipv4(unsigned int ip_be, char *buf, size_t size) {
+    unsigned int needed = 0;
+    if (size == 0) return -ERANGE;
+    int rc = __wasmify_host_sock_reverse(ip_be, buf, (int)size - 1, &needed);
+    if (rc != 0) return rc;
+    buf[needed] = '\0';
+    return 0;
+}
+
+/* getnameinfo(): the host's name and the service's, from the host's
+ * resolver and services database. An address or a port that has no name
+ * is given in numbers — unless the caller requires a name (NI_NAMEREQD) —
+ * and so are both when the caller asks for numbers (NI_NUMERICHOST,
+ * NI_NUMERICSERV). */
 int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
                 socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
-    (void)salen; (void)flags;
+    (void)salen;
     if (sa == nullptr || sa->sa_family != AF_INET) return EAI_FAMILY;
     const struct sockaddr_in *in = reinterpret_cast<const struct sockaddr_in *>(sa);
     if (host != nullptr && hostlen > 0) {
-        unsigned int ip = ntohl(in->sin_addr.s_addr);
-        int n = snprintf(host, hostlen, "%u.%u.%u.%u",
-                         (ip >> 24) & 0xff, (ip >> 16) & 0xff,
-                         (ip >> 8) & 0xff, ip & 0xff);
-        if (n < 0 || (socklen_t)n >= hostlen) return EAI_OVERFLOW;
+        int named = -ENOENT;
+        if (!(flags & NI_NUMERICHOST)) {
+            named = __wasmify_reverse_ipv4(in->sin_addr.s_addr, host, hostlen);
+            if (named == -ERANGE) return EAI_OVERFLOW;
+        }
+        if (named != 0) {
+            if (flags & NI_NAMEREQD) return EAI_NONAME;
+            unsigned int ip = ntohl(in->sin_addr.s_addr);
+            int n = snprintf(host, hostlen, "%u.%u.%u.%u",
+                             (ip >> 24) & 0xff, (ip >> 16) & 0xff,
+                             (ip >> 8) & 0xff, ip & 0xff);
+            if (n < 0 || (socklen_t)n >= hostlen) return EAI_OVERFLOW;
+        }
     }
     if (serv != nullptr && servlen > 0) {
-        int n = snprintf(serv, servlen, "%u", (unsigned int)ntohs(in->sin_port));
-        if (n < 0 || (socklen_t)n >= servlen) return EAI_OVERFLOW;
+        const unsigned int port = ntohs(in->sin_port);
+        bool named = false;
+        if (!(flags & NI_NUMERICSERV)) {
+            /* the record starts with the port and the name */
+            char rec[512];
+            unsigned int needed = 0;
+            const char *proto = (flags & NI_DGRAM) ? "udp" : "tcp";
+            if (__wasmify_host_sock_service("", 0, (int)port, 1, proto, 3, rec,
+                                            (int)sizeof(rec), &needed) == 0 && needed >= 8) {
+                unsigned int len = 0;
+                memcpy(&len, rec + 4, 4);
+                if (len <= needed - 8) {
+                    if (len >= servlen) return EAI_OVERFLOW;
+                    memcpy(serv, rec + 8, len);
+                    serv[len] = '\0';
+                    named = true;
+                }
+            }
+        }
+        if (!named) {
+            int n = snprintf(serv, servlen, "%u", port);
+            if (n < 0 || (socklen_t)n >= servlen) return EAI_OVERFLOW;
+        }
     }
     return 0;
 }
@@ -259,11 +317,26 @@ struct hostent *gethostbyname(const char *name) {
     return &ent;
 }
 
-/* gethostbyaddr(): the host offers no reverse lookup, so no address has a
- * name. */
+/* gethostbyaddr(): the host's reverse lookup of an IPv4 address. The
+ * result lives in static storage, as the interface has it. */
 struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
-    (void)addr; (void)len; (void)type;
-    return nullptr;
+    static struct hostent ent;
+    static struct in_addr kept;
+    static char *addr_list[2];
+    static char *no_aliases[1];
+    static char name[256];
+    if (addr == nullptr || type != AF_INET || len < (socklen_t)sizeof(kept)) return nullptr;
+    memcpy(&kept, addr, sizeof(kept));
+    if (__wasmify_reverse_ipv4(kept.s_addr, name, sizeof(name)) != 0) return nullptr;
+    addr_list[0] = reinterpret_cast<char *>(&kept);
+    addr_list[1] = nullptr;
+    no_aliases[0] = nullptr;
+    ent.h_name = name;
+    ent.h_aliases = no_aliases;
+    ent.h_addrtype = AF_INET;
+    ent.h_length = sizeof(kept);
+    ent.h_addr_list = addr_list;
+    return &ent;
 }
 
 /* socket(): allocate a host-managed socket fd: a TCP or a UDP socket over
