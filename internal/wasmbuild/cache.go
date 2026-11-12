@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/goccy/wasmify/internal/buildjson"
 )
 
 // BuildCache tracks input/output hashes for incremental builds.
@@ -111,8 +113,19 @@ func cacheKey(step WasmBuildStep) string {
 //     is older. This lets subsequent runs reuse orphan obj files that
 //     a previous build already produced — otherwise every interrupted
 //     build would recompile from zero.
+//
+// An input that cannot be found says nothing in either tier, because the
+// inputs of a compile step include headers the compiler finds by its search
+// path (-include config.h). The members of an archive are different: the
+// archiver takes each of them from the path the step names, so an archive
+// that is there while a member is not was made from other files than the
+// step's (an object the build has since renamed, a member that no longer
+// compiles), and is not up to date. See missingArchiveMember.
 func (bc *BuildCache) IsCached(step WasmBuildStep) bool {
 	if step.OutputFile == "" {
+		return false
+	}
+	if missingArchiveMember(step) != "" {
 		return false
 	}
 
@@ -155,6 +168,26 @@ func (bc *BuildCache) IsCached(step WasmBuildStep) bool {
 	return inputsOlder()
 }
 
+// missingArchiveMember returns the first member of an archive step that
+// does not exist, as the step names it; "" when every member is there, and
+// for a step of another type. A relative name is one the archiver resolves
+// in the step's working directory.
+func missingArchiveMember(step WasmBuildStep) string {
+	if step.Type != buildjson.StepArchive {
+		return ""
+	}
+	for _, p := range step.InputFiles {
+		path := p
+		if !filepath.IsAbs(path) && step.WorkDir != "" {
+			path = filepath.Join(step.WorkDir, path)
+		}
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return p
+		}
+	}
+	return ""
+}
+
 // Update records the current state of a step after execution.
 func (bc *BuildCache) Update(step WasmBuildStep) {
 	bc.Entries[cacheKey(step)] = CacheEntry{
@@ -173,6 +206,11 @@ func hashArgs(args []string) string {
 func (bc *BuildCache) DebugIsCached(step WasmBuildStep) {
 	if step.OutputFile == "" {
 		fmt.Fprintf(os.Stderr, "[cache-debug] no output file\n")
+		return
+	}
+	if member := missingArchiveMember(step); member != "" {
+		fmt.Fprintf(os.Stderr, "[cache-debug] MISS (member gone): %s member=%s\n",
+			filepath.Base(step.OutputFile), filepath.Base(member))
 		return
 	}
 	entry, ok := bc.Entries[cacheKey(step)]
