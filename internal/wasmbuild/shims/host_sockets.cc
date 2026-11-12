@@ -15,9 +15,11 @@
  *
  * What is handled: IPv4 TCP sockets — clients (connect) and servers (bind,
  * listen, accept) — and IPv4 UDP sockets (bind, connect, sendto, recvfrom,
- * and send/recv once connected); their names (getsockname, getpeername), a
- * fixed set of socket options, and socketpair() for a pair of connected
- * AF_UNIX stream sockets. Everything else fails with the errno the missing
+ * and send/recv once connected); send and recv with the flags MSG_PEEK,
+ * MSG_WAITALL, MSG_DONTWAIT and MSG_NOSIGNAL; their names (getsockname,
+ * getpeername), a fixed set of socket options, and socketpair() for a pair
+ * of connected AF_UNIX stream sockets. Everything else fails with the errno
+ * the missing
  * feature has: a socket of another type cannot be created (EPROTONOSUPPORT),
  * another address family is EAFNOSUPPORT, an option outside the set is
  * ENOPROTOOPT. Nothing here reports success for something it did not do.
@@ -78,14 +80,22 @@ extern int __wasmify_host_sock_getsockname(int fd, struct __wasmify_sock_name *o
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getpeername")))
 extern int __wasmify_host_sock_getpeername(int fd, struct __wasmify_sock_name *out);
 
+/* The flags of a send or a receive the host knows, by the host's own
+ * numbering (libc's MSG_ numbers differ from libc to libc). */
+#define WASMIFY_MSG_PEEK 1     /* receive: leave it in place */
+#define WASMIFY_MSG_WAITALL 2  /* receive: until the buffer is full */
+#define WASMIFY_MSG_DONTWAIT 4 /* do not wait, whatever O_NONBLOCK says */
+#define WASMIFY_MSG_NOSIGNAL 8 /* send: EPIPE without SIGPIPE */
+
 /* sendto: with has_addr, a datagram to ip_be:port; without, a send to the
- * socket's peer. *sent receives the count. */
+ * socket's peer. flags are WASMIFY_MSG_ flags. *sent receives the count. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_sendto")))
 extern int __wasmify_host_sock_sendto(int fd, const void *buf, int len, int flags,
                                       int has_addr, unsigned int ip_be, int port, int *sent);
 
 /* recvfrom: one datagram (or, on a stream socket, what there is) into buf;
- * *from receives the sender's name, with family 0 when there is none. */
+ * flags are WASMIFY_MSG_ flags. *from receives the sender's name, with
+ * family 0 when there is none. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_recvfrom")))
 extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
                                         struct __wasmify_sock_name *from, int *received);
@@ -473,8 +483,23 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
  * reports who sent the datagram it hands over. On a stream socket the
  * address carries nothing — the peer is the connection's: sendto is send,
  * and recvfrom is recv plus the peer's name. */
+/* Translates the MSG_ flags of a send or a receive into the host's. A flag
+ * outside allowed is one the call does not have: -1, and the caller reports
+ * EOPNOTSUPP. */
+static int __wasmify_msg_flags(int flags, int allowed) {
+    if (flags & ~allowed) return -1;
+    int host = 0;
+    if (flags & MSG_PEEK) host |= WASMIFY_MSG_PEEK;
+    if (flags & MSG_WAITALL) host |= WASMIFY_MSG_WAITALL;
+    if (flags & MSG_DONTWAIT) host |= WASMIFY_MSG_DONTWAIT;
+    if (flags & MSG_NOSIGNAL) host |= WASMIFY_MSG_NOSIGNAL;
+    return host;
+}
+
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *addr, socklen_t addrlen) {
+    const int host_flags = __wasmify_msg_flags(flags, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (host_flags < 0) { errno = EOPNOTSUPP; return -1; }
     int has_addr = 0;
     unsigned int ip_be = 0;
     int port = 0;
@@ -490,7 +515,7 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
     }
     if (len > 0x7fffffff) { errno = EMSGSIZE; return -1; }
     int sent = 0;
-    int r = __wasmify_host_sock_sendto(fd, buf, static_cast<int>(len), flags, has_addr,
+    int r = __wasmify_host_sock_sendto(fd, buf, static_cast<int>(len), host_flags, has_addr,
                                        ip_be, port, &sent);
     if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
     return sent;
@@ -498,10 +523,12 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *addr, socklen_t *addrlen) {
+    const int host_flags = __wasmify_msg_flags(flags, MSG_PEEK | MSG_WAITALL | MSG_DONTWAIT);
+    if (host_flags < 0) { errno = EOPNOTSUPP; return -1; }
     if (len > 0x7fffffff) len = 0x7fffffff;
     struct __wasmify_sock_name name;
     int received = 0;
-    int r = __wasmify_host_sock_recvfrom(fd, buf, static_cast<int>(len), flags, &name, &received);
+    int r = __wasmify_host_sock_recvfrom(fd, buf, static_cast<int>(len), host_flags, &name, &received);
     if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
     if (addr != nullptr && addrlen != nullptr) {
         if (name.family == 0)
@@ -510,6 +537,17 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
             __wasmify_fill_sockaddr(&name, addr, addrlen);
     }
     return received;
+}
+
+/* send() / recv(): sendto and recvfrom without an address. wasi-libc's own
+ * pair goes to the standard wasi calls, which have no flag for a send and
+ * two for a receive, and refuses every other flag; these replace it. */
+ssize_t send(int fd, const void *buf, size_t len, int flags) {
+    return sendto(fd, buf, len, flags, nullptr, 0);
+}
+
+ssize_t recv(int fd, void *buf, size_t len, int flags) {
+    return recvfrom(fd, buf, len, flags, nullptr, nullptr);
 }
 
 } /* extern "C" */
