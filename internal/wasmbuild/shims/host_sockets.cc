@@ -17,9 +17,9 @@
  * listen, accept) — and IPv4 UDP sockets (bind, connect, sendto, recvfrom,
  * and send/recv once connected); send and recv with the flags MSG_PEEK,
  * MSG_WAITALL, MSG_DONTWAIT and MSG_NOSIGNAL; their names (getsockname,
- * getpeername), a fixed set of socket options, and socketpair() for a pair
- * of connected AF_UNIX stream sockets. Everything else fails with the errno
- * the missing
+ * getpeername), a fixed set of socket options, the receive and send
+ * timeouts, and socketpair() for a pair of connected AF_UNIX stream
+ * sockets. Everything else fails with the errno the missing
  * feature has: a socket of another type cannot be created (EPROTONOSUPPORT),
  * another address family is EAFNOSUPPORT, an option outside the set is
  * ENOPROTOOPT. Nothing here reports success for something it did not do.
@@ -111,6 +111,22 @@ extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
 #define WASMIFY_SOCKOPT_LINGER 7 /* seconds, or -1 for off */
 #define WASMIFY_SOCKOPT_ERROR 8  /* read only */
 #define WASMIFY_SOCKOPT_TYPE 9   /* read only: a WASMIFY_SOCK_TYPE_* */
+#define WASMIFY_SOCKOPT_ACCEPTCONN 10 /* read only: 1 for a listening socket */
+
+/* SO_ACCEPTCONN has no number in every libc; a project that gives it one
+ * uses this one (Linux's). */
+#ifndef SO_ACCEPTCONN
+#define SO_ACCEPTCONN 30
+#endif
+
+/* The receive and send timeouts of a socket (SO_RCVTIMEO, SO_SNDTIMEO):
+ * *old_nanos receives the timeout before the call, in nanoseconds (0: no
+ * limit); with set it is then replaced by nanos. */
+#define WASMIFY_SOCK_TIMEOUT_RECEIVE 1
+#define WASMIFY_SOCK_TIMEOUT_SEND 2
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_timeout")))
+extern int __wasmify_host_sock_timeout(int fd, int which, int set, int64_t nanos,
+                                       int64_t *old_nanos);
 
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_setopt")))
 extern int __wasmify_host_sock_setopt(int fd, int option, int value);
@@ -400,6 +416,7 @@ static int __wasmify_sock_option(int level, int optname) {
         case SO_LINGER:    return WASMIFY_SOCKOPT_LINGER;
         case SO_ERROR:     return WASMIFY_SOCKOPT_ERROR;
         case SO_TYPE:      return WASMIFY_SOCKOPT_TYPE;
+        case SO_ACCEPTCONN: return WASMIFY_SOCKOPT_ACCEPTCONN;
         }
     } else if (level == IPPROTO_TCP) {
         if (optname == TCP_NODELAY) return WASMIFY_SOCKOPT_NODELAY;
@@ -407,11 +424,55 @@ static int __wasmify_sock_option(int level, int optname) {
     return 0;
 }
 
+/* Which timeout a (level, option) names, or 0 for an option that is not a
+ * timeout. */
+static int __wasmify_sock_timeout_of(int level, int optname) {
+    if (level != SOL_SOCKET) return 0;
+    if (optname == SO_RCVTIMEO) return WASMIFY_SOCK_TIMEOUT_RECEIVE;
+    if (optname == SO_SNDTIMEO) return WASMIFY_SOCK_TIMEOUT_SEND;
+    return 0;
+}
+
 int setsockopt(int fd, int level, int optname, const void *optval, socklen_t optlen) {
+    if (const int which = __wasmify_sock_timeout_of(level, optname)) {
+        if (optval == nullptr) { errno = EFAULT; return -1; }
+        /* The value is a struct timeval. Where time_t is wider than long,
+         * that is not the pair of longs it used to be, and programs that
+         * build the value by hand (a scripting language packing two native
+         * longs) still pass the pair: both layouts are taken, told apart by
+         * their size. */
+        struct timeval tv;
+        if (optlen >= (socklen_t)sizeof(struct timeval)) {
+            memcpy(&tv, optval, sizeof(tv));
+        } else if (optlen == (socklen_t)(2 * sizeof(long))) {
+            long pair[2];
+            memcpy(pair, optval, sizeof(pair));
+            tv.tv_sec = pair[0];
+            tv.tv_usec = pair[1];
+        } else {
+            errno = EINVAL;
+            return -1;
+        }
+        if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000) { errno = EDOM; return -1; }
+        /* a time too far off to count is the farthest one there is */
+        const int64_t limit = INT64_MAX / 1000000000 - 1;
+        const int64_t nanos = (int64_t)tv.tv_sec > limit
+            ? INT64_MAX
+            : (int64_t)tv.tv_sec * 1000000000 + (int64_t)tv.tv_usec * 1000;
+        int64_t old = 0;
+        int r = __wasmify_host_sock_timeout(fd, which, 1, nanos, &old);
+        if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+        return 0;
+    }
     const int option = __wasmify_sock_option(level, optname);
     if (option == 0) { errno = ENOPROTOOPT; return -1; }
     if (optval == nullptr) { errno = EFAULT; return -1; }
     int value = 0;
+    if (option == WASMIFY_SOCKOPT_ERROR || option == WASMIFY_SOCKOPT_TYPE ||
+        option == WASMIFY_SOCKOPT_ACCEPTCONN) {
+        errno = ENOPROTOOPT; /* read only */
+        return -1;
+    }
     if (option == WASMIFY_SOCKOPT_LINGER) {
         if (optlen < (socklen_t)sizeof(struct linger)) { errno = EINVAL; return -1; }
         struct linger l;
@@ -427,6 +488,19 @@ int setsockopt(int fd, int level, int optname, const void *optval, socklen_t opt
 }
 
 int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    if (const int which = __wasmify_sock_timeout_of(level, optname)) {
+        if (optval == nullptr || optlen == nullptr) { errno = EFAULT; return -1; }
+        if (*optlen < (socklen_t)sizeof(struct timeval)) { errno = EINVAL; return -1; }
+        int64_t nanos = 0;
+        int r = __wasmify_host_sock_timeout(fd, which, 0, 0, &nanos);
+        if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+        struct timeval tv;
+        tv.tv_sec = (time_t)(nanos / 1000000000);
+        tv.tv_usec = (suseconds_t)((nanos % 1000000000) / 1000);
+        memcpy(optval, &tv, sizeof(tv));
+        *optlen = sizeof(tv);
+        return 0;
+    }
     const int option = __wasmify_sock_option(level, optname);
     if (option == 0) { errno = ENOPROTOOPT; return -1; }
     if (optval == nullptr || optlen == nullptr) { errno = EFAULT; return -1; }
