@@ -250,10 +250,9 @@ static int __wasmify_sock_addr_in(const struct sockaddr *addr, socklen_t addrlen
         if (room > sizeof(un->sun_path)) room = sizeof(un->sun_path);
         size_t len;
         if (room > 0 && un->sun_path[0] == '\0') {
-            /* an abstract name: its bytes, less the padding */
+            /* An abstract name is every byte the address length covers,
+             * NULs included: a name of NULs alone is a name. */
             len = room;
-            while (len > 1 && un->sun_path[len - 1] == '\0') len--;
-            if (len == 1) return EINVAL;
         } else {
             len = strnlen(un->sun_path, room);
             if (len == 0) return EINVAL;
@@ -316,10 +315,15 @@ static void __wasmify_sock_addr_out(const struct __wasmify_sock_addr *in,
         size_t len = in->name_len;
         if (len > sizeof(sa.un.sun_path)) len = sizeof(sa.un.sun_path);
         memcpy(sa.un.sun_path, in->name, len);
-        /* The whole structure, the path padded with NULs — an empty one for
-         * a socket without a name: this libc has no convention of a shorter
-         * address, and programs built for it expect the structure's size. */
+        /* The lengths are Linux's, which is what tells the three kinds of
+         * address apart: a path is the whole structure, padded with NULs;
+         * an abstract name (one that starts with a NUL) has no terminator
+         * and ends where the address does; a socket without a name has an
+         * address that ends before the path. */
         full = sizeof(sa.un);
+        if (len == 0 || in->name[0] == '\0') {
+            full = (socklen_t)(offsetof(struct __wasmify_sockaddr_un, sun_path) + len);
+        }
         break;
     }
     }
