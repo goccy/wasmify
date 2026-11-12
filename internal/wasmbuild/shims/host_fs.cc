@@ -96,6 +96,11 @@ __attribute__((import_module("wasi_snapshot_preview1"), import_name("path_create
 extern int __wasmify_host_path_create_directory_mode(const char *path, int len,
                                                      unsigned int mode);
 
+/* Reports the working directory the guest has changed to (an absolute
+ * path): the host process follows when the guest is it. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_chdir")))
+extern int __wasmify_host_proc_chdir(const char *path, int len);
+
 /* lock: 0 unlock, 1 shared, 2 exclusive. wait: non-zero to block. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_flock")))
 extern int __wasmify_host_fd_flock(int fd, int lock, int wait);
@@ -355,7 +360,11 @@ int __wrap_chdir(const char *path) {
     }
     if (o == 0) out[o++] = '/';
     out[o] = 0;
-    return __real_chdir(out);
+    const int rc = __real_chdir(out);
+    /* The working directory is libc's to keep; the host is told where the
+     * guest now is. What it makes of that does not change the outcome. */
+    if (rc == 0) (void)__wasmify_host_proc_chdir(out, (int)o);
+    return rc;
 }
 
 } /* extern "C" */
