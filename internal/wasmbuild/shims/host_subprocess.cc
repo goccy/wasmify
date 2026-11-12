@@ -22,10 +22,12 @@
  * by the host's exec whitelist. */
 #ifdef WASMIFY_HOST_SUBPROCESS
 
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -54,6 +56,31 @@ extern int __wasmify_host_fd_dup(int fd, int *fd_out);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup2")))
 extern int __wasmify_host_fd_dup2(int from, int to);
 
+/* The close-on-exec flag of a descriptor: *old receives it as it was (0 or
+ * 1); with set non-zero it then becomes value. 0 or a negative errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_cloexec")))
+extern int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
+
+extern int __real_fcntl(int fd, int cmd, ...);
+
+/* fcntl: wasi-libc answers F_GETFD with FD_CLOEXEC and drops F_SETFD — a
+ * WASI process starts no commands, so nothing is ever inherited. With host
+ * subprocesses a command does inherit the descriptors that are not marked
+ * (the host hands them over under their numbers), so the flag is real and
+ * the host keeps it. Every other request is libc's. (The link routes fcntl
+ * here: -Wl,--wrap=fcntl.) */
+int __wrap_fcntl(int fd, int cmd, ...) {
+    va_list ap;
+    va_start(ap, cmd);
+    const int arg = va_arg(ap, int);
+    va_end(ap);
+    if (cmd != F_GETFD && cmd != F_SETFD) return __real_fcntl(fd, cmd, arg);
+    int old = 0;
+    const int rc = __wasmify_host_fd_cloexec(fd, cmd == F_SETFD, (arg & FD_CLOEXEC) != 0, &old);
+    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+    return cmd == F_GETFD ? (old ? FD_CLOEXEC : 0) : 0;
+}
+
 /* dup()/dup2()/dup3(): wasi-libc has neither (WASI preview1 has only
  * fd_renumber, whose move semantics close the source). The host imports
  * implement true sharing semantics: the descriptor closes only when the
@@ -74,9 +101,13 @@ int dup2(int from, int to) {
 }
 
 int dup3(int from, int to, int flags) {
-    (void)flags;
     if (from == to) { errno = EINVAL; return -1; }
-    return dup2(from, to);
+    if (dup2(from, to) < 0) return -1;
+    if (flags & O_CLOEXEC) {
+        int old = 0;
+        __wasmify_host_fd_cloexec(to, 1, 1, &old);
+    }
+    return to;
 }
 
 int posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa) {

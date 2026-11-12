@@ -152,6 +152,12 @@ func (c WasmConfig) EffectiveExtraLDFlags() []string {
 			"-Wl,--wrap=__wasilibc_find_relpath_alloc",
 		)
 	}
+	if c.HostSubprocess {
+		// The host-subprocess shim keeps the close-on-exec flag of a
+		// descriptor with the host (see shims/host_subprocess.cc); libc's
+		// fcntl has to come through it.
+		flags = append(flags, "-Wl,--wrap=fcntl")
+	}
 	if c.Wasm64 {
 		return append(flags, c.ExtraLDFlagsWasm64...)
 	}
