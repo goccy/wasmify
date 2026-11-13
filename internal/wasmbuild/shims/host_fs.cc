@@ -146,6 +146,18 @@ static int __wasmify_fs_no_path(const char *path) {
     return 0;
 }
 
+/* The number the preopened root directory is named by in every call that
+ * resolves a path against it. WASI has a libc find its preopened
+ * directories from descriptor 3 up, and the host has the root there; but 3
+ * is the number a program's first own descriptor gets, where a program's
+ * descriptors are an operating system's (a guest that is the host process).
+ * The host knows the root under this second number as well, one no
+ * descriptor ever has, and keeps 3 out of it when the path calls and the
+ * questions libc asks about the directory (fd_fdstat_get in openat and
+ * faccessat) come under this one. */
+#define WASMIFY_ROOT_FD 0x7ffffff0
+#define WASMIFY_PREOPEN_FD 3
+
 /* The one place wasi-libc turns a path into a preopened directory and a
  * path relative to it: open, stat, opendir, unlink, rename, ... all come
  * through here. Its own code makes the empty path the current directory. */
@@ -153,8 +165,9 @@ int __wrap___wasilibc_find_relpath_alloc(const char *path, const char **abs_pref
                                          char **relative, size_t *relative_len,
                                          int can_realloc) {
     if (__wasmify_fs_no_path(path)) return -1;
-    return __real___wasilibc_find_relpath_alloc(path, abs_prefix, relative, relative_len,
-                                                can_realloc);
+    int fd = __real___wasilibc_find_relpath_alloc(path, abs_prefix, relative, relative_len,
+                                                  can_realloc);
+    return fd == WASMIFY_PREOPEN_FD ? WASMIFY_ROOT_FD : fd;
 }
 
 /* Absolutize against the guest cwd and strip the leading '/' so the path
