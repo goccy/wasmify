@@ -109,6 +109,17 @@ extern int __wasmify_host_sock_resolve(const char *node, int len, int family,
                                        struct __wasmify_sock_addr *out, int max,
                                        unsigned int *count);
 
+/* gethostbyname's lookup, as the host's gethostbyname does it where the
+ * host can (it is not getaddrinfo's: darwin's getaddrinfo keeps a socket
+ * open that gethostbyname does not, which every command started afterwards
+ * would inherit). The record is the number of IPv4 addresses (u32), the
+ * addresses (4 bytes each, as in s_addr), then the official name, not
+ * NUL-terminated: *needed receives its size, also when buf is too small
+ * (-ERANGE). -ENOENT when the name has no IPv4 address. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_host_by_name")))
+extern int __wasmify_host_sock_host_by_name(const char *node, int len, void *buf, int buf_len,
+                                            unsigned int *needed);
+
 /* The name of the host with an IP address, not NUL-terminated: *needed
  * receives its length, also when buf is too small (-ERANGE). -ENOENT when
  * the address has no name. */
@@ -608,29 +619,43 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
     return 0;
 }
 
-/* gethostbyname(): the host's lookup, one IPv4 address. The result lives
- * in static storage, as the interface has it. */
+/* gethostbyname(): the host's gethostbyname lookup: the official name and
+ * the IPv4 addresses (up to 16) of the name. The result lives in static
+ * storage, as the interface has it. */
 struct hostent *gethostbyname(const char *name) {
+    enum { MAX_ADDRS = 16 };
     static struct hostent ent;
-    static struct in_addr addr;
-    static char *addr_list[2];
+    static struct in_addr addrs[MAX_ADDRS];
+    static char *addr_list[MAX_ADDRS + 1];
     static char *no_aliases[1];
-    static char canonical[256];
-    if (name == nullptr || strlen(name) >= sizeof(canonical)) return nullptr;
-    struct __wasmify_sock_addr found;
-    unsigned int count = 0;
-    if (__wasmify_host_sock_resolve(name, (int)strlen(name), WASMIFY_SOCK_FAMILY_IPV4, &found,
-                                    1, &count) != 0 || count == 0)
-        return nullptr;
-    memcpy(&addr, found.ip, 4);
-    strcpy(canonical, name);
-    addr_list[0] = reinterpret_cast<char *>(&addr);
-    addr_list[1] = nullptr;
+    static char official[256];
+    /* the record: count, the addresses, the name */
+    static unsigned char rec[4 + 4 * MAX_ADDRS + sizeof(official)];
+    if (name == nullptr) return nullptr;
+    unsigned int needed = 0;
+    const int rc = __wasmify_host_sock_host_by_name(name, (int)strlen(name), rec, (int)sizeof(rec),
+                                                    &needed);
+    /* a record too large holds more addresses or a longer name than are
+     * kept here: none is taken rather than part of one */
+    if (rc != 0 || needed < 4) return nullptr;
+    unsigned int count;
+    memcpy(&count, rec, 4);
+    if (count == 0 || needed < 4 + 4 * count) return nullptr;
+    const unsigned int name_len = needed - 4 - 4 * count;
+    if (name_len >= sizeof(official)) return nullptr;
+    const unsigned int kept = count < MAX_ADDRS ? count : MAX_ADDRS;
+    for (unsigned int i = 0; i < kept; i++) {
+        memcpy(&addrs[i], rec + 4 + 4 * i, 4);
+        addr_list[i] = reinterpret_cast<char *>(&addrs[i]);
+    }
+    addr_list[kept] = nullptr;
+    memcpy(official, rec + 4 + 4 * count, name_len);
+    official[name_len] = '\0';
     no_aliases[0] = nullptr;
-    ent.h_name = canonical;
+    ent.h_name = official;
     ent.h_aliases = no_aliases;
     ent.h_addrtype = AF_INET;
-    ent.h_length = sizeof(addr);
+    ent.h_length = sizeof(struct in_addr);
     ent.h_addr_list = addr_list;
     return &ent;
 }
