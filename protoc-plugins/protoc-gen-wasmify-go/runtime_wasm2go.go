@@ -449,6 +449,9 @@ func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr)
 		defer m.mu.Lock()
 		resp, err = handler.HandleCallback(methodID, req)
 	}()
+	if errors.Is(err, errCallbackJumped) {
+		return callbackJumped
+	}
 	if err != nil {
 		resp = pbAppendString(nil, 15, err.Error())
 	}
@@ -457,6 +460,20 @@ func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr)
 	}
 	return encodeCallbackResult(m, resp)
 }
+
+// errCallbackJumped is what a callback handler returns when the callback
+// ends with an exception of the guest pending: one the host held while it
+// left frames of its own (a non-local exit of the guest that passed
+// through host code) and has put back on the module. The guest sees it
+// only where a function that may raise one returns to its caller, and the
+// guest code after the import runs until then; so no answer is allocated
+// in the guest (that would be guest code, run with the exception pending),
+// and the guest is answered callbackJumped, which it returns on at once.
+var errCallbackJumped = errors.New("the callback ended with an exception of the guest pending")
+
+// callbackJumped is what callback_invoke returns to the guest for a
+// callback whose handler returned errCallbackJumped.
+const callbackJumped int64 = -1
 
 // wasmifyStubs implements wasm2go/base.WasmifyImports: the single
 // callback_invoke entry point that the C++ bridge calls back into.
