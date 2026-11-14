@@ -132,6 +132,17 @@ extern int __wasmify_host_sock_listen(int fd, int backlog);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_name")))
 extern int __wasmify_host_sock_name(int fd, int peer, struct __wasmify_sock_addr *out);
 
+/* The address of a record as the host's C library has it in a struct
+ * sockaddr (cap bytes of room at out, the length at *len), and the
+ * reverse. 0 or a negative errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_addr_to_host")))
+extern int __wasmify_host_sock_addr_to_host(const struct __wasmify_sock_addr *addr, void *out,
+                                            int cap, int *len);
+
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_addr_from_host")))
+extern int __wasmify_host_sock_addr_from_host(const void *raw, int len,
+                                              struct __wasmify_sock_addr *addr);
+
 /* The flags of a send or a receive the host knows, by the host's own
  * numbering (libc's MSG_ numbers differ from libc to libc). */
 #define WASMIFY_MSG_PEEK 1     /* receive: leave it in place */
@@ -331,6 +342,49 @@ static void __wasmify_sock_addr_out(const struct __wasmify_sock_addr *in,
     if (n > full) n = full;
     memcpy(addr, &sa, n);
     *addrlen = full;
+}
+
+/* A socket address of this C library as the host's C library has it: the
+ * bytes of a struct sockaddr of the host's (cap bytes of room at out, their
+ * number at *out_len), which native code of the host's makes and takes. A
+ * project whose program is the host process shows its program these, so
+ * that the packed addresses it holds are the ones the system and native
+ * libraries use. Returns 0 or the errno: EAFNOSUPPORT for a family the host
+ * has no sockets of, EINVAL for an address shorter than its family needs,
+ * ERANGE where the room is too small. A Unix-domain address without a name
+ * (the family alone) is one, as getsockname gives it for an unbound
+ * socket. */
+int __wasmify_sockaddr_to_host(const struct sockaddr *addr, socklen_t addrlen, void *out,
+                               size_t cap, size_t *out_len) {
+    struct __wasmify_sock_addr rec;
+    if (addr != nullptr && addrlen >= (socklen_t)sizeof(sa_family_t) && addr->sa_family == AF_UNIX &&
+        addrlen <= (socklen_t)offsetof(struct __wasmify_sockaddr_un, sun_path)) {
+        memset(&rec, 0, sizeof(rec));
+        rec.family = WASMIFY_SOCK_FAMILY_UNIX;
+    } else {
+        const int err = __wasmify_sock_addr_in(addr, addrlen, &rec, nullptr, 0, nullptr);
+        if (err != 0) return err;
+    }
+    int len = 0;
+    const int rc = __wasmify_host_sock_addr_to_host(&rec, out, cap > 0x7fffffff ? 0x7fffffff : (int)cap, &len);
+    if (rc < 0) return -rc;
+    *out_len = (size_t)len;
+    return 0;
+}
+
+/* The reverse of __wasmify_sockaddr_to_host: the struct sockaddr of the
+ * host's in the len bytes at raw as one of this C library, written the way
+ * getsockname() writes one (as much as fits in *out_len bytes at out;
+ * *out_len becomes the full size). Returns 0 or the errno: EAFNOSUPPORT for
+ * bytes that are no address of a family this C library has, EINVAL for
+ * bytes too few for their family. */
+int __wasmify_sockaddr_from_host(const void *raw, size_t len, struct sockaddr *out,
+                                 socklen_t *out_len) {
+    struct __wasmify_sock_addr rec;
+    const int rc = __wasmify_host_sock_addr_from_host(raw, len > 0x7fffffff ? 0x7fffffff : (int)len, &rec);
+    if (rc < 0) return -rc;
+    __wasmify_sock_addr_out(&rec, out, out_len);
+    return 0;
 }
 
 /* The address record of an IPv4 or IPv6 address as it sits in an in_addr
