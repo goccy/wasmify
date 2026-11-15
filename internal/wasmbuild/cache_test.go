@@ -223,3 +223,64 @@ func TestBuildCache_CompileWithHeaderFoundBySearchPath(t *testing.T) {
 		t.Error("up to date although the -include header is newer than the object")
 	}
 }
+
+// A compile step of a source tree names its source relative to the step's
+// working directory ("op.c", run in perl5/): an edit of that source makes
+// the object out of date, whatever wasmify's own working directory is.
+func TestBuildCache_CompileWithSourceRelativeToWorkDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	workDir := filepath.Join(tmpDir, "perl5")
+	object := filepath.Join(tmpDir, "obj", "perl5", "op.o")
+	for _, d := range []string{workDir, filepath.Dir(object)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := filepath.Join(workDir, "op.c")
+	for _, f := range []string{source, object} {
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"-c", "-o", object, "op.c"}
+	step := WasmBuildStep{
+		Type:       buildjson.StepCompile,
+		OriginalID: 5,
+		Args:       args,
+		WorkDir:    workDir,
+		OutputFile: object,
+		InputFiles: collectInputFiles(args),
+	}
+	if len(step.InputFiles) != 1 || step.InputFiles[0] != "op.c" {
+		t.Fatalf("inputs = %q, want the relative source", step.InputFiles)
+	}
+
+	// The source is edited after the object was made.
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(object, old, old); err != nil {
+		t.Fatal(err)
+	}
+	for _, recorded := range []bool{false, true} {
+		bc := LoadBuildCache(tmpDir, "wasm32-wasip1")
+		if recorded {
+			bc.Update(step)
+		}
+		if bc.IsCached(step) {
+			t.Errorf("recorded=%v: up to date although op.c is newer than op.o", recorded)
+		}
+	}
+
+	// The object made from it afterwards is up to date.
+	now := time.Now().Add(time.Minute)
+	if err := os.Chtimes(object, now, now); err != nil {
+		t.Fatal(err)
+	}
+	bc := LoadBuildCache(tmpDir, "wasm32-wasip1")
+	if !bc.IsCached(step) {
+		t.Error("without an entry: an object newer than its source is not up to date")
+	}
+	bc.Update(step)
+	if !bc.IsCached(step) {
+		t.Error("with an entry: an object newer than its source is not up to date")
+	}
+}

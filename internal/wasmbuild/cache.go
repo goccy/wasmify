@@ -121,6 +121,10 @@ func cacheKey(step WasmBuildStep) string {
 // that is there while a member is not was made from other files than the
 // step's (an object the build has since renamed, a member that no longer
 // compiles), and is not up to date. See missingArchiveMember.
+//
+// An input named by a relative path is the file of that name in the step's
+// working directory, where the tool runs (stepPath): a compile step of a
+// source tree names its source as "op.c".
 func (bc *BuildCache) IsCached(step WasmBuildStep) bool {
 	if step.OutputFile == "" {
 		return false
@@ -138,7 +142,7 @@ func (bc *BuildCache) IsCached(step WasmBuildStep) bool {
 	// Input mtime check applies to both tiers.
 	inputsOlder := func() bool {
 		for _, p := range step.InputFiles {
-			inInfo, err := os.Stat(p)
+			inInfo, err := os.Stat(stepPath(step, p))
 			if err != nil {
 				continue
 			}
@@ -170,22 +174,26 @@ func (bc *BuildCache) IsCached(step WasmBuildStep) bool {
 
 // missingArchiveMember returns the first member of an archive step that
 // does not exist, as the step names it; "" when every member is there, and
-// for a step of another type. A relative name is one the archiver resolves
-// in the step's working directory.
+// for a step of another type.
 func missingArchiveMember(step WasmBuildStep) string {
 	if step.Type != buildjson.StepArchive {
 		return ""
 	}
 	for _, p := range step.InputFiles {
-		path := p
-		if !filepath.IsAbs(path) && step.WorkDir != "" {
-			path = filepath.Join(step.WorkDir, path)
-		}
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		if _, err := os.Stat(stepPath(step, p)); os.IsNotExist(err) {
 			return p
 		}
 	}
 	return ""
+}
+
+// stepPath returns the file a step names by p: a relative name is one the
+// step's tool resolves in the step's working directory, not in wasmify's.
+func stepPath(step WasmBuildStep, p string) string {
+	if !filepath.IsAbs(p) && step.WorkDir != "" {
+		return filepath.Join(step.WorkDir, p)
+	}
+	return p
 }
 
 // Update records the current state of a step after execution.
@@ -231,7 +239,7 @@ func (bc *BuildCache) DebugIsCached(step WasmBuildStep) {
 	outInfo, err := os.Stat(step.OutputFile)
 	if err == nil {
 		for _, p := range step.InputFiles {
-			inInfo, inErr := os.Stat(p)
+			inInfo, inErr := os.Stat(stepPath(step, p))
 			if inErr == nil && inInfo.ModTime().After(outInfo.ModTime()) {
 				fmt.Fprintf(os.Stderr, "[cache-debug] MISS (stale): %s input=%s newer than output\n",
 					filepath.Base(step.OutputFile), filepath.Base(p))
