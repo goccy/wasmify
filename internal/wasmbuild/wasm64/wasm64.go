@@ -14,10 +14,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 //go:embed build_sysroot.sh patches/*.patch
 var assets embed.FS
+
+// builtinsRevision names the recipe the compiler-rt builtins are built
+// with; build_sysroot.sh stamps it next to the archive, and an install
+// stamped otherwise (by an earlier recipe) is not complete. wasm-cmp-int:
+// the soft-float comparisons return an int, the result LLVM's WebAssembly
+// backend calls them with.
+const builtinsRevision = "wasm-cmp-int"
 
 // InstallSysroot builds and installs the wasm64-wasip1 sysroot into
 // sdkPath; threads selects the wasm64-wasip1-threads flavor (wasi-libc's
@@ -60,6 +68,7 @@ func InstallSysroot(sdkPath string, threads bool) error {
 	cmd.Env = append(os.Environ(),
 		"WASI_SDK_PATH="+sdkPath,
 		"PATCH_DIR="+filepath.Join(stage, "patches"),
+		"BUILTINS_REVISION="+builtinsRevision,
 	)
 	if threads {
 		cmd.Env = append(cmd.Env, "WASM64_THREADS=1")
@@ -85,5 +94,24 @@ func SysrootInstalled(sdkPath string, threads bool) bool {
 			return false
 		}
 	}
-	return true
+	return builtinsCurrent(sdkPath, triple)
+}
+
+// builtinsCurrent reports whether the compiler-rt builtins of the triple
+// in the SDK's clang resource directory carry the stamp of the current
+// recipe: "<LLVM version> <builtinsRevision>".
+func builtinsCurrent(sdkPath, triple string) bool {
+	rtTriple := strings.Replace(triple, "wasm64-", "wasm64-unknown-", 1)
+	stamps, _ := filepath.Glob(filepath.Join(sdkPath, "lib", "clang", "*", "lib", rtTriple, ".wasmify-tag"))
+	for _, stamp := range stamps {
+		data, err := os.ReadFile(stamp)
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) == 2 && fields[1] == builtinsRevision {
+			return true
+		}
+	}
+	return false
 }

@@ -29,12 +29,17 @@
 #                   -pthread so its objects carry the atomics/bulk-memory
 #                   features a --shared-memory link demands.
 #   WASI_LIBC_COMMIT / LLVM_VERSION  override the pins (testing only)
+#   BUILTINS_REVISION  the recipe of the compiler-rt builtins (wasm64.go's
+#                   builtinsRevision, which InstallSysroot passes): stamped
+#                   next to the archive, so that an install made by an
+#                   earlier recipe is rebuilt
 set -euo pipefail
 
 : "${WASI_SDK_PATH:?WASI_SDK_PATH is required}"
 : "${PATCH_DIR:?PATCH_DIR is required}"
 : "${WASM64_WORK:=${XDG_CACHE_HOME:-$HOME/.cache}/wasmify/wasm64}"
 : "${WASM64_THREADS:=0}"
+: "${BUILTINS_REVISION:=wasm-cmp-int}"
 
 # wasi-libc pin: last verified against the wasm2go widened-ABI runtime.
 : "${WASI_LIBC_COMMIT:=8d8348ec24253d0638a693b8af82445c13d92d32}"
@@ -128,11 +133,34 @@ need_llvm_src() {
 RT_DIR="$RESDIR/lib/wasm64-unknown-wasip1"
 if [ "$WASM64_THREADS" = "1" ]; then RT_DIR="$RESDIR/lib/wasm64-unknown-wasip1-threads"; fi
 RT_TAG="$RT_DIR/.wasmify-tag"
-if [ -f "$RT_TAG" ] && [ "$(cat "$RT_TAG")" = "$LLVM_VERSION" ]; then
-  echo "== wasm64 compiler-rt builtins already installed ($LLVM_VERSION)"
+RT_STAMP="$LLVM_VERSION $BUILTINS_REVISION"
+if [ -f "$RT_TAG" ] && [ "$(cat "$RT_TAG")" = "$RT_STAMP" ]; then
+  echo "== wasm64 compiler-rt builtins already installed ($RT_STAMP)"
 else
   echo "== building compiler-rt builtins for $TRIPLE (LLVM $LLVM_VERSION)"
   need_llvm_src
+  # The soft-float comparisons (__lttf2, __eqtf2, ... of long double) return
+  # CMP_RESULT, which compiler-rt makes a long on every LP64 target but
+  # AArch64; LLVM's WebAssembly backend calls them with an i32 result on
+  # wasm32 and wasm64 alike (WebAssemblyRuntimeLibcallSignatures). On wasm64
+  # the two disagree: the link reports a signature mismatch for every
+  # caller and turns each call into a trap. Make the result an int on wasm
+  # (on wasm32 a long is one already). Idempotent.
+  python3 - "$LLVM_SRC/compiler-rt/lib/builtins/fp_compare_impl.inc" <<'PATCH'
+import sys
+path = sys.argv[1]
+old = "#elif __AVR__\n"
+new = ("#elif defined(__wasm__)\n"
+       "// WebAssembly: LLVM's wasm backend calls these with an i32 result.\n"
+       "typedef int CMP_RESULT;\n"
+       "#elif __AVR__\n")
+src = open(path).read()
+if new in src:
+    sys.exit(0)
+if old not in src:
+    sys.exit("CMP_RESULT selection not found in " + path)
+open(path, "w").write(src.replace(old, new, 1))
+PATCH
   BUILD="$WASM64_WORK/build-rt-$TRIPLE"
   rm -rf "$BUILD"
   cmake -S "$LLVM_SRC/compiler-rt/lib/builtins" -B "$BUILD" -G Ninja \
@@ -161,7 +189,7 @@ else
     echo "compiler-rt build produced no builtins archive" >&2; exit 1
   fi
   cp "$RT_LIB" "$RT_DIR/libclang_rt.builtins.a"
-  echo "$LLVM_VERSION" > "$RT_TAG"
+  echo "$RT_STAMP" > "$RT_TAG"
   echo "== wasm64 compiler-rt builtins installed"
 fi
 
