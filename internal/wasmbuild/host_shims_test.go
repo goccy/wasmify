@@ -27,7 +27,7 @@ func TestHostFSWrapFlagsMatchShim(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"chmod", "fchmod", "stat", "lstat", "fstat", "open", "mkdir", "chdir", "__wasilibc_find_relpath_alloc"} {
+	for _, name := range []string{"chmod", "fchmod", "stat", "lstat", "fstat", "open", "mkdir", "chdir", "access", "faccessat", "__wasilibc_find_relpath_alloc"} {
 		if !wrapped[name] {
 			t.Errorf("%s is not wrapped under HostFS", name)
 		}

@@ -67,6 +67,9 @@ extern int __wasmify_host_path_chmod(const char *path, int len, unsigned int mod
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_chmod")))
 extern int __wasmify_host_fd_chmod(int fd, unsigned int mode);
 
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_access")))
+extern int __wasmify_host_path_access(const char *path, int len, int amode, int flags);
+
 /* What the host adds to a WASI filestat: the POSIX mode — the file type in
  * the bits every Unix uses for it (0170000) and the low twelve mode bits —
  * the owner, the preferred block size for I/O (0 when the host names none),
@@ -197,6 +200,45 @@ int __wrap_chmod(const char *path, mode_t mode) {
 
 int __wrap_fchmod(int fd, mode_t mode) {
     return __wasmify_fs_result(__wasmify_host_fd_chmod(fd, (unsigned int)mode));
+}
+
+/* access(2) and faccessat(2) ask the host (path_access), which checks the
+ * file's mode, owner and access control lists for the process's ids, as
+ * the host's own access(2) does. libc's faccessat looks at the rights of
+ * the preopened directory alone, which every file under it shares, and
+ * never at X_OK: it said a file of mode 0600 could be run and one of mode
+ * 0400 written, which perl's `use filetest 'access'` (-r, -w and -x then
+ * ask access(2)) reported. The import's flags bit 0 asks with the effective
+ * ids, as AT_EACCESS does. A path relative to a directory descriptor other
+ * than the working directory's, and a host that cannot say (ENOSYS), are
+ * left to libc. */
+static const int WASMIFY_ACCESS_EFFECTIVE = 1;
+
+int __real_access(const char *path, int amode);
+int __real_faccessat(int fd, const char *path, int amode, int flag);
+
+static int __wasmify_fs_access(const char *path, int amode, int effective) {
+    char buf[4096];
+    const char *p = __wasmify_fs_import_path(path, buf, sizeof(buf));
+    return __wasmify_host_path_access(p, (int)strlen(p), amode,
+                                      effective ? WASMIFY_ACCESS_EFFECTIVE : 0);
+}
+
+int __wrap_access(const char *path, int amode) {
+    if (__wasmify_fs_no_path(path)) return -1;
+    int rc = __wasmify_fs_access(path, amode, 0);
+    if (rc == -ENOSYS) return __real_access(path, amode);
+    return __wasmify_fs_result(rc);
+}
+
+int __wrap_faccessat(int fd, const char *path, int amode, int flag) {
+    if (fd != AT_FDCWD) return __real_faccessat(fd, path, amode, flag);
+    if (__wasmify_fs_no_path(path)) return -1;
+    /* AT_EACCESS is 0 in some versions of the C library's headers, which
+     * then cannot ask for the effective ids. */
+    int rc = __wasmify_fs_access(path, amode, AT_EACCESS != 0 && (flag & AT_EACCESS) != 0);
+    if (rc == -ENOSYS) return __real_faccessat(fd, path, amode, flag);
+    return __wasmify_fs_result(rc);
 }
 
 /* The libc's constant for the file type in a host mode, or 0 when the host
