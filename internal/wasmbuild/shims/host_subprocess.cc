@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -56,6 +57,28 @@ extern int __wasmify_host_fd_dup(int fd, int *fd_out);
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup2")))
 extern int __wasmify_host_fd_dup2(int from, int to);
 
+/* fd_dup under the lowest free number that is at least min. 0 or a negative
+ * errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dupfd")))
+extern int __wasmify_host_fd_dupfd(int fd, int min, int *fd_out);
+
+/* A POSIX record lock as fd_lock passes it: type 0 F_RDLCK, 1 F_WRLCK,
+ * 2 F_UNLCK; whence 0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END. */
+struct __wasmify_record_lock {
+    int32_t type;
+    int32_t whence;
+    int64_t start;
+    int64_t len;
+    int32_t pid;
+    int32_t pad;
+};
+
+/* A record lock of the host's file behind fd: cmd 0 F_GETLK (the lock in
+ * the way is written back, type F_UNLCK when there is none), 1 F_SETLK,
+ * 2 F_SETLKW. 0 or a negative errno. */
+__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_lock")))
+extern int __wasmify_host_fd_lock(int fd, int cmd, struct __wasmify_record_lock *lock);
+
 /* The close-on-exec flag of a descriptor: *old receives it as it was (0 or
  * 1); with set non-zero it then becomes value. 0 or a negative errno. */
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_cloexec")))
@@ -63,17 +86,69 @@ extern int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
 
 extern int __real_fcntl(int fd, int cmd, ...);
 
+/* fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW) on the host's file
+ * behind fd, which wasi-libc refuses (ENOTSUP). */
+static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
+    if (fl == nullptr) { errno = EFAULT; return -1; }
+    struct __wasmify_record_lock lk;
+    memset(&lk, 0, sizeof(lk));
+    switch (fl->l_type) {
+    case F_RDLCK: lk.type = 0; break;
+    case F_WRLCK: lk.type = 1; break;
+    case F_UNLCK: lk.type = 2; break;
+    default: errno = EINVAL; return -1;
+    }
+    switch (fl->l_whence) {
+    case SEEK_SET: lk.whence = 0; break;
+    case SEEK_CUR: lk.whence = 1; break;
+    case SEEK_END: lk.whence = 2; break;
+    default: errno = EINVAL; return -1;
+    }
+    lk.start = fl->l_start;
+    lk.len = fl->l_len;
+    const int rc = __wasmify_host_fd_lock(fd, cmd == F_GETLK ? 0 : cmd == F_SETLK ? 1 : 2, &lk);
+    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+    if (cmd == F_GETLK) {
+        static const short types[3] = {F_RDLCK, F_WRLCK, F_UNLCK};
+        static const short whences[3] = {SEEK_SET, SEEK_CUR, SEEK_END};
+        fl->l_type = types[lk.type >= 0 && lk.type <= 2 ? lk.type : 2];
+        fl->l_whence = whences[lk.whence >= 0 && lk.whence <= 2 ? lk.whence : 0];
+        fl->l_start = lk.start;
+        fl->l_len = lk.len;
+        fl->l_pid = lk.pid;
+    }
+    return 0;
+}
+
 /* fcntl: wasi-libc answers F_GETFD with FD_CLOEXEC and drops F_SETFD — a
  * WASI process starts no commands, so nothing is ever inherited. With host
  * subprocesses a command does inherit the descriptors that are not marked
  * (the host hands them over under their numbers), so the flag is real and
- * the host keeps it. Every other request is libc's. (The link routes fcntl
- * here: -Wl,--wrap=fcntl.) */
+ * the host keeps it. F_DUPFD and F_DUPFD_CLOEXEC duplicate the descriptor
+ * under the lowest free number from the one given, and the record locks are
+ * the host's (both of which wasi-libc refuses). Every other request is
+ * libc's. (The link routes fcntl here: -Wl,--wrap=fcntl.) */
 int __wrap_fcntl(int fd, int cmd, ...) {
     va_list ap;
     va_start(ap, cmd);
+    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+        struct flock *fl = va_arg(ap, struct flock *);
+        va_end(ap);
+        return __wasmify_fcntl_lock(fd, cmd, fl);
+    }
     const int arg = va_arg(ap, int);
     va_end(ap);
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        if (arg < 0) { errno = EINVAL; return -1; }
+        int nfd = -1;
+        const int rc = __wasmify_host_fd_dupfd(fd, arg, &nfd);
+        if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+        if (cmd == F_DUPFD_CLOEXEC) {
+            int old = 0;
+            (void)__wasmify_host_fd_cloexec(nfd, 1, 1, &old);
+        }
+        return nfd;
+    }
     if (cmd != F_GETFD && cmd != F_SETFD) return __real_fcntl(fd, cmd, arg);
     int old = 0;
     const int rc = __wasmify_host_fd_cloexec(fd, cmd == F_SETFD, (arg & FD_CLOEXEC) != 0, &old);
