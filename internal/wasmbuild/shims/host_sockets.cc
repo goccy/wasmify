@@ -190,6 +190,12 @@ extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
 #define WASMIFY_SOCKOPT_ACCEPTCONN 10 /* read only: 1 for a listening socket */
 #define WASMIFY_SOCKOPT_V6ONLY 11 /* IPV6_V6ONLY, before the socket is bound */
 
+/* SOCK_RAW has no number in every libc (wasi-libc's headers leave it
+ * out); getaddrinfo answers for it with Linux's. */
+#ifndef SOCK_RAW
+#define SOCK_RAW 3
+#endif
+
 /* SO_ACCEPTCONN has no number in every libc; a project that gives it one
  * uses this one (Linux's). */
 #ifndef SO_ACCEPTCONN
@@ -435,11 +441,80 @@ static int __wasmify_service_port(const char *service, int socktype, int flags, 
     return 0;
 }
 
-/* getaddrinfo(): the addresses of node — every one the host's resolver
- * gives, IPv4 before IPv6 — or, without a node ("*" is none, as in glibc),
- * the address to bind to for a passive socket (AI_PASSIVE) and the loopback
- * address otherwise; each with the port of service and once per socket
- * type asked for. */
+/* An IPv4 address in the numbers-and-dots notation inet_aton(3) takes: one
+ * to four numbers, each decimal, octal (a leading 0) or hexadecimal (a
+ * leading 0x), the last filling the bytes the others leave (a.b.c.d,
+ * a.b.c with c 16 bits, a.b with b 24 bits, a alone 32 bits). glibc's
+ * getaddrinfo takes a node in that notation as an address, without asking
+ * a resolver: "127.1", "2130706433", "0x7f000001" and "127.0.0.01" are all
+ * 127.0.0.1. Returns 1 and the address in network byte order, or 0. */
+static int __wasmify_inet_aton(const char *cp, struct in_addr *addr) {
+    uint32_t parts[4];
+    int n = 0;
+    for (;;) {
+        if (n == 4) return 0;
+        int base = 10;
+        if (*cp == '0') {
+            base = 8;
+            cp++;
+            if (*cp == 'x' || *cp == 'X') {
+                base = 16;
+                cp++;
+                if (!((*cp >= '0' && *cp <= '9') || (*cp >= 'a' && *cp <= 'f') || (*cp >= 'A' && *cp <= 'F')))
+                    return 0;
+            } else if (*cp == '\0' || *cp == '.') {
+                /* "0" alone */
+                parts[n++] = 0;
+                if (*cp == '\0') break;
+                cp++;
+                continue;
+            }
+        } else if (!(*cp >= '0' && *cp <= '9')) {
+            return 0;
+        }
+        uint64_t value = 0;
+        for (;; cp++) {
+            int digit;
+            if (*cp >= '0' && *cp <= '9') digit = *cp - '0';
+            else if (base == 16 && *cp >= 'a' && *cp <= 'f') digit = *cp - 'a' + 10;
+            else if (base == 16 && *cp >= 'A' && *cp <= 'F') digit = *cp - 'A' + 10;
+            else break;
+            if (digit >= base) return 0;
+            value = value * base + digit;
+            if (value > 0xffffffffu) return 0;
+        }
+        parts[n++] = (uint32_t)value;
+        if (*cp == '\0') break;
+        if (*cp != '.') return 0;
+        cp++;
+    }
+    uint32_t ip;
+    switch (n) {
+    case 1: ip = parts[0]; break;
+    case 2:
+        if (parts[0] > 0xff || parts[1] > 0xffffff) return 0;
+        ip = parts[0] << 24 | parts[1];
+        break;
+    case 3:
+        if (parts[0] > 0xff || parts[1] > 0xff || parts[2] > 0xffff) return 0;
+        ip = parts[0] << 24 | parts[1] << 16 | parts[2];
+        break;
+    default:
+        if (parts[0] > 0xff || parts[1] > 0xff || parts[2] > 0xff || parts[3] > 0xff) return 0;
+        ip = parts[0] << 24 | parts[1] << 16 | parts[2] << 8 | parts[3];
+        break;
+    }
+    addr->s_addr = htonl(ip);
+    return 1;
+}
+
+/* getaddrinfo(): the addresses of node — an IPv4 address in the notation
+ * inet_aton takes, or every one the host's resolver gives, IPv4 before
+ * IPv6 — or, without a node ("*" is none, as in glibc), the address to bind
+ * to for a passive socket (AI_PASSIVE) and the loopback address otherwise;
+ * each with the port of service and once per socket type asked for: a
+ * stream and a datagram socket when none is asked, or the one asked for
+ * (SOCK_RAW with the protocol asked for). */
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res) {
     const int flags = hints != nullptr ? hints->ai_flags : 0;
@@ -449,7 +524,8 @@ int getaddrinfo(const char *node, const char *service,
     if (node != nullptr && node[0] == '*' && node[1] == '\0') node = nullptr;
     if (node == nullptr && (service == nullptr || service[0] == '\0')) return EAI_NONAME;
     if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6) return EAI_FAMILY;
-    if (socktype != 0 && socktype != SOCK_STREAM && socktype != SOCK_DGRAM) return EAI_SOCKTYPE;
+    if (socktype != 0 && socktype != SOCK_STREAM && socktype != SOCK_DGRAM && socktype != SOCK_RAW)
+        return EAI_SOCKTYPE;
     if (socktype == 0 && protocol == IPPROTO_TCP) socktype = SOCK_STREAM;
     if (socktype == 0 && protocol == IPPROTO_UDP) socktype = SOCK_DGRAM;
     int port = 0;
@@ -469,6 +545,8 @@ int getaddrinfo(const char *node, const char *service,
             if (!(flags & AI_PASSIVE)) a[15] = 1; /* ::1 */
             __wasmify_sock_addr_ip(&found[count++], WASMIFY_SOCK_FAMILY_IPV6, a);
         }
+    } else if (struct in_addr a; want != WASMIFY_SOCK_FAMILY_IPV6 && __wasmify_inet_aton(node, &a)) {
+        __wasmify_sock_addr_ip(&found[count++], WASMIFY_SOCK_FAMILY_IPV4, &a);
     } else {
         if (flags & AI_NUMERICHOST) {
             /* an address in numbers, with or without a scope: no lookup */
@@ -486,13 +564,13 @@ int getaddrinfo(const char *node, const char *service,
         if (rc != 0 || count == 0) return rc == -ENOMEM ? WASMIFY_EAI_MEMORY : WASMIFY_EAI_NONAME;
     }
 
-    static const int types[2] = {SOCK_STREAM, SOCK_DGRAM};
+    static const int types[3] = {SOCK_STREAM, SOCK_DGRAM, SOCK_RAW};
     struct addrinfo *head = nullptr;
     struct addrinfo **tail = &head;
     for (unsigned int i = 0; i < count; i++) {
         found[i].port = (uint32_t)port;
-        for (int t = 0; t < 2; t++) {
-            if (socktype != 0 && socktype != types[t]) continue;
+        for (int t = 0; t < 3; t++) {
+            if (socktype == 0 ? types[t] == SOCK_RAW : socktype != types[t]) continue;
             struct addrinfo *ai =
                 static_cast<struct addrinfo *>(calloc(1, sizeof(struct addrinfo)));
             struct sockaddr *sa = static_cast<struct sockaddr *>(
@@ -507,7 +585,7 @@ int getaddrinfo(const char *node, const char *service,
             __wasmify_sock_addr_out(&found[i], sa, &len);
             ai->ai_family = found[i].family == WASMIFY_SOCK_FAMILY_IPV6 ? AF_INET6 : AF_INET;
             ai->ai_socktype = types[t];
-            ai->ai_protocol = protocol != 0 ? protocol
+            ai->ai_protocol = protocol != 0 || types[t] == SOCK_RAW ? protocol
                               : (types[t] == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
             ai->ai_addrlen = len;
             ai->ai_addr = sa;
