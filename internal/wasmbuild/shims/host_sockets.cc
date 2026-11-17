@@ -189,6 +189,8 @@ extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
 #define WASMIFY_SOCKOPT_TYPE 9   /* read only: a WASMIFY_SOCK_TYPE_* */
 #define WASMIFY_SOCKOPT_ACCEPTCONN 10 /* read only: 1 for a listening socket */
 #define WASMIFY_SOCKOPT_V6ONLY 11 /* IPV6_V6ONLY, before the socket is bound */
+#define WASMIFY_SOCKOPT_BROADCAST 12 /* SO_BROADCAST */
+#define WASMIFY_SOCKOPT_DEFER_ACCEPT 13 /* TCP_DEFER_ACCEPT: seconds */
 
 /* SOCK_RAW has no number in every libc (wasi-libc's headers leave it
  * out); getaddrinfo answers for it with Linux's. */
@@ -768,6 +770,9 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
  * for a combination the host has no sockets of. */
 static int __wasmify_sock_type(int family, int type, int protocol) {
     const bool ip = family != WASMIFY_SOCK_FAMILY_UNIX;
+    /* the protocol of a Unix-domain socket is 0 or the family's own number
+     * (PF_UNIX), as Linux takes it */
+    if (!ip && protocol == AF_UNIX) protocol = 0;
     if (type == SOCK_STREAM && (protocol == 0 || (ip && protocol == IPPROTO_TCP)))
         return WASMIFY_SOCK_TYPE_STREAM;
     if (type == SOCK_DGRAM && (protocol == 0 || (ip && protocol == IPPROTO_UDP)))
@@ -906,9 +911,13 @@ static int __wasmify_sock_option(int level, int optname) {
         case SO_ERROR:     return WASMIFY_SOCKOPT_ERROR;
         case SO_TYPE:      return WASMIFY_SOCKOPT_TYPE;
         case SO_ACCEPTCONN: return WASMIFY_SOCKOPT_ACCEPTCONN;
+        case SO_BROADCAST: return WASMIFY_SOCKOPT_BROADCAST;
         }
     } else if (level == IPPROTO_TCP) {
         if (optname == TCP_NODELAY) return WASMIFY_SOCKOPT_NODELAY;
+#ifdef TCP_DEFER_ACCEPT
+        if (optname == TCP_DEFER_ACCEPT) return WASMIFY_SOCKOPT_DEFER_ACCEPT;
+#endif
     } else if (level == IPPROTO_IPV6) {
         if (optname == IPV6_V6ONLY) return WASMIFY_SOCKOPT_V6ONLY;
     }
