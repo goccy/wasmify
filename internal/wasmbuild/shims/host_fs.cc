@@ -423,6 +423,15 @@ int __wrap_chdir(const char *path) {
     }
     if (o == 0) out[o++] = '/';
     out[o] = 0;
+    /* chdir(2) needs search permission on the directory, which libc's
+     * chdir does not ask about (it opens the directory, which reading
+     * permission allows): a directory of mode 0644 is refused with EACCES.
+     * A path that is no directory is left to libc, which says what it is. */
+    const int searchable = __wasmify_fs_access(out, X_OK, 1);
+    if (searchable != 0 && searchable != -ENOSYS) {
+        struct stat st;
+        if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) return __wasmify_fs_result(searchable);
+    }
     const int rc = __real_chdir(out);
     /* The working directory is libc's to keep; the host is told where the
      * guest now is. What it makes of that does not change the outcome. */
