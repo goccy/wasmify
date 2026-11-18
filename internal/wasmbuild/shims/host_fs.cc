@@ -40,8 +40,11 @@
  * result; a creating open and mkdir hand their mode to the host through
  * path_open_mode/path_create_directory_mode, where the process's umask —
  * kept by the host, set through proc_umask — is taken out of it; flock is
- * fd_flock; and chdir collapses "." and ".." lexically before wasi-libc
- * records it (wasi-libc's own resolution is lexical, so nothing is lost).
+ * fd_flock; and chdir finds the directory as the kernel does, following
+ * each symbolic link on the way and taking ".." from what it reached,
+ * before wasi-libc records it (wasi-libc keeps the path as written, so
+ * that getcwd named a directory reached through a link by the link, and
+ * ".." after one led to the link's parent).
  * Paths cross the imports preopen-relative, like path_open's. The empty
  * path is refused where every libc path function resolves its argument
  * (__wasilibc_find_relpath_alloc), and in the wrappers here that resolve a
@@ -370,6 +373,72 @@ int __wrap_lstat(const char *path, struct stat *st) {
     return __wasmify_stat_common(path, st, 0);
 }
 
+/* The directory path names, as the kernel finds it and getcwd(2) names
+ * it: from the root, each component in turn, a symbolic link replaced by
+ * its target (from the root for an absolute one), ".." the parent of what
+ * has been reached. A component that cannot be looked at ends the walk,
+ * and the rest is taken as written, for chdir to say what is wrong with
+ * it. Returns 0, or -1 with errno set (ELOOP, ENAMETOOLONG). */
+static int __wasmify_physical_dir(const char *path, char *out, size_t outsz) {
+    char rest[4096];
+    if (snprintf(rest, sizeof(rest), "%s", path) >= (int)sizeof(rest)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    size_t o = 0;
+    int links = 0, walking = 1;
+    const char *p = rest;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *c = p;
+        while (*p && *p != '/') p++;
+        const size_t l = (size_t)(p - c);
+        if (l == 1 && c[0] == '.') continue;
+        if (l == 2 && c[0] == '.' && c[1] == '.' && walking) {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            continue;
+        }
+        if (o + 1 + l + 1 > outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        out[o] = '/';
+        memcpy(out + o + 1, c, l);
+        out[o + 1 + l] = 0;
+        struct stat st;
+        if (walking && lstat(out, &st) != 0) {
+            walking = 0;
+        } else if (walking && S_ISLNK(st.st_mode)) {
+            if (++links > 40) {
+                errno = ELOOP;
+                return -1;
+            }
+            char target[4096];
+            const ssize_t tl = readlink(out, target, sizeof(target) - 1);
+            if (tl > 0) {
+                target[tl] = 0;
+                /* the target, then what is left after the link */
+                char next[4096];
+                if (snprintf(next, sizeof(next), "%s/%s", target, p) >= (int)sizeof(next)) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+                memcpy(rest, next, strlen(next) + 1);
+                p = rest;
+                if (target[0] == '/') o = 0;
+                continue;
+            }
+            walking = 0;
+        }
+        o += 1 + l;
+    }
+    if (o == 0) out[o++] = '/';
+    out[o] = 0;
+    return 0;
+}
+
 int __wrap_chdir(const char *path) {
     if (__wasmify_fs_no_path(path)) return -1;
     char joined[4096];
@@ -387,42 +456,9 @@ int __wrap_chdir(const char *path) {
             return -1;
         }
     }
-    const char *comps[256];
-    size_t lens[256];
-    int n = 0;
-    const char *p = joined;
-    while (*p) {
-        while (*p == '/') p++;
-        if (!*p) break;
-        const char *s = p;
-        while (*p && *p != '/') p++;
-        size_t l = (size_t)(p - s);
-        if (l == 1 && s[0] == '.') continue;
-        if (l == 2 && s[0] == '.' && s[1] == '.') {
-            if (n > 0) n--;
-            continue;
-        }
-        if (n >= (int)(sizeof(comps) / sizeof(comps[0]))) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        comps[n] = s;
-        lens[n] = l;
-        n++;
-    }
     char out[4096];
-    size_t o = 0;
-    for (int i = 0; i < n; i++) {
-        if (o + 1 + lens[i] + 1 >= sizeof(out)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        out[o++] = '/';
-        memcpy(out + o, comps[i], lens[i]);
-        o += lens[i];
-    }
-    if (o == 0) out[o++] = '/';
-    out[o] = 0;
+    if (__wasmify_physical_dir(joined, out, sizeof(out)) != 0) return -1;
+    const size_t o = strlen(out);
     /* chdir(2) needs search permission on the directory, which libc's
      * chdir does not ask about (it opens the directory, which reading
      * permission allows): a directory of mode 0644 is refused with EACCES.
