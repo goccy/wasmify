@@ -86,6 +86,11 @@ extern int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
 
 extern int __real_fcntl(int fd, int cmd, ...);
 
+/* The C library names the record locks and F_DUPFD where it has them: the
+ * wasm64 build of wasi-libc does, wasm32's does not (a program there cannot
+ * ask for them, and the requests below are only recognized where they have
+ * names). */
+#ifdef F_GETLK
 /* fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW) on the host's file
  * behind fd, which wasi-libc refuses (ENOTSUP). */
 static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
@@ -119,6 +124,7 @@ static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
     }
     return 0;
 }
+#endif
 
 /* fcntl: wasi-libc answers F_GETFD with FD_CLOEXEC and drops F_SETFD — a
  * WASI process starts no commands, so nothing is ever inherited. With host
@@ -131,13 +137,16 @@ static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
 int __wrap_fcntl(int fd, int cmd, ...) {
     va_list ap;
     va_start(ap, cmd);
+#ifdef F_GETLK
     if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
         struct flock *fl = va_arg(ap, struct flock *);
         va_end(ap);
         return __wasmify_fcntl_lock(fd, cmd, fl);
     }
+#endif
     const int arg = va_arg(ap, int);
     va_end(ap);
+#ifdef F_DUPFD
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         if (arg < 0) { errno = EINVAL; return -1; }
         int nfd = -1;
@@ -149,6 +158,7 @@ int __wrap_fcntl(int fd, int cmd, ...) {
         }
         return nfd;
     }
+#endif
     if (cmd != F_GETFD && cmd != F_SETFD) return __real_fcntl(fd, cmd, arg);
     int old = 0;
     const int rc = __wasmify_host_fd_cloexec(fd, cmd == F_SETFD, (arg & FD_CLOEXEC) != 0, &old);
