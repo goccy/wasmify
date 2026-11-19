@@ -157,8 +157,20 @@ func (c WasmConfig) EffectiveExtraLDFlags() []string {
 	if c.HostSubprocess {
 		// The host-subprocess shim keeps the close-on-exec flag of a
 		// descriptor with the host (see shims/host_subprocess.cc); libc's
-		// fcntl has to come through it.
-		flags = append(flags, "-Wl,--wrap=fcntl")
+		// fcntl has to come through it. The environment is libc's table,
+		// whose changes the host is told about (shims/host_process.cc), and
+		// a write that fails with EPIPE delivers the SIGPIPE the host
+		// posted before it returns (shims/host_signal.cc).
+		flags = append(flags,
+			"-Wl,--wrap=fcntl",
+			"-Wl,--wrap=setenv",
+			"-Wl,--wrap=unsetenv",
+			"-Wl,--wrap=putenv",
+			"-Wl,--wrap=clearenv",
+			"-Wl,--wrap=write",
+			"-Wl,--wrap=writev",
+			"-Wl,--wrap=send",
+		)
 	}
 	if c.Wasm64 {
 		return append(flags, c.ExtraLDFlagsWasm64...)

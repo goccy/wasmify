@@ -39,7 +39,49 @@ func TestHostFSWrapFlagsMatchShim(t *testing.T) {
 	}
 }
 
+// The subprocess capability wraps libc functions its shims define the
+// __wrap_ side of (fcntl, the setenv family, the writes that deliver
+// SIGPIPE); as for HostFS, flag and definition are held together here.
+func TestHostSubprocessWrapFlagsMatchShims(t *testing.T) {
+	const flagPrefix = "-Wl,--wrap="
+	shims := [][]byte{hostSubprocessShim}
+	for _, name := range hostSubprocessCompanionNames {
+		content, err := hostSubprocessCompanionFS.ReadFile("shims/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shims = append(shims, content)
+	}
+	defined := func(symbol string) bool {
+		for _, shim := range shims {
+			if bytes.Contains(shim, []byte(symbol)) {
+				return true
+			}
+		}
+		return false
+	}
+	wrapped := map[string]bool{}
+	for _, flag := range (WasmConfig{HostSubprocess: true}).EffectiveExtraLDFlags() {
+		name, ok := strings.CutPrefix(flag, flagPrefix)
+		if !ok {
+			continue
+		}
+		wrapped[name] = true
+		for _, symbol := range []string{"__wrap_" + name + "(", "__real_" + name + "("} {
+			if !defined(symbol) {
+				t.Errorf("%s is passed to the linker but no subprocess shim has %s", flag, strings.TrimSuffix(symbol, "("))
+			}
+		}
+	}
+	for _, name := range []string{"fcntl", "setenv", "unsetenv", "putenv", "clearenv", "write", "writev", "send"} {
+		if !wrapped[name] {
+			t.Errorf("%s is not wrapped under HostSubprocess", name)
+		}
+	}
+}
+
 func TestDeployHostShims(t *testing.T) {
+	subprocessNames := append([]string{hostSubprocessShimName}, hostSubprocessCompanionNames...)
 	tests := []struct {
 		name           string
 		hostSockets    bool
@@ -49,9 +91,10 @@ func TestDeployHostShims(t *testing.T) {
 	}{
 		{name: "none", wantNames: nil},
 		{name: "sockets only", hostSockets: true, wantNames: []string{hostSocketsShimName}},
-		{name: "subprocess only", hostSubprocess: true, wantNames: []string{hostSubprocessShimName}},
+		{name: "subprocess only", hostSubprocess: true, wantNames: subprocessNames},
 		{name: "fs only", hostFS: true, wantNames: []string{hostFSShimName}},
-		{name: "all", hostSockets: true, hostSubprocess: true, hostFS: true, wantNames: []string{hostSocketsShimName, hostSubprocessShimName, hostFSShimName}},
+		{name: "all", hostSockets: true, hostSubprocess: true, hostFS: true,
+			wantNames: append(append([]string{hostSocketsShimName}, subprocessNames...), hostFSShimName)},
 	}
 
 	for _, tt := range tests {
@@ -93,8 +136,23 @@ func TestDeployHostShims(t *testing.T) {
 				}
 			}
 			if !tt.hostSubprocess {
-				if _, err := os.Stat(filepath.Join(shimDir, hostSubprocessShimName)); err == nil {
-					t.Fatalf("subprocess shim deployed but not requested")
+				for _, name := range append(append([]string(nil), subprocessNames...), hostShimPrivateHeaders...) {
+					if _, err := os.Stat(filepath.Join(shimDir, name)); err == nil {
+						t.Fatalf("subprocess file %s deployed but not requested", name)
+					}
+				}
+			} else {
+				// the headers the subprocess shims include from beside them
+				for _, name := range hostShimPrivateHeaders {
+					if _, err := os.Stat(filepath.Join(shimDir, name)); err != nil {
+						t.Fatalf("expected %s beside the shims: %v", name, err)
+					}
+				}
+			}
+			// every shim includes wasmify_posix.h from beside it
+			if tt.hostSockets || tt.hostSubprocess || tt.hostFS {
+				if _, err := os.Stat(filepath.Join(shimDir, wasmifyPosixHeaderName)); err != nil {
+					t.Fatalf("expected %s beside the shims: %v", wasmifyPosixHeaderName, err)
 				}
 			}
 			if !tt.hostFS {

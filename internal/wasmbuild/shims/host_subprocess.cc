@@ -34,33 +34,9 @@
 #include <string>
 #include <sys/types.h>
 
+#include "wasmify_posix.h"
+
 extern "C" {
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_spawn")))
-extern int __wasmify_host_proc_spawn(const char *path, char *const argv[],
-                                     char *const envp[], int stdin_fd,
-                                     int stdout_fd, int stderr_fd,
-                                     const char *cwd, int *pid_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait")))
-extern int __wasmify_host_proc_wait(int pid, int options, int *status_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait_any")))
-extern int __wasmify_host_proc_wait_any(int options, int *pid_out, int *status_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("pipe")))
-extern int __wasmify_host_pipe(int *fds_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup")))
-extern int __wasmify_host_fd_dup(int fd, int *fd_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup2")))
-extern int __wasmify_host_fd_dup2(int from, int to);
-
-/* fd_dup under the lowest free number that is at least min. 0 or a negative
- * errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dupfd")))
-extern int __wasmify_host_fd_dupfd(int fd, int min, int *fd_out);
 
 /* A POSIX record lock as fd_lock passes it: type 0 F_RDLCK, 1 F_WRLCK,
  * 2 F_UNLCK; whence 0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END. */
@@ -72,17 +48,6 @@ struct __wasmify_record_lock {
     int32_t pid;
     int32_t pad;
 };
-
-/* A record lock of the host's file behind fd: cmd 0 F_GETLK (the lock in
- * the way is written back, type F_UNLCK when there is none), 1 F_SETLK,
- * 2 F_SETLKW. 0 or a negative errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_lock")))
-extern int __wasmify_host_fd_lock(int fd, int cmd, struct __wasmify_record_lock *lock);
-
-/* The close-on-exec flag of a descriptor: *old receives it as it was (0 or
- * 1); with set non-zero it then becomes value. 0 or a negative errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_cloexec")))
-extern int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
 
 extern int __real_fcntl(int fd, int cmd, ...);
 
@@ -349,6 +314,150 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
 
 pid_t wait(int *wstatus) {
     return waitpid(static_cast<pid_t>(-1), wstatus, 0);
+}
+
+} /* extern "C" */
+
+/* ---- kill, times, exec, closefrom ---------------------------------------- */
+#include <signal.h>
+#include <sys/times.h>
+#include <time.h>
+
+extern char **environ;
+
+extern "C" {
+
+int kill(pid_t pid, int sig) {
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* A signal to the process itself is the host's to deliver when the
+     * process is one the host knows by that pid: the host process, whose
+     * action for the signal may be native code's handler and not the
+     * program's, or a fork child. It is delivered by the time kill
+     * returns either way. Otherwise (no host process has the pid: the
+     * program is a process of its own) it is delivered here and now
+     * (host_signal.cc). Any other process, and a process group (a pid of 0
+     * or less), is the host's to find. */
+    if (pid > 0 && pid == getpid()) {
+        if (sig == 0) return 0;
+        const int rc = __wasmify_host_proc_kill((int)pid, sig);
+        if (rc == 0) return 0;
+        if (rc != -ESRCH && rc != ESRCH) {
+            errno = rc < 0 ? -rc : rc;
+            return -1;
+        }
+        return raise(sig);
+    }
+    int rc = __wasmify_host_proc_kill((int)pid, sig);
+    if (rc != 0) {
+        errno = rc < 0 ? -rc : rc;
+        return -1;
+    }
+    return 0;
+}
+
+/* times(2). wasi-libc's emulation reports process time in clock()'s unit,
+ * nanoseconds, while times reports it in clock ticks (sysconf(_SC_CLK_TCK),
+ * the unit a caller divides by). This one reports in that unit, and what
+ * the host accounts to the process: user and system time, its own and its
+ * children's. Where the host keeps no such account the process time is the
+ * emulated clock's: time elapsed since the instance started, all of it user
+ * time. */
+clock_t times(struct tms *buf) {
+    const long ticks_per_sec = sysconf(_SC_CLK_TCK);
+    if (ticks_per_sec <= 0) {
+        errno = ENOSYS; /* the C library has no unit */
+        return (clock_t)-1;
+    }
+    const clock_t elapsed = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
+    uint64_t nanos[4] = {0, 0, 0, 0};
+    const bool accounted = __wasmify_host_proc_times(nanos) == 0;
+    if (buf) {
+        if (accounted) {
+            const uint64_t per_tick = 1000000000ull / (uint64_t)ticks_per_sec;
+            buf->tms_utime = (clock_t)(nanos[0] / per_tick);
+            buf->tms_stime = (clock_t)(nanos[1] / per_tick);
+            buf->tms_cutime = (clock_t)(nanos[2] / per_tick);
+            buf->tms_cstime = (clock_t)(nanos[3] / per_tick);
+        } else {
+            buf->tms_utime = elapsed;
+            buf->tms_stime = 0;
+            buf->tms_cutime = 0;
+            buf->tms_cstime = 0;
+        }
+    }
+    return elapsed;
+}
+
+/* closefrom(2): closes every descriptor from low_fd up. */
+void closefrom(int low_fd) { (void)__wasmify_host_fd_closefrom(low_fd); }
+
+/* The second half of exec. A process image cannot be replaced, so exec
+ * starts the command with this process's current fds and environment
+ * (posix_spawn, after __wasmify_host_proc_exec_next(1)) and then this
+ * process stands in for it until it ends:
+ *
+ *   - It gives up every descriptor it holds, as exec does for the
+ *     close-on-exec ones — the command has its own
+ *     stdio. A peer waiting for end-of-file on one of them (a status pipe
+ *     its parent reads to learn that exec succeeded) must not wait until the
+ *     command ends.
+ *   - It waits in the host, which passes every signal this process is sent
+ *     on to the command: the pid others know is this one's, and the program
+ *     that had the handlers is gone. SIGKILL included.
+ *   - It ends the way the command ended: with its exit status, or killed by
+ *     the signal that killed it, so that whoever waits for this process
+ *     sees what happened to the command.
+ *
+ * All of it without running anything of the program's own (_exit, not
+ * exit): a replaced program runs none of its exit handlers. */
+void __wasmify_exec_become(pid_t pid) {
+    closefrom(0);
+    int status = 0;
+    if (__wasmify_host_proc_exec((int)pid, &status) != 0) _exit(255);
+    if (WIFSIGNALED(status)) __wasmify_host_proc_terminate(WTERMSIG(status));
+    _exit(WEXITSTATUS(status));
+}
+
+/* execv and execvp: they return only when the command could not be
+ * started, with errno set. */
+int execv(const char *path, char *const argv[]) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, 0, 0);
+    posix_spawn_file_actions_adddup2(&fa, 1, 1);
+    posix_spawn_file_actions_adddup2(&fa, 2, 2);
+    pid_t pid = -1;
+    __wasmify_host_proc_exec_next(1);
+    const int rc = posix_spawn(&pid, path, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+        __wasmify_host_proc_exec_next(0);
+        errno = rc;
+        return -1;
+    }
+    __wasmify_exec_become(pid);
+}
+
+int execvp(const char *file, char *const argv[]) {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, 0, 0);
+    posix_spawn_file_actions_adddup2(&fa, 1, 1);
+    posix_spawn_file_actions_adddup2(&fa, 2, 2);
+    pid_t pid = -1;
+    __wasmify_host_proc_exec_next(1);
+    /* a bare name is looked up on PATH */
+    const int rc = posix_spawnp(&pid, file, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+        __wasmify_host_proc_exec_next(0);
+        errno = rc;
+        return -1;
+    }
+    __wasmify_exec_become(pid);
 }
 
 } /* extern "C" */

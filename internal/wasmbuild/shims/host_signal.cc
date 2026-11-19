@@ -1,0 +1,620 @@
+/* host_signal.cc — signals for a process that cannot be interrupted.
+ *
+ * A WASI guest is ordinary code on one thread of the host: nothing can make
+ * it run a handler at an arbitrary instruction. A program whose handlers
+ * only note a signal, for code of its own to act on at a safe point (an
+ * interpreter's), does not need that. This file supplies the part of the
+ * scheme the kernel and libc normally play:
+ *
+ *   - the disposition table (sigaction, signal), the signal mask
+ *     (sigprocmask, sigsuspend, sigpending) and the signal sets;
+ *   - delivery. A signal the process sends itself (kill with its own pid,
+ *     raise) is delivered here and now. A signal from outside — another
+ *     process, the alarm timer, the embedder — is recorded by the host,
+ *     which also stores 1 into the word the program registered
+ *     (proc_signal_register); the program calls __wasmify_signal_absorb
+ *     at its next safe point, which takes the recorded signals from the
+ *     host and delivers them;
+ *   - the real-time interval timer (alarm, ualarm, setitimer and getitimer
+ *     with ITIMER_REAL), which the host keeps and which posts SIGALRM;
+ *   - the default actions: nothing for SIGCHLD, SIGURG, SIGWINCH, SIGCONT
+ *     and the stop signals (stopping has no meaning here), and the end of
+ *     the process for every other signal, reported by the host as a death
+ *     by that signal.
+ *
+ * Blocking host calls (sleep, select, waitpid, accept, reads of pipes and
+ * sockets) return EINTR when a signal is recorded, so the safe point comes.
+ *
+ * Signal masks cross to the host as 64-bit values in which signal n is bit
+ * n-1.
+ *
+ * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ */
+#ifdef WASMIFY_HOST_SUBPROCESS
+#include <signal.h>
+#include <sys/time.h>
+#include <cerrno>
+#include <climits>
+#include <cstdint>
+#include <cstring>
+#include <unistd.h>
+#include <sys/uio.h>
+#include <wasi/api.h>
+
+#include "wasmify_posix.h"
+
+extern "C" {
+
+/* The real-time interval timer. state receives what the timer was before
+ * the call: the nanoseconds until it fires next (0: not set) and its reload
+ * interval (0: it fires once). When set is non-zero the timer is replaced
+ * by one that fires value_ns from now and every interval_ns after that; a
+ * value of 0 disarms it. */
+struct __wasmify_timer_state {
+    uint64_t left_ns;
+    uint64_t interval_ns;
+};
+} /* extern "C" */
+
+namespace {
+
+typedef void (*handler_t)(int);
+
+inline uint64_t sig_bit(int sig) { return (uint64_t)1 << (sig - 1); }
+inline bool sig_valid(int sig) { return sig >= 1 && sig < NSIG; }
+
+const uint64_t kDefaultIgnored =
+    sig_bit(SIGCHLD) | sig_bit(SIGCONT) | sig_bit(SIGSTOP) | sig_bit(SIGTSTP) |
+    sig_bit(SIGTTIN) | sig_bit(SIGTTOU) | sig_bit(SIGURG) | sig_bit(SIGWINCH);
+/* SIGKILL and SIGSTOP can be neither caught, ignored nor blocked. */
+const uint64_t kUnmaskable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
+
+/* ---- signal sets ----------------------------------------------------------
+ * wasi-libc's sigset_t is a placeholder: one unsigned char. It cannot hold
+ * a set, and programs are compiled against it (struct sigaction embeds
+ * one), so its size is fixed. The byte therefore NAMES
+ * a set: it is an index into this table of the distinct sets the process
+ * has made, 0 being the empty set. A sigset_t is still a plain value —
+ * copying it copies the set, since table entries never change — and a
+ * process gets by with a handful of distinct sets. When the table is full,
+ * the function that needed a new entry fails with ENOMEM. */
+uint64_t g_sets[256]; /* g_sets[0] == 0: the empty set */
+int g_set_count = 1;
+
+uint64_t set_mask(const sigset_t *set) {
+    const unsigned idx = (unsigned char)*set;
+    return idx < (unsigned)g_set_count ? g_sets[idx] : 0;
+}
+
+/* Stores mask in *set. Returns 0, or -1 with errno set. */
+int set_assign(sigset_t *set, uint64_t mask) {
+    for (int i = 0; i < g_set_count; i++) {
+        if (g_sets[i] == mask) {
+            *set = (sigset_t)i;
+            return 0;
+        }
+    }
+    if (g_set_count == 256) {
+        errno = ENOMEM;
+        return -1;
+    }
+    g_sets[g_set_count] = mask;
+    *set = (sigset_t)g_set_count++;
+    return 0;
+}
+
+/* ---- dispositions and mask ------------------------------------------------ */
+struct action {
+    handler_t handler; /* SIG_DFL, SIG_IGN, or the handler (either form) */
+    uint64_t mask;     /* blocked while the handler runs */
+    int flags;
+};
+action g_actions[NSIG]; /* zero-initialised: every signal at SIG_DFL */
+uint64_t g_blocked = 0; /* the signal mask */
+uint64_t g_held = 0;    /* delivered while blocked: pending until unblocked */
+/* Counts handler runs, so that pause and sigsuspend know one happened. */
+unsigned long g_handler_runs = 0;
+
+/* Tells the host which signals have a handler and which are ignored, so
+ * that it neither keeps nor interrupts a blocking call for a signal nobody
+ * would notice (it knows the default actions), and so that it knows a
+ * process that ignores SIGCHLD: the children of one leave nothing to wait
+ * for. */
+void report_dispositions() {
+    uint64_t handled = 0, ignored = 0;
+    for (int sig = 1; sig < NSIG; sig++) {
+        const handler_t h = g_actions[sig].handler;
+        if (h == SIG_IGN)
+            ignored |= sig_bit(sig);
+        else if (h != SIG_DFL)
+            handled |= sig_bit(sig);
+    }
+    __wasmify_host_proc_signal_dispositions(handled, ignored, g_blocked);
+}
+
+void release_held();
+
+/* The process's action of a signal the program left at its default, when
+ * code outside the guest has made it SIG_IGN: native code shares the
+ * process with the program, and a network library ignores SIGPIPE when it
+ * is loaded, so that a reset peer is an error of the write. The action is
+ * the program's from then on, as it is in a process of one C library:
+ * sigaction reports it ($SIG{PIPE} reads IGNORE) and the signal is not
+ * delivered. */
+void adopt_process_action(int sig) {
+    if (g_actions[sig].handler != SIG_DFL || __wasmify_host_proc_signal_ignored(sig) != 1) return;
+    g_actions[sig].handler = SIG_IGN;
+    g_actions[sig].flags = 0;
+    g_actions[sig].mask = 0;
+    report_dispositions();
+}
+
+/* Delivers a signal that is not blocked: runs its handler, or takes its
+ * default action. */
+void deliver(int sig) {
+    adopt_process_action(sig);
+    const action act = g_actions[sig];
+    if (act.handler == SIG_IGN) return;
+    if (act.handler == SIG_DFL) {
+        if (kDefaultIgnored & sig_bit(sig)) return;
+        __wasmify_host_proc_terminate(sig);
+    }
+    if (act.flags & SA_RESETHAND) {
+        g_actions[sig].handler = SIG_DFL;
+        report_dispositions();
+    }
+    /* The handler runs with its own mask added, as sigaction specifies. The
+     * host is not told about this short-lived mask: it only matters to
+     * signals the handler sends to its own process, which are delivered
+     * right here. */
+    const uint64_t saved = g_blocked;
+    g_blocked |= act.mask;
+    if (!(act.flags & SA_NODEFER)) g_blocked |= sig_bit(sig);
+    g_blocked &= ~kUnmaskable;
+    g_handler_runs++;
+    if (act.flags & SA_SIGINFO) {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        info.si_signo = sig;
+        ((void (*)(int, siginfo_t *, void *))act.handler)(sig, &info, NULL);
+    } else {
+        act.handler(sig);
+    }
+    g_blocked = saved;
+    release_held();
+}
+
+/* A signal has arrived for this process: deliver it, or hold it while it is
+ * blocked. */
+void arrive(int sig) {
+    if (g_blocked & sig_bit(sig)) {
+        const handler_t h = g_actions[sig].handler;
+        /* An ignored signal is discarded even while blocked. */
+        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig)))) return;
+        g_held |= sig_bit(sig);
+        return;
+    }
+    deliver(sig);
+}
+
+/* Delivers the held signals that are no longer blocked, lowest first. */
+void release_held() {
+    for (;;) {
+        const uint64_t ready = g_held & ~g_blocked;
+        if (!ready) return;
+        const int sig = __builtin_ctzll(ready) + 1;
+        g_held &= ~sig_bit(sig);
+        deliver(sig);
+    }
+}
+
+/* Takes the signals the host has recorded for this process and lets each
+ * arrive. */
+void absorb_posted() {
+    uint64_t posted = 0;
+    if (__wasmify_host_proc_signal_take(&posted) != 0) return;
+    while (posted) {
+        const int sig = __builtin_ctzll(posted) + 1;
+        posted &= posted - 1;
+        if (sig_valid(sig)) arrive(sig);
+    }
+}
+
+/* Blocks until the host reports a signal for this process. The wait is a
+ * poll on a clock, which the host ends with EINTR when it records a signal;
+ * the clock only bounds one round of the wait. */
+void wait_for_signal() {
+    for (;;) {
+        __wasi_subscription_t sub;
+        memset(&sub, 0, sizeof(sub));
+        sub.u.tag = __WASI_EVENTTYPE_CLOCK;
+        sub.u.u.clock.id = __WASI_CLOCKID_MONOTONIC;
+        sub.u.u.clock.timeout = (__wasi_timestamp_t)3600 * 1000000000ull;
+        __wasi_event_t event;
+        __wasi_size_t nevents = 0;
+        if (__wasi_poll_oneoff(&sub, &event, 1, &nevents) == __WASI_ERRNO_INTR) return;
+    }
+}
+
+/* ---- interval timer times -------------------------------------------------- */
+const uint64_t kNanosPerSecond = 1000000000ull;
+
+bool timeval_valid(const struct timeval &tv) {
+    return tv.tv_sec >= 0 && tv.tv_usec >= 0 && tv.tv_usec < 1000000;
+}
+
+/* A valid timeval in nanoseconds; a time too far off to count is the
+ * farthest one there is. */
+int64_t nanos_of(const struct timeval &tv) {
+    const int64_t limit = INT64_MAX / (int64_t)kNanosPerSecond - 1;
+    if ((int64_t)tv.tv_sec > limit) return INT64_MAX;
+    return (int64_t)tv.tv_sec * (int64_t)kNanosPerSecond + (int64_t)tv.tv_usec * 1000;
+}
+
+/* Nanoseconds as a timeval, rounded up to the microsecond. */
+struct timeval timeval_of(uint64_t nanos) {
+    struct timeval tv;
+    uint64_t seconds = nanos / kNanosPerSecond;
+    uint64_t micros = (nanos % kNanosPerSecond + 999) / 1000;
+    if (micros == 1000000) {
+        seconds++;
+        micros = 0;
+    }
+    tv.tv_sec = (time_t)seconds;
+    tv.tv_usec = (suseconds_t)micros;
+    return tv;
+}
+
+} /* namespace */
+
+extern "C" {
+
+/* SIG_IGN and SIG_ERR are the addresses of these two under
+ * _WASI_EMULATED_SIGNAL (1 and -1 are not usable function pointers in
+ * wasm). wasi-libc's emulation defines them next to its own signal() and
+ * raise(), which the definitions below replace; defining them here keeps
+ * that object file out of the link. Neither is ever called. */
+void __SIG_IGN(int) {}
+void __SIG_ERR(int) {}
+
+int sigemptyset(sigset_t *set) { return set_assign(set, 0); }
+
+int sigfillset(sigset_t *set) {
+    return set_assign(set, sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1));
+}
+
+int sigaddset(sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return set_assign(set, set_mask(set) | sig_bit(sig));
+}
+
+int sigdelset(sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return set_assign(set, set_mask(set) & ~sig_bit(sig));
+}
+
+int sigismember(const sigset_t *set, int sig) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return (set_mask(set) & sig_bit(sig)) != 0;
+}
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    adopt_process_action(sig);
+    const action prev = g_actions[sig];
+    if (act) {
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            errno = EINVAL;
+            return -1;
+        }
+        action next;
+        next.handler = (act->sa_flags & SA_SIGINFO) ? (handler_t)act->sa_sigaction
+                                                     : act->sa_handler;
+        next.mask = set_mask(&act->sa_mask);
+        next.flags = act->sa_flags;
+        g_actions[sig] = next;
+    }
+    if (old) {
+        memset(old, 0, sizeof(*old));
+        if (prev.flags & SA_SIGINFO)
+            old->sa_sigaction = (void (*)(int, siginfo_t *, void *))prev.handler;
+        else
+            old->sa_handler = prev.handler;
+        old->sa_flags = prev.flags;
+        if (set_assign(&old->sa_mask, prev.mask) != 0) return -1;
+    }
+    if (act) {
+        const handler_t h = g_actions[sig].handler;
+        /* Setting a signal to be ignored discards it if it is pending. */
+        if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig))))
+            g_held &= ~sig_bit(sig);
+        report_dispositions();
+    }
+    return 0;
+}
+
+handler_t signal(int sig, handler_t handler) {
+    struct sigaction act, old;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+    if (sigaction(sig, &act, &old) != 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
+    const uint64_t prev = g_blocked;
+    if (set) {
+        const uint64_t mask = set_mask(set);
+        switch (how) {
+        case SIG_BLOCK:
+            g_blocked = prev | mask;
+            break;
+        case SIG_UNBLOCK:
+            g_blocked = prev & ~mask;
+            break;
+        case SIG_SETMASK:
+            g_blocked = mask;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+        g_blocked &= ~kUnmaskable;
+    }
+    if (old && set_assign(old, prev) != 0) {
+        g_blocked = prev;
+        return -1;
+    }
+    if (set && g_blocked != prev) {
+        report_dispositions();
+        /* What the host held back while it was blocked, and what was held
+         * here, is delivered before sigprocmask returns. */
+        absorb_posted();
+        release_held();
+    }
+    return 0;
+}
+
+/* The program's mask as native code changes it with sigprocmask or
+ * pthread_sigmask: kind 0 blocks the signals
+ * of mask, 1 unblocks them, 2 makes mask the mask, 3 only asks; a signal it
+ * unblocks that came meanwhile is delivered before it returns, as
+ * sigprocmask delivers it. The mask before. */
+uint64_t __wasmify_signal_native_mask(int kind, uint64_t mask) {
+    /* the set in one entry of the table, not one for each signal added */
+    sigset_t set = 0, old = 0;
+    if (kind != 3 && set_assign(&set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1))) != 0)
+        return g_blocked;
+    const int how = kind == 0 ? SIG_BLOCK : kind == 1 ? SIG_UNBLOCK : SIG_SETMASK;
+    if (sigprocmask(how, kind == 3 ? NULL : &set, &old) != 0) return g_blocked;
+    return set_mask(&old);
+}
+
+/* The mask a sigset_t of the program's holds, and a sigset_t made to hold
+ * a mask, in one entry of the table (the sets native code hands
+ * sigprocmask). __wasmify_signal_set_store returns 0, or -1 with errno set
+ * when the table is full. */
+uint64_t __wasmify_signal_set_mask(const void *set) { return set_mask((const sigset_t *)set); }
+
+int __wasmify_signal_set_store(void *set, uint64_t mask) {
+    return set_assign((sigset_t *)set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1)));
+}
+
+/* What the host posted while a call of the program's was made, delivered
+ * as the call returns: a signal the call itself raised (SIGPIPE, which a
+ * write into a pipe nobody reads raises) is delivered before the call
+ * returns, as the kernel delivers it to a process of its own. */
+void __wasmify_signal_after_call(void) {
+    absorb_posted();
+}
+
+int sigpending(sigset_t *set) {
+    absorb_posted(); /* the host holds the blocked signals it recorded */
+    return set_assign(set, g_held);
+}
+
+/* Waits, with the signal mask replaced by *mask, until a handler has run. */
+int sigsuspend(const sigset_t *mask) {
+    const uint64_t saved = g_blocked;
+    const unsigned long runs = g_handler_runs;
+    g_blocked = set_mask(mask) & ~kUnmaskable;
+    report_dispositions();
+    absorb_posted();
+    release_held();
+    while (g_handler_runs == runs) {
+        wait_for_signal();
+        absorb_posted();
+    }
+    g_blocked = saved;
+    report_dispositions();
+    release_held();
+    errno = EINTR;
+    return -1;
+}
+
+int pause(void) {
+    const unsigned long runs = g_handler_runs;
+    absorb_posted();
+    while (g_handler_runs == runs) {
+        wait_for_signal();
+        absorb_posted();
+    }
+    errno = EINTR;
+    return -1;
+}
+
+int raise(int sig) {
+    if (sig == 0) return 0;
+    if (!sig_valid(sig)) {
+        errno = EINVAL;
+        return -1;
+    }
+    arrive(sig);
+    return 0;
+}
+
+/* abort: the process ends by SIGABRT. A handler for the signal runs first;
+ * when it returns, or the signal is ignored or blocked, the process ends
+ * by the signal all the same. (wasi-libc's abort is a trap, which reaches
+ * the host as a crash of the instance and not as a process that ended.) */
+void abort(void) {
+    if (!(g_blocked & sig_bit(SIGABRT))) {
+        const handler_t h = g_actions[SIGABRT].handler;
+        if (h != SIG_IGN && h != SIG_DFL) deliver(SIGABRT);
+    }
+    __wasmify_host_proc_terminate(SIGABRT);
+}
+
+/* ---- the interval timer ---------------------------------------------------
+ * One timer, kept by the host, behind all four functions: alarm and ualarm
+ * are setitimer(ITIMER_REAL) with their own units, as POSIX describes them.
+ * Times that were left are rounded up, so a timer that is set never reads
+ * as zero. */
+unsigned int alarm(unsigned int seconds) {
+    __wasmify_timer_state old = {0, 0};
+    __wasmify_host_proc_itimer(1, (int64_t)seconds * kNanosPerSecond, 0, &old);
+    return (unsigned int)((old.left_ns + kNanosPerSecond - 1) / kNanosPerSecond);
+}
+
+unsigned ualarm(unsigned value, unsigned interval) {
+    __wasmify_timer_state old = {0, 0};
+    __wasmify_host_proc_itimer(1, (int64_t)value * 1000, (int64_t)interval * 1000, &old);
+    const uint64_t left = (old.left_ns + 999) / 1000;
+    return left > UINT_MAX ? UINT_MAX : (unsigned)left;
+}
+
+int getitimer(int which, struct itimerval *current) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+    __wasmify_timer_state state = {0, 0};
+    const int rc = __wasmify_host_proc_itimer(0, 0, 0, &state);
+    if (rc != 0) {
+        errno = -rc;
+        return -1;
+    }
+    current->it_value = timeval_of(state.left_ns);
+    current->it_interval = timeval_of(state.interval_ns);
+    return 0;
+}
+
+int setitimer(int which, const struct itimerval *next, struct itimerval *old) {
+    if (which != ITIMER_REAL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (next && (!timeval_valid(next->it_value) || !timeval_valid(next->it_interval))) {
+        errno = EINVAL;
+        return -1;
+    }
+    __wasmify_timer_state state = {0, 0};
+    const int rc = next ? __wasmify_host_proc_itimer(1, nanos_of(next->it_value),
+                                                nanos_of(next->it_interval), &state)
+                        : __wasmify_host_proc_itimer(0, 0, 0, &state);
+    if (rc != 0) {
+        errno = -rc;
+        return -1;
+    }
+    if (old) {
+        old->it_value = timeval_of(state.left_ns);
+        old->it_interval = timeval_of(state.interval_ns);
+    }
+    return 0;
+}
+
+/* What the host is to know of this process's signals, told again: an
+ * instance may be a copy of one that told it before — made from a
+ * snapshot of its memory, or by fork — for which the host knows none of it.
+ * A program calls it once it has registered its word with the host
+ * (proc_signal_register), whenever it is entered; the host answers at once
+ * when it has nothing to learn. */
+void __wasmify_signal_report(void) { report_dispositions(); }
+
+/* The signals the host recorded for this process, delivered: a program
+ * that runs its handlers at safe points calls this from there. */
+void __wasmify_signal_absorb(void) { absorb_posted(); }
+
+/* The child side of fork: signals pending for the parent are not pending
+ * for the child (the interval timer is not inherited either; the host
+ * starts the child without one). */
+void __wasmify_signal_fork_child(void) { g_held = 0; }
+
+/* A wait of native code with a signal mask of its own (epoll_pwait, ppoll,
+ * pselect), which the kernel puts in place for the wait alone. begin:
+ * mask is the signal mask from now on, and the one before is put in *old;
+ * a signal that was held and is let in is delivered at once. Otherwise the
+ * wait has ended: what arrived while it ran is delivered, with its mask
+ * still in place, and then mask is the signal mask again. Returns whether
+ * a handler ran, which ends a wait with EINTR. */
+int __wasmify_signal_wait_mask(int begin, uint64_t mask, uint64_t *old) {
+    const unsigned long runs = g_handler_runs;
+    if (begin) {
+        *old = g_blocked;
+    } else {
+        absorb_posted();
+        release_held();
+    }
+    if ((mask & ~kUnmaskable) != g_blocked) {
+        g_blocked = mask & ~kUnmaskable;
+        report_dispositions();
+        if (begin) {
+            absorb_posted();
+            release_held();
+        }
+    }
+    return g_handler_runs != runs;
+}
+
+/* ---- the SIGPIPE of a write ----------------------------------------------
+ * A write into a pipe or socket nobody reads any more fails with EPIPE, and
+ * the host posts the program SIGPIPE as well. The kernel delivers that
+ * signal before the call returns: its default action ends the process
+ * there, and a handler that only marks it (an interpreter's, which runs
+ * its handlers at its next safe point) has marked it by then. So the posted
+ * signals are delivered as such a call returns. The C library's calls are
+ * wrapped at link time (the --wrap flags of HostSubprocess). */
+extern "C" ssize_t __real_write(int fd, const void *buf, size_t count);
+extern "C" ssize_t __wrap_write(int fd, const void *buf, size_t count) {
+    const ssize_t r = __real_write(fd, buf, count);
+    if (r < 0 && errno == EPIPE) {
+        __wasmify_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
+}
+extern "C" ssize_t __real_writev(int fd, const struct iovec *iov, int count);
+extern "C" ssize_t __wrap_writev(int fd, const struct iovec *iov, int count) {
+    const ssize_t r = __real_writev(fd, iov, count);
+    if (r < 0 && errno == EPIPE) {
+        __wasmify_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
+}
+extern "C" ssize_t __real_send(int fd, const void *buf, size_t len, int flags);
+extern "C" ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
+    const ssize_t r = __real_send(fd, buf, len, flags);
+    if (r < 0 && errno == EPIPE) {
+        __wasmify_signal_after_call();
+        errno = EPIPE;
+    }
+    return r;
+}
+
+} /* extern "C" */
+
+#endif /* WASMIFY_HOST_SUBPROCESS */

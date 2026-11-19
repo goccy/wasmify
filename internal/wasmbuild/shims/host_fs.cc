@@ -62,16 +62,9 @@
 #include <cstdio>
 #include <cstring>
 
+#include "wasmify_posix.h"
+
 extern "C" {
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_chmod")))
-extern int __wasmify_host_path_chmod(const char *path, int len, unsigned int mode);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_chmod")))
-extern int __wasmify_host_fd_chmod(int fd, unsigned int mode);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_access")))
-extern int __wasmify_host_path_access(const char *path, int len, int amode, int flags);
 
 /* What the host adds to a WASI filestat: the POSIX mode — the file type in
  * the bits every Unix uses for it (0170000) and the low twelve mode bits —
@@ -87,35 +80,6 @@ struct __wasmify_filestat_ext {
     unsigned long long blocks;
 };
 
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_filestat_ext")))
-extern int __wasmify_host_path_filestat_ext(const char *path, int len, int follow,
-                                            struct __wasmify_filestat_ext *out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_filestat_ext")))
-extern int __wasmify_host_fd_filestat_ext(int fd, struct __wasmify_filestat_ext *out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_umask")))
-extern int __wasmify_host_proc_umask(unsigned int mask);
-
-/* path_open for a preopen-relative path, plus the mode of open(2). */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_open_mode")))
-extern int __wasmify_host_path_open_mode(int lookup_flags, const char *path, int len,
-                                         int oflags, unsigned long long rights_base,
-                                         int fdflags, unsigned int mode, int *fd_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("path_create_directory_mode")))
-extern int __wasmify_host_path_create_directory_mode(const char *path, int len,
-                                                     unsigned int mode);
-
-/* Reports the working directory the guest has changed to (an absolute
- * path): the host process follows when the guest is it. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_chdir")))
-extern int __wasmify_host_proc_chdir(const char *path, int len);
-
-/* lock: 0 unlock, 1 shared, 2 exclusive. wait: non-zero to block. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_flock")))
-extern int __wasmify_host_fd_flock(int fd, int lock, int wait);
-
 extern int __real_chmod(const char *path, mode_t mode);
 extern int __real_fchmod(int fd, mode_t mode);
 extern int __real_stat(const char *path, struct stat *st);
@@ -128,7 +92,7 @@ extern int __real___wasilibc_find_relpath_alloc(const char *path, const char **a
                                                 char **relative, size_t *relative_len,
                                                 int can_realloc);
 
-/* Every import above returns 0 or a negative errno. */
+/* Every import returns 0 or a negative errno (wasmify_posix.h). */
 static int __wasmify_fs_result(int rc) {
     if (rc != 0) {
         errno = (rc < 0) ? -rc : rc;
@@ -473,6 +437,153 @@ int __wrap_chdir(const char *path) {
      * guest now is. What it makes of that does not change the outcome. */
     if (rc == 0) (void)__wasmify_host_proc_chdir(out, (int)o);
     return rc;
+}
+
+} /* extern "C" */
+
+/* ---- owners, FIFOs, temporary files, fchdir -------------------------------
+ * Each of these either does its job with what the host has, or fails with
+ * the errno of the thing that is missing; a libc function left undefined
+ * would be an import answered with "success" for something that never
+ * happened. */
+namespace {
+
+int fail(int error) {
+    errno = error;
+    return -1;
+}
+
+/* Where files have no owners to change (the host says ENOSYS), a request
+ * to change a file's owner is granted when it changes nothing — each id is
+ * -1 ("leave it") or the one the file already has — and refused otherwise:
+ * the process has no privilege to give files away. */
+int change_owner(const struct stat &st, uid_t owner, gid_t group) {
+    if ((owner != (uid_t)-1 && owner != st.st_uid) || (group != (gid_t)-1 && group != st.st_gid))
+        return fail(EPERM);
+    return 0;
+}
+
+/* A path as the host imports take it: absolute, without the leading
+ * slash. Returns NULL with errno set when the path cannot be named. */
+const char *root_relative(const char *path, char *buf, size_t size) {
+    if (!path) {
+        errno = EFAULT;
+        return NULL;
+    }
+    if (!*path) {
+        errno = ENOENT;
+        return NULL;
+    }
+    const char *p = path;
+    if (*p != '/') {
+        char cwd[3584];
+        if (!getcwd(cwd, sizeof(cwd))) return NULL;
+        if (snprintf(buf, size, "%s/%s", cwd, path) >= (int)size) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        p = buf;
+    }
+    while (*p == '/') p++;
+    return p;
+}
+
+int change_path_owner(const char *path, uid_t owner, gid_t group, int follow) {
+    char buf[4096];
+    const char *p = root_relative(path, buf, sizeof(buf));
+    if (!p) return -1;
+    const int rc = __wasmify_host_path_chown(p, (int)strlen(p), (int)owner, (int)group, follow);
+    if (rc == 0) return 0;
+    if (rc != -ENOSYS) return fail(-rc);
+    struct stat st;
+    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return -1;
+    return change_owner(st, owner, group);
+}
+
+} /* namespace */
+
+extern "C" {
+
+/* ---- file ownership ------------------------------------------------------ */
+int chown(const char *path, uid_t owner, gid_t group) {
+    return change_path_owner(path, owner, group, 1);
+}
+
+int lchown(const char *path, uid_t owner, gid_t group) {
+    return change_path_owner(path, owner, group, 0);
+}
+
+int fchown(int fd, uid_t owner, gid_t group) {
+    const int rc = __wasmify_host_fd_chown(fd, (int)owner, (int)group);
+    if (rc == 0) return 0;
+    if (rc != -ENOSYS) return fail(-rc);
+    struct stat st;
+    if (fstat(fd, &st) != 0) return -1;
+    return change_owner(st, owner, group);
+}
+
+/* ---- temporary files ------------------------------------------------------
+ * mkstemp: replaces the trailing XXXXXX of the template with characters
+ * that make a name no file has, and creates that file, for this process
+ * only. */
+int mkstemp(char *tmpl) {
+    static const char alphabet[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const size_t len = tmpl ? strlen(tmpl) : 0;
+    if (len < 6 || memcmp(tmpl + len - 6, "XXXXXX", 6) != 0) return fail(EINVAL);
+    for (int attempt = 0; attempt < 100; attempt++) {
+        unsigned char random[6];
+        if (getentropy(random, sizeof(random)) != 0) return -1;
+        for (int i = 0; i < 6; i++)
+            tmpl[len - 6 + i] = alphabet[random[i] % (sizeof(alphabet) - 1)];
+        const int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) break;
+    }
+    memcpy(tmpl + len - 6, "XXXXXX", 6);
+    return -1;
+}
+
+/* ---- the working directory by descriptor ----------------------------------- */
+
+/* The working directory is a path kept by libc, so a directory that is
+ * known by its descriptor has to be named first. The host knows the path the
+ * descriptor was opened under (fd_path). That name may lead somewhere else
+ * by now — the directory was renamed, or replaced — and fchdir is about the
+ * directory, not the name: when the two no longer agree the directory
+ * cannot be named, and the call fails rather than go elsewhere. */
+int fchdir(int fd) {
+    struct stat by_descriptor;
+    if (fstat(fd, &by_descriptor) != 0) return -1;
+    if (!S_ISDIR(by_descriptor.st_mode)) return fail(ENOTDIR);
+    char path[4096];
+    int length = 0;
+    const int rc = __wasmify_host_fd_path(fd, path, (int)sizeof(path) - 1, &length);
+    if (rc != 0) return fail(rc == -ERANGE ? ENAMETOOLONG : -rc);
+    path[length] = '\0';
+    struct stat by_name;
+    if (stat(path, &by_name) != 0) return -1;
+    if (by_name.st_dev != by_descriptor.st_dev || by_name.st_ino != by_descriptor.st_ino)
+        return fail(ENOENT);
+    return chdir(path);
+}
+
+/* ---- what a WASI process cannot do ---------------------------------------- */
+
+/* The root of the filesystem is the host's to set. */
+int chroot(const char *path) {
+    (void)path;
+    return fail(EPERM);
+}
+
+/* FIFOs are the host filesystem's to create; WASI has no call for it. */
+int mkfifo(const char *path, mode_t mode) {
+    char buf[4096];
+    const char *p = root_relative(path, buf, sizeof(buf));
+    if (!p) return -1;
+    const int rc = __wasmify_host_path_mkfifo(p, (int)strlen(p), (unsigned int)mode);
+    if (rc != 0) return fail(-rc);
+    return 0;
 }
 
 } /* extern "C" */

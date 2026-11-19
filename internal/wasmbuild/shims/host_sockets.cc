@@ -50,6 +50,8 @@
 #include <unistd.h>
 #include <wasi/api.h>
 
+#include "wasmify_posix.h"
+
 extern "C" {
 
 /* The socket types, by the host's own numbering (libc's SOCK_* numbers
@@ -90,91 +92,12 @@ struct __wasmify_sockaddr_un {
  * absolute, without the leading '/'. The host does not know the program's
  * working directory. */
 
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_open")))
-extern int __wasmify_host_sock_open(int family, int type);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_connect_addr")))
-extern int __wasmify_host_sock_connect(int fd, const struct __wasmify_sock_addr *addr,
-                                       const char *path, int path_len);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_bind_addr")))
-extern int __wasmify_host_sock_bind(int fd, const struct __wasmify_sock_addr *addr,
-                                    const char *path, int path_len);
-
-/* The addresses of a host name, of one family or (family 0) of both, IPv4
- * first: at most max records, *count receives their number. An address
- * written in numbers is converted. -ENOENT when the name has none. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_resolve")))
-extern int __wasmify_host_sock_resolve(const char *node, int len, int family,
-                                       struct __wasmify_sock_addr *out, int max,
-                                       unsigned int *count);
-
-/* gethostbyname's lookup, as the host's gethostbyname does it where the
- * host can (it is not getaddrinfo's: darwin's getaddrinfo keeps a socket
- * open that gethostbyname does not, which every command started afterwards
- * would inherit). The record is the number of IPv4 addresses (u32), the
- * addresses (4 bytes each, as in s_addr), then the official name, not
- * NUL-terminated: *needed receives its size, also when buf is too small
- * (-ERANGE). -ENOENT when the name has no IPv4 address. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_host_by_name")))
-extern int __wasmify_host_sock_host_by_name(const char *node, int len, void *buf, int buf_len,
-                                            unsigned int *needed);
-
-/* The name of the host with an IP address, not NUL-terminated: *needed
- * receives its length, also when buf is too small (-ERANGE). -ENOENT when
- * the address has no name. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_reverse_addr")))
-extern int __wasmify_host_sock_reverse(const struct __wasmify_sock_addr *addr, char *buf,
-                                       int buf_len, unsigned int *needed);
-
-/* An entry of the host's services database, by name (by_port 0) or by
- * port, for the protocol proto when it is not empty. The record is the port
- * (u32), then the name and the protocol, each a u32 length and the bytes,
- * then the aliases. -ENOENT when there is no such service. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_service")))
-extern int __wasmify_host_sock_service(const char *name, int name_len, int port, int by_port,
-                                       const char *proto, int proto_len, void *buf,
-                                       int buf_len, unsigned int *needed);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_listen")))
-extern int __wasmify_host_sock_listen(int fd, int backlog);
-
-/* The socket's local name (peer 0) or its peer's. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_name")))
-extern int __wasmify_host_sock_name(int fd, int peer, struct __wasmify_sock_addr *out);
-
-/* The address of a record as the host's C library has it in a struct
- * sockaddr (cap bytes of room at out, the length at *len), and the
- * reverse. 0 or a negative errno. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_addr_to_host")))
-extern int __wasmify_host_sock_addr_to_host(const struct __wasmify_sock_addr *addr, void *out,
-                                            int cap, int *len);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_addr_from_host")))
-extern int __wasmify_host_sock_addr_from_host(const void *raw, int len,
-                                              struct __wasmify_sock_addr *addr);
-
 /* The flags of a send or a receive the host knows, by the host's own
  * numbering (libc's MSG_ numbers differ from libc to libc). */
 #define WASMIFY_MSG_PEEK 1     /* receive: leave it in place */
 #define WASMIFY_MSG_WAITALL 2  /* receive: until the buffer is full */
 #define WASMIFY_MSG_DONTWAIT 4 /* do not wait, whatever O_NONBLOCK says */
 #define WASMIFY_MSG_NOSIGNAL 8 /* send: EPIPE without SIGPIPE */
-
-/* sendto: with addr, a datagram to that address (path as for connect);
- * without, a send to the socket's peer. flags are WASMIFY_MSG_ flags. *sent
- * receives the count. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_sendto_addr")))
-extern int __wasmify_host_sock_sendto(int fd, const void *buf, int len, int flags,
-                                      const struct __wasmify_sock_addr *addr,
-                                      const char *path, int path_len, int *sent);
-
-/* recvfrom: one datagram (or, on a stream socket, what there is) into buf;
- * flags are WASMIFY_MSG_ flags. *from receives the sender's address, with
- * family 0 when there is none. */
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_recvfrom_addr")))
-extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
-                                        struct __wasmify_sock_addr *from, int *received);
 
 /* The socket options the host knows, by the host's own numbering: libc's
  * numbers for them differ from libc to libc. */
@@ -209,19 +132,6 @@ extern int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
  * limit); with set it is then replaced by nanos. */
 #define WASMIFY_SOCK_TIMEOUT_RECEIVE 1
 #define WASMIFY_SOCK_TIMEOUT_SEND 2
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_timeout")))
-extern int __wasmify_host_sock_timeout(int fd, int which, int set, int64_t nanos,
-                                       int64_t *old_nanos);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_setopt")))
-extern int __wasmify_host_sock_setopt(int fd, int option, int value);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_getopt")))
-extern int __wasmify_host_sock_getopt(int fd, int option, int *value);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("sock_socketpair")))
-extern int __wasmify_host_sock_socketpair(int family, int type, int fds[2]);
-
 /* struct addrinfo, the EAI_* values, and the prototypes this file
  * implements all come from wasmify's <netdb.h> stub header (included
  * above) — the SAME header a consuming libc socket module compiles
@@ -1104,6 +1014,416 @@ ssize_t send(int fd, const void *buf, size_t len, int flags) {
 
 ssize_t recv(int fd, void *buf, size_t len, int flags) {
     return recvfrom(fd, buf, len, flags, nullptr, nullptr);
+}
+
+} /* extern "C" */
+
+/* ---- shutdown, the network databases, inet_ntop, poll ----------------- */
+#include <arpa/inet.h>
+#include <poll.h>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <wasi/api.h>
+
+namespace {
+
+int fail(int error) {
+    errno = error;
+    return -1;
+}
+
+/* A lookup in the host's services database. */
+struct servent *find_service(const char *name, int port, int by_port, const char *proto) {
+    static struct servent ent;
+    static char rec[2048];
+    static char *aliases[32];
+    if (!proto) proto = "";
+    uint32_t needed = 0;
+    if (__wasmify_host_sock_service(name, (int)strlen(name), port, by_port, proto, (int)strlen(proto),
+                               rec, (int)sizeof(rec), &needed) != 0)
+        return NULL;
+    /* The record: u32 port, then strings as a u32 length and the bytes —
+     * the name, the protocol — a u32 count and the aliases. Each string is
+     * moved down onto its length, which makes room for its terminator. */
+    uint32_t pos = 0, value = 0;
+    auto number = [&](uint32_t *out) {
+        if (needed - pos < 4) return false;
+        memcpy(out, rec + pos, 4);
+        pos += 4;
+        return true;
+    };
+    auto string = [&]() -> char * {
+        uint32_t n = 0;
+        if (!number(&n) || needed - pos < n) return NULL;
+        char *s = rec + pos - 4;
+        memmove(s, rec + pos, n);
+        s[n] = '\0';
+        pos += n;
+        return s;
+    };
+    if (!number(&value)) return NULL;
+    ent.s_port = (int)htons((uint16_t)value);
+    ent.s_name = string();
+    ent.s_proto = string();
+    uint32_t count = 0;
+    if (!ent.s_name || !ent.s_proto || !number(&count)) return NULL;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        char *alias = string();
+        if (!alias) return NULL;
+        if (kept + 1 < sizeof(aliases) / sizeof(aliases[0])) aliases[kept++] = alias;
+    }
+    aliases[kept] = NULL;
+    ent.s_aliases = aliases;
+    return &ent;
+}
+
+/* The protocols database: the file /etc/protocols, as the C library of
+ * the system reads it (netbase's on Debian: gre, sctp and the others), or,
+ * where there is no such file (an in-memory filesystem), the entries every
+ * /etc/protocols starts with. */
+char *no_aliases[] = {NULL};
+char proto_ip[] = "ip", proto_icmp[] = "icmp", proto_tcp[] = "tcp", proto_udp[] = "udp",
+     proto_ipv6[] = "ipv6", proto_icmpv6[] = "ipv6-icmp";
+struct protoent builtin_protocols[] = {
+    {proto_ip, no_aliases, 0},      {proto_icmp, no_aliases, 1},
+    {proto_tcp, no_aliases, 6},     {proto_udp, no_aliases, 17},
+    {proto_ipv6, no_aliases, 41},   {proto_icmpv6, no_aliases, 58},
+};
+FILE *protocol_file = NULL; /* getprotoent's position in /etc/protocols */
+size_t protocol_next = 0;   /* ... or in the entries above */
+bool protocol_from_file = false;
+
+/* The next entry of the open protocols file: protocols(5), a name, a
+ * number and aliases a line, white space between them, # to the end of
+ * the line a comment. The entry lives in static storage. */
+struct protoent *next_protocol_line(FILE *f) {
+    static char line[1024];
+    static char *aliases[32];
+    static struct protoent ent;
+    while (fgets(line, sizeof(line), f)) {
+        if (char *hash = strchr(line, '#')) *hash = '\0';
+        char *save = NULL;
+        char *name = strtok_r(line, " \t\r\n", &save);
+        char *number = name ? strtok_r(NULL, " \t\r\n", &save) : NULL;
+        if (!number) continue;
+        char *end = NULL;
+        const long value = strtol(number, &end, 10);
+        if (*end != '\0' || value < 0 || value > 255) continue;
+        size_t n = 0;
+        while (n + 1 < sizeof(aliases) / sizeof(aliases[0])) {
+            char *alias = strtok_r(NULL, " \t\r\n", &save);
+            if (!alias) break;
+            aliases[n++] = alias;
+        }
+        aliases[n] = NULL;
+        ent.p_name = name;
+        ent.p_aliases = aliases;
+        ent.p_proto = (int)value;
+        return &ent;
+    }
+    return NULL;
+}
+
+/* The next entry of the database from where the walk is: the file when it
+ * can be read, the built-in entries otherwise. */
+struct protoent *next_protocol() {
+    if (!protocol_file && !protocol_from_file && protocol_next == 0) {
+        protocol_file = fopen("/etc/protocols", "re");
+        protocol_from_file = protocol_file != NULL;
+    }
+    if (protocol_from_file) return protocol_file ? next_protocol_line(protocol_file) : NULL;
+    const size_t count = sizeof(builtin_protocols) / sizeof(builtin_protocols[0]);
+    return protocol_next < count ? &builtin_protocols[protocol_next++] : NULL;
+}
+
+void rewind_protocols() {
+    if (protocol_file) fclose(protocol_file);
+    protocol_file = NULL;
+    protocol_from_file = false;
+    protocol_next = 0;
+}
+
+/* A lookup walks the database from its start, as glibc's does (and leaves
+ * a walk of getprotoent's where it starts over). */
+template <typename Match> struct protoent *find_protocol(Match match) {
+    rewind_protocols();
+    struct protoent *p;
+    while ((p = next_protocol()) != NULL && !match(p)) {
+    }
+    rewind_protocols();
+    return p;
+}
+
+} /* namespace */
+
+extern "C" {
+
+/* ---- sockets ----------------------------------------------------------------
+ * shutdown: "how" is 0, 1 or 2 (SHUT_RD, SHUT_WR, SHUT_RDWR as
+ * wasmify's <sys/socket.h> defines them, the numbers programs pass
+ * literally); the WASI call takes one bit per direction. This definition
+ * takes the place of wasi-libc's, which hands its argument over as the
+ * bits. */
+int shutdown(int fd, int how) {
+    __wasi_sdflags_t flags;
+    switch (how) {
+    case SHUT_RD:
+        flags = __WASI_SDFLAGS_RD;
+        break;
+    case SHUT_WR:
+        flags = __WASI_SDFLAGS_WR;
+        break;
+    case SHUT_RDWR:
+        flags = __WASI_SDFLAGS_RD | __WASI_SDFLAGS_WR;
+        break;
+    default:
+        return fail(EINVAL);
+    }
+    const __wasi_errno_t error = __wasi_sock_shutdown((__wasi_fd_t)fd, flags);
+    if (error != 0) return fail(error);
+    return 0;
+}
+
+/* ---- network databases -----------------------------------------------------
+ * Hosts: lookups by name go to the host (gethostbyname, above); there is
+ * no table to walk. */
+void sethostent(int stayopen) { (void)stayopen; }
+void endhostent(void) {}
+struct hostent *gethostent(void) { return NULL; }
+
+/* Networks: no database. */
+void setnetent(int stayopen) { (void)stayopen; }
+void endnetent(void) {}
+struct netent *getnetent(void) { return NULL; }
+struct netent *getnetbyname(const char *name) {
+    (void)name;
+    return NULL;
+}
+struct netent *getnetbyaddr(uint32_t net, int type) {
+    (void)net;
+    (void)type;
+    return NULL;
+}
+
+/* Services: lookups by name and by port go to the host, which has the
+ * database when the process is the host process; there is no table to
+ * walk. The result lives in static storage, as the interface has it. */
+void setservent(int stayopen) { (void)stayopen; }
+void endservent(void) {}
+struct servent *getservent(void) { return NULL; }
+struct servent *getservbyname(const char *name, const char *proto) {
+    if (!name) return NULL;
+    return find_service(name, 0, 0, proto);
+}
+struct servent *getservbyport(int port, const char *proto) {
+    /* the port is in network byte order, as in a sockaddr */
+    return find_service("", (int)ntohs((uint16_t)port), 1, proto);
+}
+
+/* Protocols: the database above, by name or alias, or by number. */
+void setprotoent(int stayopen) {
+    (void)stayopen;
+    rewind_protocols();
+}
+void endprotoent(void) { rewind_protocols(); }
+struct protoent *getprotoent(void) {
+    struct protoent *p = next_protocol();
+    if (!p) rewind_protocols();
+    return p;
+}
+struct protoent *getprotobyname(const char *name) {
+    if (!name) return NULL;
+    return find_protocol([name](struct protoent *p) {
+        if (strcmp(p->p_name, name) == 0) return true;
+        for (char **a = p->p_aliases; *a; a++)
+            if (strcmp(*a, name) == 0) return true;
+        return false;
+    });
+}
+struct protoent *getprotobynumber(int number) {
+    return find_protocol([number](struct protoent *p) { return p->p_proto == number; });
+}
+
+/* inet_ntop(3) as glibc words an address: an IPv6 address whose first 96
+ * bits are zero (an IPv4-compatible address, ::1.2.3.4) or that is an
+ * IPv4-mapped one (::ffff:1.2.3.4) ends in the dotted IPv4 notation, the
+ * longest run of zero groups (two at least) is "::", and the groups are
+ * hexadecimal without leading zeros. wasi-libc words the IPv4-compatible
+ * addresses in hexadecimal (::102:304). */
+const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    const unsigned char *b = (const unsigned char *)src;
+    char out[INET6_ADDRSTRLEN];
+    if (af == AF_INET) {
+        snprintf(out, sizeof(out), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    } else if (af == AF_INET6) {
+        unsigned int words[8];
+        for (int i = 0; i < 8; i++) words[i] = (unsigned int)b[2 * i] << 8 | b[2 * i + 1];
+        int best_base = -1, best_len = 0, cur_base = -1, cur_len = 0;
+        for (int i = 0; i < 8; i++) {
+            if (words[i] == 0) {
+                if (cur_base == -1) cur_base = i, cur_len = 1;
+                else cur_len++;
+            } else if (cur_base != -1) {
+                if (best_base == -1 || cur_len > best_len) best_base = cur_base, best_len = cur_len;
+                cur_base = -1;
+            }
+        }
+        if (cur_base != -1 && (best_base == -1 || cur_len > best_len)) best_base = cur_base, best_len = cur_len;
+        if (best_base != -1 && best_len < 2) best_base = -1;
+        char *tp = out;
+        for (int i = 0; i < 8; i++) {
+            if (best_base != -1 && i >= best_base && i < best_base + best_len) {
+                if (i == best_base) *tp++ = ':';
+                continue;
+            }
+            if (i != 0) *tp++ = ':';
+            if (i == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && words[5] == 0xffff))) {
+                tp += snprintf(tp, sizeof(out) - (size_t)(tp - out), "%u.%u.%u.%u", b[12], b[13], b[14], b[15]);
+                break;
+            }
+            tp += snprintf(tp, sizeof(out) - (size_t)(tp - out), "%x", words[i]);
+        }
+        if (best_base != -1 && best_base + best_len == 8) *tp++ = ':';
+        *tp = '\0';
+    } else {
+        errno = EAFNOSUPPORT;
+        return NULL;
+    }
+    if (strlen(out) + 1 > (size_t)size) {
+        errno = ENOSPC;
+        return NULL;
+    }
+    return strcpy(dst, out);
+}
+
+/* ---- poll(2) ---------------------------------------------------------------
+ * poll over poll_oneoff, as wasi-libc's ppoll, except that a descriptor not
+ * asked for reading is still watched for the events poll reports whether
+ * asked or not: POLLNVAL (it is not open), POLLERR (nobody reads the pipe
+ * it writes to any more) and POLLHUP (its peer has hung up). wasi-libc
+ * refuses a descriptor asked for neither reading nor writing (ENOSYS: it
+ * builds one subscription per POLLRDNORM and POLLWRNORM), and a program
+ * that turns reading off for a while passes one: an event loop that asks
+ * POLLERR|POLLHUP|POLLNVAL of a client it has stopped reading got -1 for
+ * every wait and spun. An event loop that watches the write end of a pipe
+ * for a hang-up asks POLLHUP alone.
+ *
+ * Such a descriptor gets a subscription for reading whose readiness is not
+ * reported, as it was not asked for: only its error (POLLNVAL, POLLERR) and
+ * the event's hang-up flag (POLLHUP). When a wait ends with nothing to
+ * report but such readiness — the descriptor has input nobody asked about —
+ * the wait goes on without that subscription for what is left of the
+ * timeout, as poll(2) would not have returned. */
+/* What a subscription of poll's is for, in the low bits of its userdata
+ * (the descriptor's index is above them). */
+static const uint64_t POLL_READ = 0, POLL_WRITE = 1, POLL_UNASKED = 2;
+
+static uint64_t poll_userdata(size_t index, uint64_t kind) { return (uint64_t)index << 2 | kind; }
+
+/* The monotonic clock, in nanoseconds. */
+static uint64_t poll_now(void) {
+    __wasi_timestamp_t now = 0;
+    (void)__wasi_clock_time_get(__WASI_CLOCKID_MONOTONIC, 1, &now);
+    return now;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
+    /* A descriptor whose unasked readiness ended a wait: left out of the
+     * waits that follow. */
+    std::vector<bool> quiet(nfds, false);
+    const bool bounded = timeout >= 0;
+    const uint64_t deadline = bounded ? poll_now() + (uint64_t)timeout * 1000000 : 0;
+    std::vector<__wasi_subscription_t> subs;
+    std::vector<__wasi_event_t> events;
+    for (;;) {
+        subs.clear();
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].fd < 0) continue;
+            /* POLLPRI is never reported: nothing here has priority data */
+            const short asked = fds[i].events & ~POLLPRI;
+            __wasi_subscription_t sub = {};
+            if (asked & POLLRDNORM) {
+                sub.userdata = poll_userdata(i, POLL_READ);
+                sub.u.tag = __WASI_EVENTTYPE_FD_READ;
+                sub.u.u.fd_read.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+            if (asked & POLLWRNORM) {
+                sub.userdata = poll_userdata(i, POLL_WRITE);
+                sub.u.tag = __WASI_EVENTTYPE_FD_WRITE;
+                sub.u.u.fd_write.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+            if (!(asked & POLLRDNORM) && !quiet[i]) {
+                sub.userdata = poll_userdata(i, POLL_UNASKED);
+                sub.u.tag = __WASI_EVENTTYPE_FD_READ;
+                sub.u.u.fd_read.file_descriptor = fds[i].fd;
+                subs.push_back(sub);
+            }
+        }
+        const bool watched = !subs.empty();
+        if (bounded || (!watched && nfds > 0)) {
+            /* The timeout; with nothing left to watch and none given, a
+             * wait a signal ends, as poll(2) waits on descriptors that
+             * report nothing. */
+            const uint64_t now = poll_now();
+            __wasi_subscription_t sub = {};
+            sub.userdata = UINT64_MAX;
+            sub.u.tag = __WASI_EVENTTYPE_CLOCK;
+            sub.u.u.clock.id = __WASI_CLOCKID_MONOTONIC;
+            sub.u.u.clock.timeout = bounded ? (deadline > now ? deadline - now : 0) : (uint64_t)1 << 62;
+            subs.push_back(sub);
+        }
+        if (subs.empty()) {
+            /* nothing at all to wait for: as wasi-libc */
+            errno = ENOTSUP;
+            return -1;
+        }
+        events.resize(subs.size());
+        size_t nevents = 0;
+        const __wasi_errno_t error = __wasi_poll_oneoff(subs.data(), events.data(), subs.size(), &nevents);
+        if (error != 0) {
+            errno = error;
+            return -1;
+        }
+        bool expired = false;
+        for (size_t e = 0; e < nevents; e++) {
+            const __wasi_event_t &ev = events[e];
+            if (ev.type == __WASI_EVENTTYPE_CLOCK) {
+                expired = expired || bounded;
+                continue;
+            }
+            const size_t i = (size_t)(ev.userdata >> 2);
+            const uint64_t kind = ev.userdata & 3;
+            if (i >= nfds) continue;
+            struct pollfd &p = fds[i];
+            if (ev.error == __WASI_ERRNO_BADF) {
+                p.revents |= POLLNVAL;
+            } else if (ev.error != 0) {
+                /* in error: the reader of the pipe it writes to has closed
+                 * it, and a write fails at once */
+                p.revents |= POLLERR;
+            } else {
+                const bool hangup = (ev.fd_readwrite.flags & __WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0;
+                if (kind == POLL_READ) p.revents |= POLLRDNORM;
+                if (kind == POLL_WRITE) p.revents |= POLLWRNORM;
+                if (hangup) p.revents |= POLLHUP;
+                /* readable, and nobody asked: not an event of poll's */
+                if (kind == POLL_UNASKED && !hangup) quiet[i] = true;
+            }
+        }
+        /* A socket whose peer has hung up is reported hung up and, when
+         * that was asked, writable (the write finds out), as on Linux. */
+        int ready = 0;
+        for (nfds_t i = 0; i < nfds; i++) {
+            if (fds[i].revents) ready++;
+        }
+        if (ready > 0 || expired) return ready;
+        if (bounded && poll_now() >= deadline) return 0;
+    }
 }
 
 } /* extern "C" */

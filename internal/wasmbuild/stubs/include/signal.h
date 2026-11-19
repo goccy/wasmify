@@ -66,6 +66,13 @@ struct sigaction {
 #define sa_sigaction __sa_handler.sa_sigaction
 #endif
 
+/* sigprocmask's how */
+#ifndef SIG_BLOCK
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+#endif
+
 /* Signal set manipulation */
 int sigemptyset(sigset_t *);
 int sigfillset(sigset_t *);

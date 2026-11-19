@@ -136,6 +136,44 @@ int getnameinfo(const struct sockaddr *__restrict, socklen_t,
 struct hostent *gethostbyname(const char *);
 struct hostent *gethostbyaddr(const void *, socklen_t, int);
 
+/* --- the networks, services and protocols databases --- */
+
+struct netent {
+    char         *n_name;
+    char        **n_aliases;
+    int           n_addrtype;
+    uint32_t      n_net;
+};
+struct servent {
+    char  *s_name;
+    char **s_aliases;
+    int    s_port;
+    char  *s_proto;
+};
+struct protoent {
+    char  *p_name;
+    char **p_aliases;
+    int    p_proto;
+};
+struct hostent  *gethostent(void);
+struct netent   *getnetent(void);
+struct netent   *getnetbyname(const char *);
+struct netent   *getnetbyaddr(uint32_t, int);
+struct servent  *getservent(void);
+struct servent  *getservbyname(const char *, const char *);
+struct servent  *getservbyport(int, const char *);
+struct protoent *getprotoent(void);
+struct protoent *getprotobyname(const char *);
+struct protoent *getprotobynumber(int);
+void sethostent(int);
+void endhostent(void);
+void setnetent(int);
+void endnetent(void);
+void setservent(int);
+void endservent(void);
+void setprotoent(int);
+void endprotoent(void);
+
 #ifdef __cplusplus
 }
 #endif

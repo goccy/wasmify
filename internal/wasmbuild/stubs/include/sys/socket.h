@@ -173,6 +173,18 @@
 #ifndef SHUT_RDWR
 #define SHUT_RDWR       2
 #endif
+/* shutdown(2)'s "how" is 0, 1 or 2 on every system, and programs pass the
+ * numbers themselves; wasi-libc gives the three names the bits of the WASI
+ * call instead (1, 2 and 3). With host sockets, shutdown() is wasmify's
+ * (host_sockets.cc), which takes the usual numbers and translates them. */
+#ifdef WASMIFY_HOST_SOCKETS
+#undef SHUT_RD
+#undef SHUT_WR
+#undef SHUT_RDWR
+#define SHUT_RD         0
+#define SHUT_WR         1
+#define SHUT_RDWR       2
+#endif
 
 /* --- CMSG macros --- */
 

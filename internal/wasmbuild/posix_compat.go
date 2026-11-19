@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-//go:embed stubs/include/sys/socket.h stubs/include/netdb.h stubs/include/signal.h stubs/include/stdio.h stubs/include/unistd.h stubs/include/stdlib.h stubs/include/__struct_in6_addr.h stubs/include/netinet/in.h stubs/include/time.h stubs/include/emscripten/version.h stubs/include/emscripten.h stubs/include/emscripten/console.h
+//go:embed stubs/include/sys/socket.h stubs/include/sys/time.h stubs/include/netdb.h stubs/include/signal.h stubs/include/stdio.h stubs/include/unistd.h stubs/include/stdlib.h stubs/include/__struct_in6_addr.h stubs/include/netinet/in.h stubs/include/time.h stubs/include/emscripten/version.h stubs/include/emscripten.h stubs/include/emscripten/console.h
 var posixCompatFS embed.FS
 
 // DeployPosixCompat extracts the always-on POSIX compatibility headers
@@ -699,41 +699,7 @@ int getrusage(int, struct rusage *);
 	"termios.h": {
 		Description: "Terminal I/O control API (tcgetattr, tcsetattr, struct termios).\n" +
 			"Used for configuring serial/terminal device parameters.",
-		Content: strings.TrimLeft(`
-#ifndef _WASMIFY_TERMIOS_H
-#define _WASMIFY_TERMIOS_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef unsigned int tcflag_t;
-typedef unsigned char cc_t;
-typedef unsigned int speed_t;
-
-#define NCCS 32
-
-struct termios {
-    tcflag_t c_iflag;
-    tcflag_t c_oflag;
-    tcflag_t c_cflag;
-    tcflag_t c_lflag;
-    cc_t     c_cc[NCCS];
-};
-
-#define TCSANOW   0
-#define TCSADRAIN 1
-#define TCSAFLUSH 2
-
-int tcgetattr(int, struct termios *);
-int tcsetattr(int, int, const struct termios *);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* _WASMIFY_TERMIOS_H */
-`, "\n"),
+		Content: hostSubprocessHeader("termios.h"),
 	},
 
 	"sys/mman.h": {
@@ -852,44 +818,7 @@ int select(int, fd_set *, fd_set *, fd_set *, struct timeval *);
 	"syslog.h": {
 		Description: "System logging API (openlog, syslog, closelog).\n" +
 			"Used for writing messages to the system log daemon.",
-		Content: strings.TrimLeft(`
-#ifndef _WASMIFY_SYSLOG_H
-#define _WASMIFY_SYSLOG_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#define LOG_EMERG   0
-#define LOG_ALERT   1
-#define LOG_CRIT    2
-#define LOG_ERR     3
-#define LOG_WARNING 4
-#define LOG_NOTICE  5
-#define LOG_INFO    6
-#define LOG_DEBUG   7
-
-#define LOG_KERN     (0<<3)
-#define LOG_USER     (1<<3)
-#define LOG_DAEMON   (3<<3)
-#define LOG_LOCAL0   (16<<3)
-#define LOG_LOCAL7   (23<<3)
-
-#define LOG_PID    0x01
-#define LOG_CONS   0x02
-#define LOG_NDELAY 0x08
-#define LOG_NOWAIT 0x10
-
-void openlog(const char *, int, int);
-void syslog(int, const char *, ...);
-void closelog(void);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* _WASMIFY_SYSLOG_H */
-`, "\n"),
+		Content: hostSubprocessHeader("syslog.h"),
 	},
 
 	"semaphore.h": {
