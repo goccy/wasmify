@@ -12,9 +12,9 @@
  * able to tell defines __wasmify_syslog_undelivered (wasmify_posix.h): it
  * is called, from openlog or syslog, for a message that was not delivered.
  *
- * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ * Compiled when the host capability system.logging is given (WASMIFY_HOST_SYSTEM_LOGGING).
  */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_SYSTEM_LOGGING
 
 #include <cerrno>
 #include <cstdarg>
@@ -109,4 +109,4 @@ int setlogmask(int mask) {
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_SYSTEM_LOGGING */

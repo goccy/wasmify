@@ -11,21 +11,21 @@ import (
 // proposal requires, plus the wasi_thread_start export wasm2go starts on a
 // goroutine).
 func TestHostThreadsTargetSwap(t *testing.T) {
-	cfg := WasmConfig{Target: "wasm32-wasip1", HostThreads: true}
+	cfg := WasmConfig{Target: "wasm32-wasip1", Host: hostWith("process.threads")}
 	if got := effectiveTarget(cfg); got != "wasm32-wasip1-threads" {
-		t.Errorf("effectiveTarget with HostThreads = %q, want wasm32-wasip1-threads", got)
+		t.Errorf("effectiveTarget with process.threads = %q, want wasm32-wasip1-threads", got)
 	}
-	cfg.HostThreads = false
+	cfg.Host = hostWith()
 	if got := effectiveTarget(cfg); got != "wasm32-wasip1" {
-		t.Errorf("effectiveTarget without HostThreads = %q, want wasm32-wasip1", got)
+		t.Errorf("effectiveTarget without process.threads = %q, want wasm32-wasip1", got)
 	}
 }
 
 func TestHostThreadsFlags(t *testing.T) {
-	cfg := WasmConfig{Target: "wasm32-wasip1", HostThreads: true, MaxMemoryPages: 2048}
+	cfg := WasmConfig{Target: "wasm32-wasip1", Host: hostWith("process.threads"), MaxMemoryPages: 2048}
 
 	compile := strings.Join(wasmCompileFlags(cfg), " ")
-	for _, want := range []string{"-DWASMIFY_HOST_THREADS", "-pthread"} {
+	for _, want := range []string{"-DWASMIFY_HOST_PROCESS_THREADS", "-DWASMIFY_HOST_THREADS", "-pthread"} {
 		if !strings.Contains(compile, want) {
 			t.Errorf("compile flags missing %q: %s", want, compile)
 		}
@@ -49,7 +49,7 @@ func TestHostThreadsFlags(t *testing.T) {
 func TestHostThreadsOffByDefault(t *testing.T) {
 	cfg := WasmConfig{Target: "wasm32-wasip1"}
 	all := strings.Join(wasmCompileFlags(cfg), " ") + " " + strings.Join(wasmLinkFlags(cfg), " ")
-	for _, unwanted := range []string{"-pthread", "shared-memory", "WASMIFY_HOST_THREADS", "max-memory"} {
+	for _, unwanted := range []string{"-pthread", "shared-memory", "WASMIFY_HOST_", "max-memory"} {
 		if strings.Contains(all, unwanted) {
 			t.Errorf("threads-off build leaked %q: %s", unwanted, all)
 		}
@@ -59,21 +59,21 @@ func TestHostThreadsOffByDefault(t *testing.T) {
 // A threads build with no explicit ceiling still declares one — a shared
 // memory without a maximum is invalid wasm.
 func TestHostThreadsDefaultMaxMemory(t *testing.T) {
-	cfg := WasmConfig{Target: "wasm32-wasip1", HostThreads: true}
+	cfg := WasmConfig{Target: "wasm32-wasip1", Host: hostWith("process.threads")}
 	link := strings.Join(wasmLinkFlags(cfg), " ")
 	if !strings.Contains(link, "-Wl,--max-memory=67108864") { // 1024 pages
 		t.Errorf("default max-memory missing: %s", link)
 	}
 }
 
-// Wasm64 and HostThreads compose: the combined flavor selects the
+// Wasm64 and process.threads compose: the combined flavor selects the
 // wasm64-wasip1-threads sysroot, whose archives carry both the 8-byte
 // pointer ABI and the atomics/bulk-memory features a --shared-memory
 // link demands.
 func TestWasm64ThreadsTargetSwap(t *testing.T) {
-	cfg := WasmConfig{Target: "wasm32-wasip1", Wasm64: true, HostThreads: true}
+	cfg := WasmConfig{Target: "wasm32-wasip1", Wasm64: true, Host: hostWith("process.threads")}
 	if got := effectiveTarget(cfg); got != "wasm64-wasip1-threads" {
-		t.Errorf("effectiveTarget with Wasm64+HostThreads = %q, want wasm64-wasip1-threads", got)
+		t.Errorf("effectiveTarget with Wasm64+process.threads = %q, want wasm64-wasip1-threads", got)
 	}
 	// The threads link flags apply unchanged in the wasm64 flavor.
 	flags := strings.Join(wasmLinkFlags(cfg), " ")

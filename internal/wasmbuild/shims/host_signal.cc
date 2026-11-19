@@ -28,9 +28,10 @@
  * Signal masks cross to the host as 64-bit values in which signal n is bit
  * n-1.
  *
- * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ * Compiled when the host capability signals is given (WASMIFY_HOST_SIGNALS);
+ * the interval timer with signals.timers (WASMIFY_HOST_SIGNALS_TIMERS).
  */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_SIGNALS
 #include <signal.h>
 #include <sys/time.h>
 #include <cerrno>
@@ -45,6 +46,7 @@
 
 extern "C" {
 
+#ifdef WASMIFY_HOST_SIGNALS_TIMERS
 /* The real-time interval timer. state receives what the timer was before
  * the call: the nanoseconds until it fires next (0: not set) and its reload
  * interval (0: it fires once). When set is non-zero the timer is replaced
@@ -54,11 +56,17 @@ struct __wasmify_timer_state {
     uint64_t left_ns;
     uint64_t interval_ns;
 };
+#endif
 } /* extern "C" */
 
 namespace {
 
 typedef void (*handler_t)(int);
+
+int fail(int error) {
+    errno = error;
+    return -1;
+}
 
 inline uint64_t sig_bit(int sig) { return (uint64_t)1 << (sig - 1); }
 inline bool sig_valid(int sig) { return sig >= 1 && sig < NSIG; }
@@ -236,6 +244,7 @@ void wait_for_signal() {
     }
 }
 
+#ifdef WASMIFY_HOST_SIGNALS_TIMERS
 /* ---- interval timer times -------------------------------------------------- */
 const uint64_t kNanosPerSecond = 1000000000ull;
 
@@ -264,6 +273,7 @@ struct timeval timeval_of(uint64_t nanos) {
     tv.tv_usec = (suseconds_t)micros;
     return tv;
 }
+#endif
 
 } /* namespace */
 
@@ -478,6 +488,7 @@ void abort(void) {
     __wasmify_host_proc_terminate(SIGABRT);
 }
 
+#ifdef WASMIFY_HOST_SIGNALS_TIMERS
 /* ---- the interval timer ---------------------------------------------------
  * One timer, kept by the host, behind all four functions: alarm and ualarm
  * are setitimer(ITIMER_REAL) with their own units, as POSIX describes them.
@@ -535,6 +546,7 @@ int setitimer(int which, const struct itimerval *next, struct itimerval *old) {
     }
     return 0;
 }
+#endif
 
 /* What the host is to know of this process's signals, told again: an
  * instance may be a copy of one that told it before — made from a
@@ -579,6 +591,44 @@ int __wasmify_signal_wait_mask(int begin, uint64_t mask, uint64_t *old) {
     return g_handler_runs != runs;
 }
 
+/* ---- kill ------------------------------------------------------------------ */
+int kill(pid_t pid, int sig) {
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* A signal to the process itself is the host's to deliver when the
+     * process is one the host knows by that pid: the host process, whose
+     * action for the signal may be native code's handler and not the
+     * program's, or a fork child. It is delivered by the time kill
+     * returns either way. Otherwise (no host process has the pid: the
+     * program is a process of its own) it is delivered here and now
+     * (raise). Any other process, and a process group (a pid of 0
+     * or less), is the host's to find. */
+    if (pid > 0 && pid == getpid()) {
+        if (sig == 0) return 0;
+        const int rc = __wasmify_host_proc_kill((int)pid, sig);
+        if (rc == 0) return 0;
+        if (rc != -ESRCH && rc != ESRCH) {
+            errno = rc < 0 ? -rc : rc;
+            return -1;
+        }
+        return raise(sig);
+    }
+    int rc = __wasmify_host_proc_kill((int)pid, sig);
+    if (rc != 0) {
+        errno = rc < 0 ? -rc : rc;
+        return -1;
+    }
+    return 0;
+}
+
+int killpg(pid_t pgrp, int sig) {
+    if (pgrp < 0) return fail(EINVAL);
+    /* group 0 is the caller's own, as kill has it */
+    return kill(pgrp > 1 ? -pgrp : 0, sig);
+}
+
 /* ---- the SIGPIPE of a write ----------------------------------------------
  * A write into a pipe or socket nobody reads any more fails with EPIPE, and
  * the host posts the program SIGPIPE as well. The kernel delivers that
@@ -617,4 +667,4 @@ extern "C" ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_SIGNALS */

@@ -8,7 +8,7 @@ import (
 	"github.com/goccy/wasmify/internal/buildjson"
 )
 
-// A target-triple change (wasm_build.wasm64 flipped, HostThreads
+// A target-triple change (wasm_build.wasm64 flipped, process.threads
 // toggled) must discard the whole cache: steps whose command lines
 // never mention the target — llvm-ar archives — would otherwise keep
 // serving outputs of the previous width and the link fails on a

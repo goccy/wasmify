@@ -1,13 +1,13 @@
 /* host_subprocess.cc — generic host-provided subprocess shim.
  *
  * This translation unit is deployed and compiled by wasmify itself, and only
- * when host subprocess support is opted in (bridge.HostSubprocess in
- * wasmify.json, which makes wasmify define WASMIFY_HOST_SUBPROCESS for this
- * compile). Without that opt-in the file is excluded entirely and the wasm
- * stays portable (standard wasi imports only).
+ * when the host capability process.spawn is given (wasmify.json's "host",
+ * which makes wasmify define WASMIFY_HOST_PROCESS_SPAWN for this compile).
+ * Without it the file is excluded entirely and the wasm stays portable
+ * (standard wasi imports only).
  *
  * WASI preview1 cannot spawn processes and wasi-libc provides no posix_spawn
- * or waitpid. When host subprocess support is opted in, we DEFINE the
+ * or waitpid. With process.spawn, we DEFINE the
  * posix_spawn family + waitpid here, backed by proc_spawn/proc_wait host
  * imports the WASI host implements in Go (e.g. via os/exec). A consuming
  * library's subprocess implementation that routes onto posix_spawn therefore
@@ -20,7 +20,7 @@
  * ends as the child's stdout/stderr. Other file actions and the attr object
  * carry no state and are no-ops. The spawned program is a HOST binary, gated
  * by the host's exec whitelist. */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
 
 #include <fcntl.h>
 #include <spawn.h>
@@ -37,99 +37,6 @@
 #include "wasmify_posix.h"
 
 extern "C" {
-
-/* A POSIX record lock as fd_lock passes it: type 0 F_RDLCK, 1 F_WRLCK,
- * 2 F_UNLCK; whence 0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END. */
-struct __wasmify_record_lock {
-    int32_t type;
-    int32_t whence;
-    int64_t start;
-    int64_t len;
-    int32_t pid;
-    int32_t pad;
-};
-
-extern int __real_fcntl(int fd, int cmd, ...);
-
-/* The C library names the record locks and F_DUPFD where it has them: the
- * wasm64 build of wasi-libc does, wasm32's does not (a program there cannot
- * ask for them, and the requests below are only recognized where they have
- * names). */
-#ifdef F_GETLK
-/* fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW) on the host's file
- * behind fd, which wasi-libc refuses (ENOTSUP). */
-static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
-    if (fl == nullptr) { errno = EFAULT; return -1; }
-    struct __wasmify_record_lock lk;
-    memset(&lk, 0, sizeof(lk));
-    switch (fl->l_type) {
-    case F_RDLCK: lk.type = 0; break;
-    case F_WRLCK: lk.type = 1; break;
-    case F_UNLCK: lk.type = 2; break;
-    default: errno = EINVAL; return -1;
-    }
-    switch (fl->l_whence) {
-    case SEEK_SET: lk.whence = 0; break;
-    case SEEK_CUR: lk.whence = 1; break;
-    case SEEK_END: lk.whence = 2; break;
-    default: errno = EINVAL; return -1;
-    }
-    lk.start = fl->l_start;
-    lk.len = fl->l_len;
-    const int rc = __wasmify_host_fd_lock(fd, cmd == F_GETLK ? 0 : cmd == F_SETLK ? 1 : 2, &lk);
-    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
-    if (cmd == F_GETLK) {
-        static const short types[3] = {F_RDLCK, F_WRLCK, F_UNLCK};
-        static const short whences[3] = {SEEK_SET, SEEK_CUR, SEEK_END};
-        fl->l_type = types[lk.type >= 0 && lk.type <= 2 ? lk.type : 2];
-        fl->l_whence = whences[lk.whence >= 0 && lk.whence <= 2 ? lk.whence : 0];
-        fl->l_start = lk.start;
-        fl->l_len = lk.len;
-        fl->l_pid = lk.pid;
-    }
-    return 0;
-}
-#endif
-
-/* fcntl: wasi-libc answers F_GETFD with FD_CLOEXEC and drops F_SETFD — a
- * WASI process starts no commands, so nothing is ever inherited. With host
- * subprocesses a command does inherit the descriptors that are not marked
- * (the host hands them over under their numbers), so the flag is real and
- * the host keeps it. F_DUPFD and F_DUPFD_CLOEXEC duplicate the descriptor
- * under the lowest free number from the one given, and the record locks are
- * the host's (both of which wasi-libc refuses). Every other request is
- * libc's. (The link routes fcntl here: -Wl,--wrap=fcntl.) */
-int __wrap_fcntl(int fd, int cmd, ...) {
-    va_list ap;
-    va_start(ap, cmd);
-#ifdef F_GETLK
-    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
-        struct flock *fl = va_arg(ap, struct flock *);
-        va_end(ap);
-        return __wasmify_fcntl_lock(fd, cmd, fl);
-    }
-#endif
-    const int arg = va_arg(ap, int);
-    va_end(ap);
-#ifdef F_DUPFD
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        if (arg < 0) { errno = EINVAL; return -1; }
-        int nfd = -1;
-        const int rc = __wasmify_host_fd_dupfd(fd, arg, &nfd);
-        if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
-        if (cmd == F_DUPFD_CLOEXEC) {
-            int old = 0;
-            (void)__wasmify_host_fd_cloexec(nfd, 1, 1, &old);
-        }
-        return nfd;
-    }
-#endif
-    if (cmd != F_GETFD && cmd != F_SETFD) return __real_fcntl(fd, cmd, arg);
-    int old = 0;
-    const int rc = __wasmify_host_fd_cloexec(fd, cmd == F_SETFD, (arg & FD_CLOEXEC) != 0, &old);
-    if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
-    return cmd == F_GETFD ? (old ? FD_CLOEXEC : 0) : 0;
-}
 
 /* dup()/dup2()/dup3(): wasi-libc has neither (WASI preview1 has only
  * fd_renumber, whose move semantics close the source). The host imports
@@ -318,78 +225,10 @@ pid_t wait(int *wstatus) {
 
 } /* extern "C" */
 
-/* ---- kill, times, exec, closefrom ---------------------------------------- */
-#include <signal.h>
-#include <sys/times.h>
-#include <time.h>
-
+/* ---- exec, closefrom ------------------------------------------------------ */
 extern char **environ;
 
 extern "C" {
-
-int kill(pid_t pid, int sig) {
-    if (sig < 0 || sig >= NSIG) {
-        errno = EINVAL;
-        return -1;
-    }
-    /* A signal to the process itself is the host's to deliver when the
-     * process is one the host knows by that pid: the host process, whose
-     * action for the signal may be native code's handler and not the
-     * program's, or a fork child. It is delivered by the time kill
-     * returns either way. Otherwise (no host process has the pid: the
-     * program is a process of its own) it is delivered here and now
-     * (host_signal.cc). Any other process, and a process group (a pid of 0
-     * or less), is the host's to find. */
-    if (pid > 0 && pid == getpid()) {
-        if (sig == 0) return 0;
-        const int rc = __wasmify_host_proc_kill((int)pid, sig);
-        if (rc == 0) return 0;
-        if (rc != -ESRCH && rc != ESRCH) {
-            errno = rc < 0 ? -rc : rc;
-            return -1;
-        }
-        return raise(sig);
-    }
-    int rc = __wasmify_host_proc_kill((int)pid, sig);
-    if (rc != 0) {
-        errno = rc < 0 ? -rc : rc;
-        return -1;
-    }
-    return 0;
-}
-
-/* times(2). wasi-libc's emulation reports process time in clock()'s unit,
- * nanoseconds, while times reports it in clock ticks (sysconf(_SC_CLK_TCK),
- * the unit a caller divides by). This one reports in that unit, and what
- * the host accounts to the process: user and system time, its own and its
- * children's. Where the host keeps no such account the process time is the
- * emulated clock's: time elapsed since the instance started, all of it user
- * time. */
-clock_t times(struct tms *buf) {
-    const long ticks_per_sec = sysconf(_SC_CLK_TCK);
-    if (ticks_per_sec <= 0) {
-        errno = ENOSYS; /* the C library has no unit */
-        return (clock_t)-1;
-    }
-    const clock_t elapsed = (clock_t)((long long)clock() * ticks_per_sec / CLOCKS_PER_SEC);
-    uint64_t nanos[4] = {0, 0, 0, 0};
-    const bool accounted = __wasmify_host_proc_times(nanos) == 0;
-    if (buf) {
-        if (accounted) {
-            const uint64_t per_tick = 1000000000ull / (uint64_t)ticks_per_sec;
-            buf->tms_utime = (clock_t)(nanos[0] / per_tick);
-            buf->tms_stime = (clock_t)(nanos[1] / per_tick);
-            buf->tms_cutime = (clock_t)(nanos[2] / per_tick);
-            buf->tms_cstime = (clock_t)(nanos[3] / per_tick);
-        } else {
-            buf->tms_utime = elapsed;
-            buf->tms_stime = 0;
-            buf->tms_cutime = 0;
-            buf->tms_cstime = 0;
-        }
-    }
-    return elapsed;
-}
 
 /* closefrom(2): closes every descriptor from low_fd up. */
 void closefrom(int low_fd) { (void)__wasmify_host_fd_closefrom(low_fd); }
@@ -462,4 +301,4 @@ int execvp(const char *file, char *const argv[]) {
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_PROCESS_SPAWN */

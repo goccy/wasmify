@@ -83,7 +83,8 @@ int __wasmify_host_fd_flock(int fd, int lock, int wait);
 WASMIFY_POSIX_IMPORT(fd_path)
 int __wasmify_host_fd_path(int fd, char *buf, int buf_len, int *length);
 
-/* ---- descriptors and processes (host_subprocess.cc) --------------------- */
+/* ---- descriptors and processes (host_subprocess.cc, host_fcntl.cc,
+ *      host_signal.cc for kill, host_process.cc for times) -------------- */
 WASMIFY_POSIX_IMPORT(proc_spawn)
 int __wasmify_host_proc_spawn(const char *path, char *const argv[], char *const envp[],
                               int stdin_fd, int stdout_fd, int stderr_fd, const char *cwd,
@@ -143,7 +144,8 @@ void __wasmify_host_proc_terminate(int sig);
 WASMIFY_POSIX_IMPORT(proc_times)
 int __wasmify_host_proc_times(uint64_t times[4]);
 
-/* ---- who the process is (host_process.cc) ------------------------------- */
+/* ---- the process, its user and groups, the system (host_process.cc,
+ *      host_users.cc, host_system.cc) ------------------------------------ */
 WASMIFY_POSIX_IMPORT(proc_ids)
 int __wasmify_host_proc_ids(uint32_t ids[6]);
 WASMIFY_POSIX_IMPORT(proc_groups)

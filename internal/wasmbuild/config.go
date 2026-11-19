@@ -3,6 +3,8 @@ package wasmbuild
 import (
 	"os"
 	"strings"
+
+	"github.com/goccy/wasmify/internal/hostcap"
 )
 
 // DefaultStackSize is the default wasm stack size in bytes (32 MB).
@@ -27,34 +29,32 @@ const DefaultMaxMemoryPages = 1024
 
 // WasmConfig holds configuration for wasm build transformation and execution.
 type WasmConfig struct {
-	WasiSDKPath         string   // Path to wasi-sdk installation
-	Target              string   // Target triple (default: "wasm32-wasi")
-	BuildDir            string   // Output directory for wasm build artifacts
-	NoEntry             bool     // Library mode (no _start entry point)
-	AllowUndefined      bool     // Allow undefined symbols (for host-provided imports)
-	DryRun              bool     // Only generate wasm-build.json without executing
-	NoCache             bool     // Disable build cache
-	PosixCompatDir      string   // Path to POSIX compatibility headers (injected via -isystem)
-	HostIncludeDir      string   // Path to build-local host-capability stub headers (spawn.h/sys/wait.h for HostSubprocess, netdb.h for HostSockets), injected via -I on every compile when either is on
-	ProjectRoot         string   // Absolute project root; added to the bridge compile -I so generated api_bridge.cc's project-relative includes (e.g. "embed/foo.h") resolve
-	CustomBridgeSources []string // Absolute paths to the project's hand-written bridge implementation sources (declared in wasmify.json bridge.CustomBridgeSources); each is compiled and linked, with -I of its own dir so its sibling-relative includes resolve
-	StackSize           int      // Wasm stack size in bytes (default: DefaultStackSize)
-	HostSockets         bool     // Opt-in: define WASMIFY_HOST_SOCKETS for every wasm-build compile + add HostIncludeDir (netdb.h) to -I (host-provided outbound sockets)
-	HostSubprocess      bool     // Opt-in: define WASMIFY_HOST_SUBPROCESS for every wasm-build compile + add HostIncludeDir to -I (host-provided process spawn)
-	HostFS              bool     // Opt-in: define WASMIFY_HOST_FS for every wasm-build compile + wrap chmod/fchmod/stat/lstat/fstat/open/mkdir/chdir at link (host-backed file modes, owners, umask and flock; normalized cwd)
-	HostThreads         bool     // Opt-in: build for wasm32-wasi-threads — -pthread + shared memory + atomics, define WASMIFY_HOST_THREADS (host-provided threads: wasm2go runs each guest thread on a goroutine)
-	Wasm64              bool     // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; incompatible with HostThreads; mirrors WASMIFY_WASM64
-	OptLevel            string   // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
-	MaxMemoryPages      int      // Threads only: the shared memory's declared maximum in the wasm binary, in 64 KiB pages (default DefaultMaxMemoryPages). Mandatory for a threads build (the WebAssembly threads proposal requires a bounded shared memory). A conventional VM enforces it as the memory.grow cap; the wasm2go backend instead honors the embedding host's own runtime cap, which overrides this baked value.
-	KeepSymbols         bool     // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
-	NoPosixCompat       bool     // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT
-	NoEmscriptenDefine  bool     // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
-	ExtraLDFlags        []string // Extra linker flags appended to every (non-skipped) link step, e.g. -Wl,--wrap=connect; mirrors WASMIFY_EXTRA_LDFLAGS
-	ExtraLDFlagsWasm32  []string // Appended after ExtraLDFlags on wasm32 links only (wasmify.json wasm_build.extra_ldflags_wasm32) — width-specific artifacts like a vendored wasm32 -L tree
-	ExtraLDFlagsWasm64  []string // Appended after ExtraLDFlags on wasm64 links only (wasmify.json wasm_build.extra_ldflags_wasm64)
-	BridgeExtraIncludes []string // Extra -I directories for compiling the generated/custom bridge sources; mirrors WASMIFY_BRIDGE_EXTRA_INCLUDES
-	ExtraCXXFlags       []string // Extra compile flags for the bridge sources, appended last so they override wasmify's defaults (wasmify.json wasm_build.extra_cxxflags); mirrors WASMIFY_EXTRA_CXXFLAGS
-	PrebuiltArchives    []string // Absolute paths to already-compiled wasm32-wasi .a files linked after the build tree's own archives (wasmify.json wasm_build.prebuilt_archives); mirrors WASMIFY_PREBUILT_ARCHIVES
+	WasiSDKPath         string          // Path to wasi-sdk installation
+	Target              string          // Target triple (default: "wasm32-wasi")
+	BuildDir            string          // Output directory for wasm build artifacts
+	NoEntry             bool            // Library mode (no _start entry point)
+	AllowUndefined      bool            // Allow undefined symbols (for host-provided imports)
+	DryRun              bool            // Only generate wasm-build.json without executing
+	NoCache             bool            // Disable build cache
+	PosixCompatDir      string          // Path to POSIX compatibility headers (injected via -isystem)
+	HostIncludeDir      string          // Path to the build-local headers of the host capabilities (wasmify_posix.h, and spawn.h, netdb.h, termios.h, ... for the parts given), injected via -I on every compile when a capability is given
+	ProjectRoot         string          // Absolute project root; added to the bridge compile -I so generated api_bridge.cc's project-relative includes (e.g. "embed/foo.h") resolve
+	CustomBridgeSources []string        // Absolute paths to the project's hand-written bridge implementation sources (declared in wasmify.json bridge.CustomBridgeSources); each is compiled and linked, with -I of its own dir so its sibling-relative includes resolve
+	StackSize           int             // Wasm stack size in bytes (default: DefaultStackSize)
+	Host                hostcap.Set     // The host capabilities (wasmify.json "host"): which host shims, headers, -D macros and link wraps the build gets (see hostParts); process.threads builds for wasi-threads (-pthread, shared memory, atomics; wasm2go runs each guest thread on a goroutine). Resolved with HostAliases by ResolveHost
+	HostAliases         hostcap.Aliases // The deprecated bridge flags HostFS/HostSockets/HostSubprocess/HostThreads and their WASMIFY_HOST_* variables; ResolveHost folds them into Host (giving them and the tree is an error)
+	Wasm64              bool            // Opt-in (wasmify.json wasm_build.wasm64): build for wasm64-wasip1 (memory64, 8-byte pointers, >4GiB linear memory); provisions the wasm64 sysroot on demand; mirrors WASMIFY_WASM64
+	OptLevel            string          // Optimization level for every wasm compile and the link ("-O0".."-O3", "-Os", "-Oz"); empty means the -Oz default (wasmify.json wasm_build.opt_level; mirrors WASMIFY_OPT_LEVEL)
+	MaxMemoryPages      int             // Threads only: the shared memory's declared maximum in the wasm binary, in 64 KiB pages (default DefaultMaxMemoryPages). Mandatory for a threads build (the WebAssembly threads proposal requires a bounded shared memory). A conventional VM enforces it as the memory.grow cap; the wasm2go backend instead honors the embedding host's own runtime cap, which overrides this baked value.
+	KeepSymbols         bool            // Opt-in (wasmify.json wasm_build.keep_symbols): skip -Wl,--strip-all so the final wasm keeps its name section
+	NoPosixCompat       bool            // Skip the POSIX-compat stub headers (wasi-native projects whose code the bare sysroot already backs); mirrors WASMIFY_NO_POSIX_COMPAT
+	NoEmscriptenDefine  bool            // Skip the implicit -D__EMSCRIPTEN__ (wasi-native projects with real #ifdef __EMSCRIPTEN__ branches); mirrors WASMIFY_NO_EMSCRIPTEN_DEFINE
+	ExtraLDFlags        []string        // Extra linker flags appended to every (non-skipped) link step, e.g. -Wl,--wrap=connect; mirrors WASMIFY_EXTRA_LDFLAGS
+	ExtraLDFlagsWasm32  []string        // Appended after ExtraLDFlags on wasm32 links only (wasmify.json wasm_build.extra_ldflags_wasm32) — width-specific artifacts like a vendored wasm32 -L tree
+	ExtraLDFlagsWasm64  []string        // Appended after ExtraLDFlags on wasm64 links only (wasmify.json wasm_build.extra_ldflags_wasm64)
+	BridgeExtraIncludes []string        // Extra -I directories for compiling the generated/custom bridge sources; mirrors WASMIFY_BRIDGE_EXTRA_INCLUDES
+	ExtraCXXFlags       []string        // Extra compile flags for the bridge sources, appended last so they override wasmify's defaults (wasmify.json wasm_build.extra_cxxflags); mirrors WASMIFY_EXTRA_CXXFLAGS
+	PrebuiltArchives    []string        // Absolute paths to already-compiled wasm32-wasi .a files linked after the build tree's own archives (wasmify.json wasm_build.prebuilt_archives); mirrors WASMIFY_PREBUILT_ARCHIVES
 }
 
 // envSet reports whether an environment variable carries a value. Presence —
@@ -72,17 +72,18 @@ func envSet(key string) bool {
 // once, right after cfg has been populated from wasmify.json / state, so the
 // resolved options flow everywhere downstream.
 func (c *WasmConfig) ApplyEnvOverrides() {
+	// the deprecated host flags (see hostcap.Aliases)
 	if envSet("WASMIFY_HOST_SOCKETS") {
-		c.HostSockets = true
+		c.HostAliases.Sockets = true
 	}
 	if envSet("WASMIFY_HOST_SUBPROCESS") {
-		c.HostSubprocess = true
+		c.HostAliases.Subprocess = true
 	}
 	if envSet("WASMIFY_HOST_FS") {
-		c.HostFS = true
+		c.HostAliases.FS = true
 	}
 	if envSet("WASMIFY_HOST_THREADS") {
-		c.HostThreads = true
+		c.HostAliases.Threads = true
 	}
 	if envSet("WASMIFY_WASM64") {
 		c.Wasm64 = true
@@ -117,6 +118,26 @@ func (c *WasmConfig) ApplyEnvOverrides() {
 	}
 }
 
+// ResolveHost makes Host the capabilities of the build: the tree, or what
+// the deprecated aliases stand for (see hostcap.Resolve). Call it once Host
+// and HostAliases have been set from wasmify.json and the environment
+// (ApplyEnvOverrides); it refuses a tree given with an alias and a feature
+// without what it needs.
+func (c *WasmConfig) ResolveHost() error {
+	host, err := hostcap.Resolve(c.Host, c.HostAliases)
+	if err != nil {
+		return err
+	}
+	c.Host = host
+	c.HostAliases = hostcap.Aliases{}
+	return nil
+}
+
+// Threads reports whether the build is given threads (process.threads).
+func (c WasmConfig) Threads() bool {
+	return c.Host.Feature(hostcap.Process, "threads")
+}
+
 // DefaultConfig returns a WasmConfig with sensible defaults.
 func DefaultConfig() WasmConfig {
 	return WasmConfig{
@@ -134,43 +155,13 @@ func DefaultConfig() WasmConfig {
 // libraries resolve from.
 func (c WasmConfig) EffectiveExtraLDFlags() []string {
 	flags := append([]string(nil), c.ExtraLDFlags...)
-	if c.HostFS {
-		// The host-fs shim provides __wrap_ definitions for these; the
-		// wrap flags route every libc caller through them (see
-		// shims/host_fs.cc for why plain symbol shadowing cannot work
-		// for chdir, whose libc definition shares an object with the
-		// cwd bookkeeping globals).
-		flags = append(flags,
-			"-Wl,--wrap=chmod",
-			"-Wl,--wrap=fchmod",
-			"-Wl,--wrap=stat",
-			"-Wl,--wrap=lstat",
-			"-Wl,--wrap=fstat",
-			"-Wl,--wrap=open",
-			"-Wl,--wrap=mkdir",
-			"-Wl,--wrap=chdir",
-			"-Wl,--wrap=access",
-			"-Wl,--wrap=faccessat",
-			"-Wl,--wrap=__wasilibc_find_relpath_alloc",
-		)
-	}
-	if c.HostSubprocess {
-		// The host-subprocess shim keeps the close-on-exec flag of a
-		// descriptor with the host (see shims/host_subprocess.cc); libc's
-		// fcntl has to come through it. The environment is libc's table,
-		// whose changes the host is told about (shims/host_process.cc), and
-		// a write that fails with EPIPE delivers the SIGPIPE the host
-		// posted before it returns (shims/host_signal.cc).
-		flags = append(flags,
-			"-Wl,--wrap=fcntl",
-			"-Wl,--wrap=setenv",
-			"-Wl,--wrap=unsetenv",
-			"-Wl,--wrap=putenv",
-			"-Wl,--wrap=clearenv",
-			"-Wl,--wrap=write",
-			"-Wl,--wrap=writev",
-			"-Wl,--wrap=send",
-		)
+	// The host shims provide __wrap_ definitions of libc functions; the wrap
+	// flags route every libc caller through them, per capability part (see
+	// hostParts; shims/host_fs.cc says why plain symbol shadowing cannot
+	// work for chdir, whose libc definition shares an object with the cwd
+	// bookkeeping globals).
+	for _, name := range hostWraps(c.Host) {
+		flags = append(flags, "-Wl,--wrap="+name)
 	}
 	if c.Wasm64 {
 		return append(flags, c.ExtraLDFlagsWasm64...)

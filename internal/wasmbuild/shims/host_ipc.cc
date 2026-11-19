@@ -11,9 +11,9 @@
  * the program's: shmat fails with EINVAL, and a program copies between a
  * segment and its own memory with shm_copy instead.
  *
- * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ * Compiled when the host capability ipc.sysv is given (WASMIFY_HOST_IPC_SYSV).
  */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_IPC_SYSV
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -150,4 +150,4 @@ key_t ftok(const char *path, int id) {
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_IPC_SYSV */

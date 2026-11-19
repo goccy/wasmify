@@ -1,0 +1,146 @@
+package hostcap
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func parse(t *testing.T, text string) (Set, error) {
+	t.Helper()
+	var s Set
+	err := json.Unmarshal([]byte(text), &s)
+	return s, err
+}
+
+// A capability given as true has all its features; one given as an object
+// has the features set true in it and its base; false and a missing key
+// give nothing.
+func TestSetFromJSON(t *testing.T) {
+	s, err := parse(t, `{"network": true, "process": {"spawn": true, "fork": false}, "terminal": {}, "ipc": false}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"sockets", "resolver"} {
+		if !s.Feature(Network, f) {
+			t.Errorf("network.%s not given by network: true", f)
+		}
+	}
+	if !s.Feature(Process, "spawn") || s.Feature(Process, "fork") || s.Feature(Process, "threads") {
+		t.Errorf("process: spawn %v fork %v threads %v; want true false false",
+			s.Feature(Process, "spawn"), s.Feature(Process, "fork"), s.Feature(Process, "threads"))
+	}
+	if !s.Has(Terminal) || s.Feature(Terminal, "pseudo") {
+		t.Errorf("terminal: {} gives the base alone, got has %v pseudo %v", s.Has(Terminal), s.Feature(Terminal, "pseudo"))
+	}
+	if s.Has(IPC) || s.Has(Users) {
+		t.Errorf("ipc: false or a missing users gives the capability")
+	}
+}
+
+func TestSetFromJSONErrors(t *testing.T) {
+	for _, tt := range []struct{ text, want string }{
+		{`{"net": true}`, `no capability "net"`},
+		{`{"network": {"socket": true}}`, `host.network: no feature "socket"`},
+		{`{"network": 1}`, `host.network: want true, false or an object`},
+		{`{"network": {"sockets": "yes"}}`, `host.network.sockets: want true or false`},
+		{`[]`, `host:`},
+	} {
+		if _, err := parse(t, tt.text); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%s: error %v, want one containing %q", tt.text, err, tt.want)
+		}
+	}
+}
+
+// What the JSON says comes back from the JSON written.
+func TestSetJSONRoundTrip(t *testing.T) {
+	s, err := parse(t, `{"filesystem": true, "process": {"spawn": true, "resources": true}, "signals": {}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"filesystem":true,"process":{"spawn":true,"resources":true},"signals":{}}`; string(data) != want {
+		t.Errorf("marshal: %s, want %s", data, want)
+	}
+	back, err := parse(t, string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(back, s) {
+		t.Errorf("round trip: %v, want %v", back, s)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	for _, tt := range []struct{ text, want string }{
+		{`{"process": {"job_control": true}}`, "process.job_control needs terminal"},
+		{`{"process": {"fork": true}}`, "process.fork needs process.spawn"},
+		{`{"signals": true}`, "signals needs process"},
+		{`{"system": {"logging": true}}`, "system.logging needs process"},
+		{`{"system": {"info": true, "time_zones": true}}`, ""},
+		{`{"process": {"job_control": true, "spawn": true, "fork": true}, "terminal": {}}`, ""},
+		{`{"process": true, "terminal": true}`, ""},
+	} {
+		s, err := parse(t, tt.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Validate()
+		switch {
+		case tt.want == "" && err != nil:
+			t.Errorf("%s: %v", tt.text, err)
+		case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+			t.Errorf("%s: error %v, want one containing %q", tt.text, err, tt.want)
+		}
+	}
+}
+
+// The deprecated bridge flags stand for the features they covered; giving
+// them and the tree is an error.
+func TestResolveAliases(t *testing.T) {
+	s, err := Resolve(Set{}, Aliases{FS: true, Sockets: true, Subprocess: true, Threads: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range [][2]string{
+		{Filesystem, "attributes"}, {Filesystem, "locking"}, {Network, "sockets"}, {Network, "resolver"},
+		{Process, "spawn"}, {Process, "threads"},
+	} {
+		if !s.Feature(f[0], f[1]) {
+			t.Errorf("the aliases do not give %s.%s", f[0], f[1])
+		}
+	}
+	if s.Feature(Filesystem, "fifo") || s.Feature(Process, "fork") || s.Has(Signals) {
+		t.Errorf("the aliases give more than they covered: %v", s.Macros())
+	}
+	var tree Set
+	tree.Enable(Network, "sockets")
+	if _, err := Resolve(tree, Aliases{Sockets: true}); err == nil || !strings.Contains(err.Error(), "not both") {
+		t.Errorf("tree and alias: error %v, want one saying not both", err)
+	}
+	if got, err := Resolve(tree, Aliases{}); err != nil || !got.Feature(Network, "sockets") {
+		t.Errorf("tree alone: %v, %v", got, err)
+	}
+	var bad Set
+	bad.Enable(Process, "fork")
+	if _, err := Resolve(bad, Aliases{}); err == nil {
+		t.Error("Resolve does not validate")
+	}
+}
+
+func TestMacros(t *testing.T) {
+	var s Set
+	s.Enable(Network, "sockets")
+	s.Enable(System, "time_zones")
+	want := []string{
+		"WASMIFY_HOST_NETWORK", "WASMIFY_HOST_NETWORK_SOCKETS", "WASMIFY_HOST_SOCKETS",
+		"WASMIFY_HOST_SYSTEM", "WASMIFY_HOST_SYSTEM_TIME_ZONES",
+	}
+	if got := s.Macros(); !reflect.DeepEqual(got, want) {
+		t.Errorf("macros %v, want %v", got, want)
+	}
+}

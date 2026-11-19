@@ -1,10 +1,15 @@
 /* host_fs.cc — generic filesystem-fidelity shim.
  *
  * This translation unit is deployed and compiled by wasmify itself, and only
- * when host filesystem fidelity is opted in (bridge.HostFS in wasmify.json,
- * which makes wasmify define WASMIFY_HOST_FS for this compile and add the
- * matching -Wl,--wrap= flags to every link). Without the opt-in the file is
+ * when the host capability filesystem is given (wasmify.json's "host",
+ * which makes wasmify define WASMIFY_HOST_FILESYSTEM for this compile and
+ * add the matching -Wl,--wrap= flags to every link). Without it the file is
  * excluded entirely and the wasm stays portable (standard wasi imports only).
+ * The file system itself brings the working directory as the kernel keeps
+ * it, the refusal of the empty path, fchdir, chroot and mkstemp; the modes,
+ * owners, umask and timestamps come with filesystem.attributes, flock with
+ * filesystem.locking (the record locks of fcntl are host_fcntl.cc's), and
+ * mkfifo with filesystem.fifo.
  *
  * WASI preview1 has no file modes, owners, creation masks or locks: nothing
  * can change a mode, filestat carries neither permission bits nor an owner,
@@ -49,7 +54,7 @@
  * path is refused where every libc path function resolves its argument
  * (__wasilibc_find_relpath_alloc), and in the wrappers here that resolve a
  * path themselves. */
-#ifdef WASMIFY_HOST_FS
+#ifdef WASMIFY_HOST_FILESYSTEM
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -66,6 +71,7 @@
 
 extern "C" {
 
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 /* What the host adds to a WASI filestat: the POSIX mode — the file type in
  * the bits every Unix uses for it (0170000) and the low twelve mode bits —
  * the owner, the preferred block size for I/O (0 when the host names none),
@@ -79,6 +85,7 @@ struct __wasmify_filestat_ext {
     unsigned long long rdev;
     unsigned long long blocks;
 };
+#endif
 
 extern int __real_chmod(const char *path, mode_t mode);
 extern int __real_fchmod(int fd, mode_t mode);
@@ -157,6 +164,7 @@ static const char *__wasmify_fs_import_path(const char *path, char *buf,
     return p;
 }
 
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 int __wrap_chmod(const char *path, mode_t mode) {
     if (__wasmify_fs_no_path(path)) return -1;
     char buf[4096];
@@ -168,6 +176,7 @@ int __wrap_chmod(const char *path, mode_t mode) {
 int __wrap_fchmod(int fd, mode_t mode) {
     return __wasmify_fs_result(__wasmify_host_fd_chmod(fd, (unsigned int)mode));
 }
+#endif
 
 /* access(2) and faccessat(2) ask the host (path_access), which checks the
  * file's mode, owner and access control lists for the process's ids, as
@@ -191,6 +200,7 @@ static int __wasmify_fs_access(const char *path, int amode, int effective) {
                                       effective ? WASMIFY_ACCESS_EFFECTIVE : 0);
 }
 
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 int __wrap_access(const char *path, int amode) {
     if (__wasmify_fs_no_path(path)) return -1;
     int rc = __wasmify_fs_access(path, amode, 0);
@@ -265,6 +275,8 @@ __attribute__((weak)) mode_t umask(mode_t mask) {
     return (mode_t)__wasmify_host_proc_umask((unsigned int)mask);
 }
 
+#endif
+#ifdef WASMIFY_HOST_FILESYSTEM_LOCKING
 __attribute__((weak)) int flock(int fd, int operation) {
     int lock;
     switch (operation & ~LOCK_NB) {
@@ -279,6 +291,8 @@ __attribute__((weak)) int flock(int fd, int operation) {
         __wasmify_host_fd_flock(fd, lock, (operation & LOCK_NB) == 0));
 }
 
+#endif
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 /* futimes() is futimens() at microsecond resolution. */
 __attribute__((weak)) int futimes(int fd, const struct timeval tv[2]) {
     if (tv == nullptr) return futimens(fd, nullptr);
@@ -336,6 +350,7 @@ int __wrap_stat(const char *path, struct stat *st) {
 int __wrap_lstat(const char *path, struct stat *st) {
     return __wasmify_stat_common(path, st, 0);
 }
+#endif
 
 /* The directory path names, as the kernel finds it and getcwd(2) names
  * it: from the root, each component in turn, a symbolic link replaced by
@@ -453,6 +468,7 @@ int fail(int error) {
     return -1;
 }
 
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 /* Where files have no owners to change (the host says ENOSYS), a request
  * to change a file's owner is granted when it changes nothing — each id is
  * -1 ("leave it") or the one the file already has — and refused otherwise:
@@ -463,6 +479,9 @@ int change_owner(const struct stat &st, uid_t owner, gid_t group) {
     return 0;
 }
 
+#endif
+
+#if defined(WASMIFY_HOST_FILESYSTEM_ATTRIBUTES) || defined(WASMIFY_HOST_FILESYSTEM_FIFO)
 /* A path as the host imports take it: absolute, without the leading
  * slash. Returns NULL with errno set when the path cannot be named. */
 const char *root_relative(const char *path, char *buf, size_t size) {
@@ -488,6 +507,9 @@ const char *root_relative(const char *path, char *buf, size_t size) {
     return p;
 }
 
+#endif
+
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 int change_path_owner(const char *path, uid_t owner, gid_t group, int follow) {
     char buf[4096];
     const char *p = root_relative(path, buf, sizeof(buf));
@@ -500,10 +522,13 @@ int change_path_owner(const char *path, uid_t owner, gid_t group, int follow) {
     return change_owner(st, owner, group);
 }
 
+#endif
+
 } /* namespace */
 
 extern "C" {
 
+#ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
 /* ---- file ownership ------------------------------------------------------ */
 int chown(const char *path, uid_t owner, gid_t group) {
     return change_path_owner(path, owner, group, 1);
@@ -521,6 +546,8 @@ int fchown(int fd, uid_t owner, gid_t group) {
     if (fstat(fd, &st) != 0) return -1;
     return change_owner(st, owner, group);
 }
+
+#endif
 
 /* ---- temporary files ------------------------------------------------------
  * mkstemp: replaces the trailing XXXXXX of the template with characters
@@ -576,6 +603,7 @@ int chroot(const char *path) {
     return fail(EPERM);
 }
 
+#ifdef WASMIFY_HOST_FILESYSTEM_FIFO
 /* FIFOs are the host filesystem's to create; WASI has no call for it. */
 int mkfifo(const char *path, mode_t mode) {
     char buf[4096];
@@ -585,7 +613,8 @@ int mkfifo(const char *path, mode_t mode) {
     if (rc != 0) return fail(-rc);
     return 0;
 }
+#endif
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_FS */
+#endif /* WASMIFY_HOST_FILESYSTEM */

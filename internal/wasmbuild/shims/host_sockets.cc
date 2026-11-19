@@ -1,10 +1,14 @@
 /* host_sockets.cc — generic host-provided socket shim.
  *
  * This translation unit is deployed and compiled by wasmify itself, and only
- * when host socket support is opted in (bridge.HostSockets in wasmify.json,
- * which makes wasmify define WASMIFY_HOST_SOCKETS for this compile). Without
- * that opt-in the file is excluded entirely and the wasm imports only standard
- * wasi, staying portable to any wasi runtime.
+ * when the host capability network is given (wasmify.json's "host", which
+ * makes wasmify define WASMIFY_HOST_NETWORK for this compile). Without it
+ * the file is excluded entirely and the wasm imports only standard wasi,
+ * staying portable to any wasi runtime. The sockets (socket(), connect(),
+ * the options, send and receive, shutdown, poll) come with network.sockets,
+ * the resolver (getaddrinfo(), gethostbyname(), getnameinfo() and the
+ * services, protocols and networks databases) with network.resolver;
+ * inet_ntop with either.
  *
  * WASI preview1 has no way to create, connect or bind a socket, and
  * wasi-libc under __wasip1__ does not even declare or define socket()/connect()
@@ -29,11 +33,11 @@
  *
  * The matching declarations come from wasmify's <netdb.h> stub,
  * deployed into the build-local host-include dir that every wasm-build compile
- * gets on its -I whenever host sockets are opted in (independent of the
+ * gets on its -I whenever the network capability is given (independent of the
  * POSIX-compat overlay), so a libc socket module compiled with
  * HAVE_SOCKET/HAVE_CONNECT sees the same struct addrinfo layout this file
  * fills in. */
-#ifdef WASMIFY_HOST_SOCKETS
+#ifdef WASMIFY_HOST_NETWORK
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -141,6 +145,7 @@ struct __wasmify_sockaddr_un {
 #define WASMIFY_EAI_MEMORY EAI_MEMORY
 #define WASMIFY_EAI_NONAME EAI_NONAME
 
+#if defined(WASMIFY_HOST_NETWORK_SOCKETS) || defined(WASMIFY_HOST_NETWORK_RESOLVER)
 /* The host's family for a libc address family, or 0 for one the host has
  * no sockets of. */
 static int __wasmify_sock_family(int domain) {
@@ -273,6 +278,9 @@ static void __wasmify_sock_addr_out(const struct __wasmify_sock_addr *in,
     *addrlen = full;
 }
 
+#endif
+
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 /* A socket address of this C library as the host's C library has it: the
  * bytes of a struct sockaddr of the host's (cap bytes of room at out, their
  * number at *out_len), which native code of the host's makes and takes. A
@@ -316,6 +324,9 @@ int __wasmify_sockaddr_from_host(const void *raw, size_t len, struct sockaddr *o
     return 0;
 }
 
+#endif /* WASMIFY_HOST_NETWORK_SOCKETS */
+
+#ifdef WASMIFY_HOST_NETWORK_RESOLVER
 /* The address record of an IPv4 or IPv6 address as it sits in an in_addr
  * or in6_addr. */
 static void __wasmify_sock_addr_ip(struct __wasmify_sock_addr *out, int family,
@@ -676,6 +687,9 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
     return &ent;
 }
 
+#endif /* WASMIFY_HOST_NETWORK_RESOLVER */
+
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 /* The host's type for a libc socket type and protocol of a family, or 0
  * for a combination the host has no sockets of. */
 static int __wasmify_sock_type(int family, int type, int protocol) {
@@ -1016,6 +1030,8 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
     return recvfrom(fd, buf, len, flags, nullptr, nullptr);
 }
 
+#endif /* WASMIFY_HOST_NETWORK_SOCKETS */
+
 } /* extern "C" */
 
 /* ---- shutdown, the network databases, inet_ntop, poll ----------------- */
@@ -1028,11 +1044,14 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
 
 namespace {
 
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 int fail(int error) {
     errno = error;
     return -1;
 }
+#endif
 
+#ifdef WASMIFY_HOST_NETWORK_RESOLVER
 /* A lookup in the host's services database. */
 struct servent *find_service(const char *name, int port, int by_port, const char *proto) {
     static struct servent ent;
@@ -1156,10 +1175,13 @@ template <typename Match> struct protoent *find_protocol(Match match) {
     return p;
 }
 
+#endif /* WASMIFY_HOST_NETWORK_RESOLVER */
+
 } /* namespace */
 
 extern "C" {
 
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 /* ---- sockets ----------------------------------------------------------------
  * shutdown: "how" is 0, 1 or 2 (SHUT_RD, SHUT_WR, SHUT_RDWR as
  * wasmify's <sys/socket.h> defines them, the numbers programs pass
@@ -1186,6 +1208,9 @@ int shutdown(int fd, int how) {
     return 0;
 }
 
+#endif /* WASMIFY_HOST_NETWORK_SOCKETS */
+
+#ifdef WASMIFY_HOST_NETWORK_RESOLVER
 /* ---- network databases -----------------------------------------------------
  * Hosts: lookups by name go to the host (gethostbyname, above); there is
  * no table to walk. */
@@ -1246,6 +1271,8 @@ struct protoent *getprotobynumber(int number) {
     return find_protocol([number](struct protoent *p) { return p->p_proto == number; });
 }
 
+#endif /* WASMIFY_HOST_NETWORK_RESOLVER */
+
 /* inet_ntop(3) as glibc words an address: an IPv6 address whose first 96
  * bits are zero (an IPv4-compatible address, ::1.2.3.4) or that is an
  * IPv4-mapped one (::ffff:1.2.3.4) ends in the dotted IPv4 notation, the
@@ -1298,6 +1325,7 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
     return strcpy(dst, out);
 }
 
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 /* ---- poll(2) ---------------------------------------------------------------
  * poll over poll_oneoff, as wasi-libc's ppoll, except that a descriptor not
  * asked for reading is still watched for the events poll reports whether
@@ -1425,7 +1453,8 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
         if (bounded && poll_now() >= deadline) return 0;
     }
 }
+#endif /* WASMIFY_HOST_NETWORK_SOCKETS */
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SOCKETS */
+#endif /* WASMIFY_HOST_NETWORK */

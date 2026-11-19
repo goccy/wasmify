@@ -1,8 +1,8 @@
 /* host_time.cc — time zones, for a C library that has one (UTC).
  *
- * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ * Compiled when the host capability system.time_zones is given (WASMIFY_HOST_SYSTEM_TIME_ZONES).
  */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_SYSTEM_TIME_ZONES
 
 #include <cstddef>
 #include <cstdint>
@@ -124,4 +124,4 @@ void tzset(void) {
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_SYSTEM_TIME_ZONES */

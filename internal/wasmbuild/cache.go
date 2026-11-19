@@ -20,7 +20,7 @@ type BuildCache struct {
 	// built for. The triple is a global property of the build
 	// directory — obj files, archives and the link must all agree on
 	// pointer width and sysroot flavor — so a triple change (e.g.
-	// wasm_build.wasm64 flipped, HostThreads toggled) invalidates the
+	// wasm_build.wasm64 flipped, process.threads given) invalidates the
 	// whole cache rather than relying on per-step arg hashes: steps
 	// whose command lines never mention the target (llvm-ar archives)
 	// would otherwise keep serving outputs of the previous width and

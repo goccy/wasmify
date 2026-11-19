@@ -1,9 +1,10 @@
 /* host_tty.cc — terminals, for a C library that has none.
  *
- * Compiled when host subprocess support is opted in (WASMIFY_HOST_SUBPROCESS).
+ * Compiled when the host capability terminal is given (WASMIFY_HOST_TERMINAL);
+ * tcgetpgrp and tcsetpgrp with process.job_control.
  * tcgetattr and its companions, ttyname and ctermid, on the tty_* imports.
  */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_TERMINAL
 
 #include <cerrno>
 #include <cstddef>
@@ -97,6 +98,7 @@ int tcflow(int fd, int action) { return terminal_control(fd, 1, action); }
 int tcflush(int fd, int queue) { return terminal_control(fd, 2, queue); }
 int tcsendbreak(int fd, int duration) { return terminal_control(fd, 3, duration); }
 
+#ifdef WASMIFY_HOST_PROCESS_JOB_CONTROL
 pid_t tcgetpgrp(int fd) {
     int pgrp = 0;
     const int rc = __wasmify_host_tty_pgrp(fd, 0, 0, &pgrp);
@@ -108,7 +110,8 @@ int tcsetpgrp(int fd, pid_t pgrp) {
     const int rc = __wasmify_host_tty_pgrp(fd, 1, (int)pgrp, &was);
     return rc != 0 ? fail(-rc) : 0;
 }
+#endif
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_TERMINAL */

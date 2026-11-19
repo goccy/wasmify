@@ -5,52 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/goccy/wasmify/internal/hostcap"
 )
 
-// hostSocketsShim is the generic libc->import socket shim. It DEFINES
-// socket()/connect()/getaddrinfo() backed by the host's sock_* imports and is
-// gated internally on WASMIFY_HOST_SOCKETS, so it only emits symbols/imports
-// when wasmify defines that macro for the compile.
+// hostShimFS holds wasmify's host shims: the libc functions of the host
+// capabilities (wasmify.json's "host"), on imports of the module
+// "wasmify_posix". Each source is guarded inside by the macros of the
+// capability parts it serves (see hostParts), so a build compiles exactly
+// what it is given.
 //
-//go:embed shims/host_sockets.cc
-var hostSocketsShim []byte
-
-// hostSubprocessShim is the generic libc->import subprocess shim. It DEFINES
-// the posix_spawn family + waitpid/pipe backed by the host's proc_*/pipe
-// imports and is gated internally on WASMIFY_HOST_SUBPROCESS.
-//
-//go:embed shims/host_subprocess.cc
-var hostSubprocessShim []byte
-
-// hostFSShim is the generic filesystem-fidelity shim. It provides __wrap_
-// definitions for chmod/fchmod/stat/lstat/fstat/open/mkdir/chdir and
-// definitions of umask/flock/futimes, backed by the host's file mode, owner,
-// umask and lock imports (plus lexical chdir normalization), and is gated
-// internally on WASMIFY_HOST_FS; the matching -Wl,--wrap= flags come from
-// EffectiveExtraLDFlags.
-//
-//go:embed shims/host_fs.cc
-var hostFSShim []byte
-
-// hostSubprocessCompanionFS holds the shims that come with the subprocess
-// capability besides host_subprocess.cc: who the process is (ids, users and
-// groups, sessions, priority, uname, the environment), signals and the
-// interval timer, terminals, time zones, System V IPC and syslog. Each is
-// gated internally on WASMIFY_HOST_SUBPROCESS, like host_subprocess.cc.
-//
-//go:embed shims/host_process.cc shims/host_signal.cc shims/host_tty.cc shims/host_time.cc shims/host_ipc.cc shims/host_syslog.cc
-var hostSubprocessCompanionFS embed.FS
-
-// hostSubprocessCompanionNames lists hostSubprocessCompanionFS's shims, in
-// the order they are deployed and compiled.
-var hostSubprocessCompanionNames = []string{
-	"host_process.cc",
-	"host_signal.cc",
-	"host_tty.cc",
-	"host_time.cc",
-	"host_ipc.cc",
-	"host_syslog.cc",
-}
+//go:embed shims/*.cc
+var hostShimFS embed.FS
 
 // wasmifyPosixHeader declares every import of the "wasmify_posix" module the
 // shims are built on, and the building blocks the shims export. The shims
@@ -60,48 +26,54 @@ var hostSubprocessCompanionNames = []string{
 //go:embed shims/wasmify_posix.h
 var wasmifyPosixHeader []byte
 
-// hostSubprocessHeaderFS holds the headers of the C library interfaces the
-// subprocess shims implement and wasi-libc has no header for.
+// hostHeaderFS holds the headers of the C library interfaces the shims
+// implement and wasi-libc has no header for.
 //
 //go:embed shims/include
-var hostSubprocessHeaderFS embed.FS
+var hostHeaderFS embed.FS
 
-// hostSubprocessHeaders lists hostSubprocessHeaderFS's headers by the name
-// a program includes them under.
-var hostSubprocessHeaders = []string{
-	"termios.h",
-	"syslog.h",
-	"sys/ipc.h",
-	"sys/msg.h",
-	"sys/sem.h",
-	"sys/shm.h",
-}
-
-// hostSubprocessHeader returns the content of one of hostSubprocessHeaders.
+// hostSubprocessHeader returns the content of a header of hostHeaderFS.
 func hostSubprocessHeader(name string) string {
-	data, err := hostSubprocessHeaderFS.ReadFile("shims/include/" + name)
+	data, err := hostHeaderFS.ReadFile("shims/include/" + name)
 	if err != nil {
 		panic(fmt.Sprintf("embedded host header %s: %v", name, err))
 	}
 	return string(data)
 }
 
-// hostShimPrivateHeaders are the stub headers the subprocess shims include
-// from beside them (wasi-libc has neither). They are not put on the
-// project's include path: a project may be built against declarations of
-// its own for the same structures.
-var hostShimPrivateHeaders = []string{"pwd.h", "grp.h"}
+const wasmifyPosixHeaderName = "wasmify_posix.h"
 
-const (
-	hostSocketsShimName    = "host_sockets.cc"
-	hostSubprocessShimName = "host_subprocess.cc"
-	hostFSShimName         = "host_fs.cc"
-	wasmifyPosixHeaderName = "wasmify_posix.h"
-)
+// hostShim returns the content of one of the shims.
+func hostShim(name string) ([]byte, error) {
+	data, err := hostShimFS.ReadFile("shims/" + name)
+	if err != nil {
+		return nil, fmt.Errorf("missing embedded host shim %s: %w", name, err)
+	}
+	return data, nil
+}
 
-// HostSubprocessStubHeaders lists the stub headers the subprocess shim needs to
-// compile (resolved from the stub registry against cfg.PosixCompatDir).
-var HostSubprocessStubHeaders = []string{"spawn.h", "sys/wait.h"}
+// hostHeaderContent returns the content of a header a capability part puts
+// in host-include or beside the shims: hostHeaderFS's own; netdb.h, which is
+// the POSIX-compat overlay's (the same file under both, so that a project
+// and the socket shim see one layout of struct addrinfo whether or not the
+// overlay is on); or the stub registry's (spawn.h, sys/wait.h, pwd.h,
+// grp.h).
+func hostHeaderContent(name string) (string, error) {
+	if data, err := hostHeaderFS.ReadFile("shims/include/" + name); err == nil {
+		return string(data), nil
+	}
+	if name == "netdb.h" {
+		data, err := posixCompatFS.ReadFile("stubs/include/netdb.h")
+		if err != nil {
+			return "", fmt.Errorf("missing embedded header <%s>: %w", name, err)
+		}
+		return string(data), nil
+	}
+	if stub, ok := LookupHeaderStub(name); ok {
+		return stub.Content, nil
+	}
+	return "", fmt.Errorf("no embedded header <%s>", name)
+}
 
 // deployWasmifyPosixHeader writes wasmify_posix.h into dir.
 func deployWasmifyPosixHeader(dir string) error {
@@ -111,74 +83,35 @@ func deployWasmifyPosixHeader(dir string) error {
 	return nil
 }
 
-// hostSocketsHeader is the header the socket shim and its consumers share:
-// struct addrinfo, the AI_*/EAI_* values, and the getaddrinfo family
-// prototypes. It is the same file the POSIX-compat overlay ships as <netdb.h>,
-// deployed separately so the socket capability does not depend on the overlay
-// being enabled (a wasi-native project builds with NoPosixCompat and still
-// opts in to host sockets).
-const hostSocketsHeader = "netdb.h"
-
 // HostIncludeSubdir is the build-local directory (under the wasm-build
-// BuildDir) where wasmify materializes the host-capability stub headers.
+// BuildDir) where wasmify materializes the host-capability headers.
 const HostIncludeSubdir = "host-include"
 
-// DeployHostSocketsHeaders writes the host-sockets contract header (netdb.h)
-// into <buildDir>/host-include and returns that directory. The wasip1 sysroot
-// has no netdb.h; the socket shim #includes it for struct addrinfo and the
-// EAI_* values, and every upstream translation unit that calls getaddrinfo()
-// must see the SAME layout, so the header goes on every wasm-build compile's
-// -I (see wasmCompileFlags) rather than only on the shim's. Under the
-// POSIX-compat overlay the identical file is also reachable via -isystem; the
-// include guard makes the duplicate harmless. The build-local dir keeps the
-// shared wasi-sdk sysroot pristine, and the capability stays gated by the
-// -DWASMIFY_HOST_SOCKETS macro wasmify defines only at wasm-build.
-func DeployHostSocketsHeaders(buildDir string) (string, error) {
-	incDir := filepath.Join(buildDir, HostIncludeSubdir)
-	data, err := posixCompatFS.ReadFile("stubs/include/" + hostSocketsHeader)
-	if err != nil {
-		return "", fmt.Errorf("missing embedded host sockets header <%s>: %w", hostSocketsHeader, err)
-	}
-	if err := DeployStubHeader(incDir, hostSocketsHeader, string(data)); err != nil {
-		return "", fmt.Errorf("failed to deploy host sockets header <%s>: %w", hostSocketsHeader, err)
-	}
-	if err := deployWasmifyPosixHeader(incDir); err != nil {
-		return "", err
-	}
-	return incDir, nil
-}
-
-// DeployHostSubprocessHeaders writes the host-subprocess headers into
-// <buildDir>/host-include and returns that directory: the stubs spawn.h and
-// sys/wait.h, which declare the posix_spawn/waitpid surface the
-// host-subprocess shim backs with host imports; termios.h, syslog.h and the
-// System V IPC headers, of the interfaces the companion shims implement; and
-// wasmify_posix.h. wasi-libc ships none of them (WASI preview1 has no
-// processes).
+// DeployHostHeaders writes the headers of the given host capabilities into
+// <buildDir>/host-include and returns that directory ("" when no
+// capability is given): wasmify_posix.h, and per capability part the
+// headers wasi-libc does not have (spawn.h and sys/wait.h with
+// process.spawn, netdb.h with network, termios.h with terminal, syslog.h
+// with system.logging, the System V IPC headers with ipc.sysv).
 //
 // The directory is added to every wasm-build compile's include path (see
-// wasmCompileFlags), so the upstream sources and wasmify's shim resolve
-// <spawn.h>/<sys/wait.h> WITHOUT touching the shared wasi-sdk sysroot. The
-// capability is gated by the -DWASMIFY_HOST_SUBPROCESS macro wasmify defines
-// only at wasm-build: the upstream's own (host-arch-equivalent) build phase
-// never sees that macro, so it stays unmodified and #includes neither header
-// — which is why the build-local dir suffices and the sysroot is left pristine
-// (no cross-project leakage). The dir's mere presence is inert until the macro
-// is on.
-func DeployHostSubprocessHeaders(buildDir string) (string, error) {
-	incDir := filepath.Join(buildDir, HostIncludeSubdir)
-	for _, header := range HostSubprocessStubHeaders {
-		stub, ok := LookupHeaderStub(header)
-		if !ok {
-			return "", fmt.Errorf("missing stub for host subprocess header <%s>", header)
-		}
-		if err := DeployStubHeader(incDir, header, stub.Content); err != nil {
-			return "", fmt.Errorf("failed to deploy host subprocess header <%s>: %w", header, err)
-		}
+// wasmCompileFlags), so the upstream sources and wasmify's shims resolve the
+// headers WITHOUT touching the shared wasi-sdk sysroot. The capability is
+// gated by the -DWASMIFY_HOST_* macros wasmify defines only at wasm-build
+// (and in the capture build): the upstream's own (host-arch-equivalent)
+// build phase never sees them.
+func DeployHostHeaders(buildDir string, host hostcap.Set) (string, error) {
+	if host.Empty() {
+		return "", nil
 	}
-	for _, header := range hostSubprocessHeaders {
-		if err := DeployStubHeader(incDir, header, hostSubprocessHeader(header)); err != nil {
-			return "", fmt.Errorf("failed to deploy host subprocess header <%s>: %w", header, err)
+	incDir := filepath.Join(buildDir, HostIncludeSubdir)
+	for _, header := range hostHeaderNames(host) {
+		content, err := hostHeaderContent(header)
+		if err != nil {
+			return "", err
+		}
+		if err := DeployStubHeader(incDir, header, content); err != nil {
+			return "", fmt.Errorf("failed to deploy host header <%s>: %w", header, err)
 		}
 	}
 	if err := deployWasmifyPosixHeader(incDir); err != nil {
@@ -187,72 +120,45 @@ func DeployHostSubprocessHeaders(buildDir string) (string, error) {
 	return incDir, nil
 }
 
-// DeployHostShims writes the enabled host-capability shim sources under
-// <buildDir>/host-shims/ and returns their absolute source paths (sockets
-// first, then subprocess and its companions, then fs) for the bridge
-// compile+link to pick up. Each shim is written only when its flag is on;
-// with every flag off, nothing is written and an empty slice is returned (the
-// wasm imports only standard wasi and stays portable). The shim bodies are
-// additionally guarded by their respective WASMIFY_HOST_* macros, which
-// wasmify defines for the compile only when the flag is on. The headers the
-// shims include from beside them (wasmify_posix.h, and pwd.h and grp.h for
-// the subprocess companions) are written there too, and are not returned.
-func DeployHostShims(buildDir string, hostSockets, hostSubprocess, hostFS bool) ([]string, error) {
-	if !hostSockets && !hostSubprocess && !hostFS {
+// DeployHostShims writes the shim sources of the given host capabilities
+// under <buildDir>/host-shims/ and returns their absolute paths, in
+// hostShimOrder, for the bridge compile+link to pick up. With no capability
+// given, nothing is written and an empty slice is returned (the wasm imports
+// only standard wasi and stays portable). The headers the shims include from
+// beside them (wasmify_posix.h, and pwd.h and grp.h with users) are written
+// there too, and are not returned.
+func DeployHostShims(buildDir string, host hostcap.Set) ([]string, error) {
+	names := hostShimNames(host)
+	if len(names) == 0 {
 		return nil, nil
 	}
-
 	shimDir := filepath.Join(buildDir, "host-shims")
 	if err := os.MkdirAll(shimDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create host-shims dir: %w", err)
 	}
-
-	var paths []string
-	write := func(name string, content []byte) error {
-		dst := filepath.Join(shimDir, name)
-		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			return fmt.Errorf("failed to write host shim %s: %w", name, err)
-		}
-		paths = append(paths, dst)
-		return nil
-	}
-
 	if err := deployWasmifyPosixHeader(shimDir); err != nil {
 		return nil, err
 	}
-	if hostSockets {
-		if err := write(hostSocketsShimName, hostSocketsShim); err != nil {
+	for _, header := range hostPrivateHeaderNames(host) {
+		content, err := hostHeaderContent(header)
+		if err != nil {
 			return nil, err
 		}
+		if err := DeployStubHeader(shimDir, header, content); err != nil {
+			return nil, fmt.Errorf("failed to deploy host shim header <%s>: %w", header, err)
+		}
 	}
-	if hostSubprocess {
-		if err := write(hostSubprocessShimName, hostSubprocessShim); err != nil {
+	var paths []string
+	for _, name := range names {
+		content, err := hostShim(name)
+		if err != nil {
 			return nil, err
 		}
-		for _, name := range hostSubprocessCompanionNames {
-			content, err := hostSubprocessCompanionFS.ReadFile("shims/" + name)
-			if err != nil {
-				return nil, fmt.Errorf("missing embedded host shim %s: %w", name, err)
-			}
-			if err := write(name, content); err != nil {
-				return nil, err
-			}
+		dst := filepath.Join(shimDir, name)
+		if err := os.WriteFile(dst, content, 0o644); err != nil {
+			return nil, fmt.Errorf("failed to write host shim %s: %w", name, err)
 		}
-		for _, header := range hostShimPrivateHeaders {
-			stub, ok := LookupHeaderStub(header)
-			if !ok {
-				return nil, fmt.Errorf("missing stub for host shim header <%s>", header)
-			}
-			if err := DeployStubHeader(shimDir, header, stub.Content); err != nil {
-				return nil, fmt.Errorf("failed to deploy host shim header <%s>: %w", header, err)
-			}
-		}
+		paths = append(paths, dst)
 	}
-	if hostFS {
-		if err := write(hostFSShimName, hostFSShim); err != nil {
-			return nil, err
-		}
-	}
-
 	return paths, nil
 }

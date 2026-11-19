@@ -6,10 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/goccy/wasm2go/transpile"
+	"github.com/goccy/wasmify/internal/hostcap"
 )
 
 // hostShimsRunWant is what testdata/host_shims_run.c prints when every
@@ -47,7 +47,8 @@ poll: 1 1
 `
 
 // A C program that calls the libc functions of every host shim is built
-// with the shims, for both pointer widths, transpiled by wasm2go and run:
+// with every host capability given, for both pointer widths, transpiled by
+// wasm2go and run:
 // each function does its job on the host's imports (module wasmify_posix),
 // and an exec ends the program with the command's status. Skipped where
 // no wasi-sdk is installed.
@@ -66,7 +67,13 @@ func TestHostShimsRun(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			wasm := buildHostShimsProgram(t, sdk, dir, wasm64)
+			src, err := filepath.Abs(filepath.Join("testdata", "host_shims_run.c"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var all hostcap.Set
+			all.EnableAll()
+			wasm := buildHostProgram(t, sdk, dir, all, wasm64, src)
 			runner := transpileRunner(t, wasm, dir)
 			out, status := runHostShimsProgram(t, runner, "all")
 			if status != 0 || out != hostShimsRunWant {
@@ -78,78 +85,6 @@ func TestHostShimsRun(t *testing.T) {
 			}
 		})
 	}
-}
-
-// buildHostShimsProgram compiles testdata/host_shims_run.c and every host
-// shim with the flags wasm-build uses, and links them into a command
-// module. Nothing is left undefined: a libc function the shims do not
-// provide is a link error, not an import.
-func buildHostShimsProgram(t *testing.T, sdk, dir string, wasm64 bool) string {
-	t.Helper()
-	buildDir := filepath.Join(dir, "build")
-	compat, err := DeployPosixCompat(buildDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := WasmConfig{
-		Target:         "wasm32-wasip1",
-		Wasm64:         wasm64,
-		WasiSDKPath:    sdk,
-		PosixCompatDir: compat,
-		HostSockets:    true,
-		HostSubprocess: true,
-		HostFS:         true,
-	}
-	if cfg.HostIncludeDir, err = DeployHostSubprocessHeaders(buildDir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DeployHostSocketsHeaders(buildDir); err != nil {
-		t.Fatal(err)
-	}
-	shims, err := DeployHostShims(buildDir, true, true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	run := func(tool string, args ...string) {
-		t.Helper()
-		out, err := exec.Command(filepath.Join(sdk, "bin", tool), args...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s %s: %v\n%s", tool, strings.Join(args, " "), err, out)
-		}
-	}
-	flags := append(wasmCompileFlags(cfg), "-fno-exceptions")
-	var objs []string
-	for _, src := range shims {
-		obj := filepath.Join(buildDir, filepath.Base(src)+".o")
-		run("clang++", append(append([]string{"-c", "-std=c++20"}, flags...), "-o", obj, src)...)
-		objs = append(objs, obj)
-	}
-	prog := filepath.Join(buildDir, "host_shims_run.o")
-	src, err := filepath.Abs(filepath.Join("testdata", "host_shims_run.c"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	run("clang", append(append([]string{"-c", "-Wno-deprecated-declarations",
-		"-I", filepath.Join(buildDir, "host-shims")}, flags...), "-o", prog, src)...)
-	wasm := filepath.Join(dir, "host_shims_run.wasm")
-	link := []string{"--target=" + effectiveTarget(cfg), "--sysroot=" + Sysroot(sdk), "-fno-exceptions",
-		"-o", wasm, prog}
-	link = append(link, objs...)
-	link = append(link, cfg.EffectiveExtraLDFlags()...)
-	link = append(link, "-lwasi-emulated-process-clocks")
-	if wasm64 {
-		// wasi-sdk's libc++ for wasm64 is built with exception handling
-		// and refers to the tag of C++ exceptions without defining it.
-		tagSrc, err := filepath.Abs(filepath.Join("testdata", "cpp_exception_tag_wasm64.s"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		tag := filepath.Join(buildDir, "cpp_exception_tag.o")
-		run("clang", "-c", "--target="+effectiveTarget(cfg), "-mexception-handling", "-o", tag, tagSrc)
-		link = append(link, tag)
-	}
-	run("clang++", link...)
-	return wasm
 }
 
 // transpileRunner transpiles the module and writes beside it a program

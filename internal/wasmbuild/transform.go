@@ -832,7 +832,8 @@ func (c WasmConfig) optLevel() string {
 }
 
 // effectiveTarget returns the target triple the wasm build actually compiles
-// and links for. HostThreads swaps wasm32-wasip1 for wasm32-wasip1-threads:
+// and links for. Threads (the host capability process.threads) swap
+// wasm32-wasip1 for wasm32-wasip1-threads:
 // -pthread alone is not enough, because the target triple decides WHICH
 // prebuilt sysroot libraries (libc, libc++, libc++abi) the driver links, and
 // only the -threads flavor is compiled with the atomics/bulk-memory features.
@@ -841,7 +842,7 @@ func (c WasmConfig) optLevel() string {
 //
 // Wasm64 swaps in wasm64-wasip1 the same way; the triple selects the
 // wasm64 sysroot libraries (8-byte pointers, memory64) that wasmify
-// provisions into the SDK. Wasm64 && HostThreads combines both: the
+// provisions into the SDK. Wasm64 with threads combines both: the
 // wasm64-wasip1-threads sysroot flavor carries 8-byte pointers AND the
 // atomics/bulk-memory features plus real pthreads.
 func effectiveTarget(cfg WasmConfig) string {
@@ -849,11 +850,11 @@ func effectiveTarget(cfg WasmConfig) string {
 		return cfg.Target
 	}
 	switch {
-	case cfg.Wasm64 && cfg.HostThreads:
+	case cfg.Wasm64 && cfg.Threads():
 		return "wasm64-wasip1-threads"
 	case cfg.Wasm64:
 		return "wasm64-wasip1"
-	case cfg.HostThreads:
+	case cfg.Threads():
 		return "wasm32-wasip1-threads"
 	}
 	return cfg.Target
@@ -866,33 +867,27 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		// Must come before --sysroot so our headers override wasi-sdk's
 		flags = append(flags, "-isystem", cfg.PosixCompatDir)
 	}
-	// Host-capability opt-ins applied to EVERY wasm-build compile (not just the
-	// bridge), so the upstream's own sources enable the matching feature at
-	// wasm-build only. The upstream's separate (host-arch-equivalent) make phase
-	// never sees these, so it stays plain and needs none of the extra headers.
-	if cfg.HostSockets {
-		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
+	// The macros of the host capabilities given (WASMIFY_HOST_<CAPABILITY>
+	// and WASMIFY_HOST_<CAPABILITY>_<FEATURE>, see hostcap.Set.Macros),
+	// applied to EVERY wasm-build compile (not just the bridge), so the
+	// upstream's own sources enable the matching feature at wasm-build only.
+	// The upstream's separate (host-arch-equivalent) make phase never sees
+	// these, so it stays plain and needs none of the extra headers.
+	for _, macro := range cfg.Host.Macros() {
+		flags = append(flags, "-D"+macro)
 	}
-	if cfg.HostThreads {
+	if cfg.Threads() {
 		// wasi-libc's threads build: -pthread turns on <pthread.h>, thread-local
 		// storage, and the atomics/shared-memory features the threads proposal
 		// needs. The wasm carries a wasi_thread_spawn import and a
 		// wasi_thread_start export; wasm2go maps the former onto a goroutine, so
-		// the HOST implements nothing. The macro lets upstream sources take their
-		// threaded path at wasm-build only.
-		flags = append(flags, "-DWASMIFY_HOST_THREADS", "-pthread")
+		// the HOST implements nothing.
+		flags = append(flags, "-pthread")
 	}
-	if cfg.HostSubprocess {
-		flags = append(flags, "-DWASMIFY_HOST_SUBPROCESS")
-	}
-	if cfg.HostFS {
-		flags = append(flags, "-DWASMIFY_HOST_FS")
-	}
-	if cfg.HostIncludeDir != "" && (cfg.HostSockets || cfg.HostSubprocess) {
-		// Carries the headers wasi-libc omits for the opted-in capabilities:
-		// spawn.h/sys/wait.h for host subprocess, netdb.h for host sockets.
-		// Gated behind the macros above so its presence is inert when the
-		// features are off. Added once, whichever capabilities populated it.
+	if cfg.HostIncludeDir != "" && !cfg.Host.Empty() {
+		// Carries wasmify_posix.h and the headers wasi-libc omits for the
+		// capabilities given (spawn.h, netdb.h, termios.h, ...). Gated behind
+		// the macros above so its presence is inert when they are off.
 		flags = append(flags, "-I", cfg.HostIncludeDir)
 	}
 	flags = append(flags,
@@ -913,9 +908,9 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 		// portable code guards its threaded paths on the PAIR: without it,
 		// e.g. ggml's graph planner clamps n_threads to 1
 		// ("Emscripten without pthreads support can only use a single
-		// thread"). A HostThreads build must therefore complete the
+		// thread"). A threads build must therefore complete the
 		// emulation or silently lose its parallelism.
-		if cfg.HostThreads {
+		if cfg.Threads() {
 			flags = append(flags, "-D__EMSCRIPTEN_PTHREADS__")
 		}
 	}
@@ -1015,7 +1010,7 @@ func wasmLinkOptions(cfg WasmConfig) []string {
 		stackSize = DefaultStackSize
 	}
 	flags = append(flags, fmt.Sprintf("-Wl,-z,stack-size=%d", stackSize))
-	if cfg.HostThreads {
+	if cfg.Threads() {
 		// A shared memory MUST declare a maximum (threads proposal), and
 		// --shared-memory + --import-memory/--export-memory is what makes
 		// wasm-ld emit one. The declared maximum is a property of the binary

@@ -2,9 +2,9 @@
  * POSIX sys/time.h compatibility overlay for wasip1.
  *
  * wasi-libc guards setitimer, getitimer and their types out of <sys/time.h>
- * ("WASI has no getitimer"). With host subprocess support, wasmify's signal
- * shim (host_signal.cc) implements both on the real-time interval timer the
- * host keeps, the one alarm() sets. ITIMER_REAL is the only timer there is:
+ * ("WASI has no getitimer"). With the host capability signals.timers,
+ * wasmify's signal shim (host_signal.cc) implements both on the real-time
+ * interval timer the host keeps, the one alarm() sets. ITIMER_REAL is the only timer there is:
  * the process CPU-time timers (ITIMER_VIRTUAL, ITIMER_PROF) have nothing to
  * count, and stay undefined so that nothing offers them.
  */

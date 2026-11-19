@@ -175,9 +175,10 @@
 #endif
 /* shutdown(2)'s "how" is 0, 1 or 2 on every system, and programs pass the
  * numbers themselves; wasi-libc gives the three names the bits of the WASI
- * call instead (1, 2 and 3). With host sockets, shutdown() is wasmify's
- * (host_sockets.cc), which takes the usual numbers and translates them. */
-#ifdef WASMIFY_HOST_SOCKETS
+ * call instead (1, 2 and 3). With the host capability network.sockets,
+ * shutdown() is wasmify's (host_sockets.cc), which takes the usual numbers
+ * and translates them. */
+#ifdef WASMIFY_HOST_NETWORK_SOCKETS
 #undef SHUT_RD
 #undef SHUT_WR
 #undef SHUT_RDWR
