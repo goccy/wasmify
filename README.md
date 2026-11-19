@@ -133,6 +133,23 @@ Project decisions live under typed sections:
 
 Generated artifacts (`build.json`, `api-spec.json`, `proto/`, `bridge/`, the `.wasm` file, the `.go` file) all go in `.gitignore` and are reproduced by re-running the pipeline.
 
+### Host capabilities
+
+What a wasm needs of a POSIX system that WASI preview1 lacks (processes, signals, sockets, file modes and owners, users, terminals, System V IPC, syslog, time zones) is declared under `host`, by the option groups of POSIX.1-2017:
+
+```jsonc
+{
+  "host": {
+    "filesystem": true,                       // a capability with all its features
+    "network":    { "sockets": true },        // or with the features set true
+    "process":    { "spawn": true, "resources": true },
+    "signals":    {}                          // or its base alone
+  }
+}
+```
+
+The capabilities are `filesystem` {attributes, fifo, locking}, `network` {sockets, resolver}, `process` {spawn, fork, job_control, resources, threads}, `signals` {timers}, `terminal` {pseudo}, `users` {database}, `ipc` {sysv} and `system` {logging, info, time_zones}. wasmify compiles and links the host shims of what is given (libc functions on imports of the module `wasmify_posix`, which the host implements; the wasm2go runtime does), with their headers, `WASMIFY_HOST_*` macros and link wraps, and refuses a feature without what it needs. Without `host` the wasm imports standard WASI only. The bridge flags `HostFS`, `HostSockets`, `HostSubprocess` and `HostThreads` are deprecated aliases. See [`docs/host-capabilities.md`](docs/host-capabilities.md).
+
 ## Using the generated Go package
 
 End users never see wasm or protobuf:
@@ -231,5 +248,6 @@ Global flag: `--non-interactive` (or env `WASMIFY_NON_INTERACTIVE=1`) — fails 
 ## Documentation
 
 - [`agents/wasmify.md`](agents/wasmify.md) — AI agent workflow (Claude Code `/wasmify` etc.).
+- [`docs/host-capabilities.md`](docs/host-capabilities.md) — the `host` capabilities: what each brings, what needs what, `wasmify_posix.h`, the deprecated flags.
 - [`protoc-plugins/README.md`](protoc-plugins/README.md) — wasm binary contract + proto options (plugin authors).
 - [`protoc-plugins/protoc-gen-wasmify-go/README.md`](protoc-plugins/protoc-gen-wasmify-go/README.md) — Go plugin design.
