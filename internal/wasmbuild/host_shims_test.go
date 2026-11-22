@@ -127,6 +127,11 @@ func TestDeployHostShims(t *testing.T) {
 		{hostWith("filesystem.fifo"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.locking"), []string{"host_fcntl.cc", "host_fs.cc"}},
 		{hostWith("process.threads"), nil},
+		{hostWith("users"), []string{"host_users.cc"}},
+		{hostWith("users.database"), []string{"host_users.cc"}},
+		{hostWith("system"), nil},
+		{hostWith("system.info"), []string{"host_system.cc"}},
+		{hostWith("system.time_zones"), []string{"host_time.cc"}},
 	} {
 		buildDir := t.TempDir()
 		paths, err := DeployHostShims(buildDir, tt.host)
@@ -182,6 +187,30 @@ func TestDeployHostHeaders(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fsDir, "wasmify_posix.h")); err != nil {
 		t.Errorf("wasmify_posix.h not deployed with filesystem: %v", err)
+	}
+	for _, tt := range []struct {
+		part    string
+		headers []string
+		absent  []string
+	}{
+		{"users", []string{"wasmify_posix.h"}, []string{"pwd.h", "grp.h"}},
+		{"users.database", []string{"wasmify_posix.h", "pwd.h", "grp.h"}, nil},
+		{"system.time_zones", []string{"wasmify_posix.h", "time.h"}, nil},
+	} {
+		dir, err := DeployHostHeaders(t.TempDir(), hostWith(tt.part))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, header := range tt.headers {
+			if _, err := os.Stat(filepath.Join(dir, header)); err != nil {
+				t.Errorf("%s not deployed with %s: %v", header, tt.part, err)
+			}
+		}
+		for _, header := range tt.absent {
+			if _, err := os.Stat(filepath.Join(dir, header)); err == nil {
+				t.Errorf("%s deployed with %s", header, tt.part)
+			}
+		}
 	}
 }
 

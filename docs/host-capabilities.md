@@ -3,8 +3,9 @@
 WASI preview1 has no processes, file modes or owners, and only a few socket
 calls. A wasm that needs them is given them by the host it runs on:
 wasmify's host shims implement the libc functions on imports of the module
-`wasip1_posix_extension` (the file system and processes) and on
-non-standard imports of `wasi_snapshot_preview1` (the network), and the host
+`wasip1_posix_extension` (the file system, processes, users and the system)
+and on non-standard imports of `wasi_snapshot_preview1` (the network), and
+the host
 implements those imports (the [wasm2go](https://github.com/goccy/wasm2go) runtime
 does). Without any capability the wasm imports standard WASI only and is
 portable to any WASI runtime.
@@ -38,6 +39,9 @@ feature. A name the tree does not have is an error.
 | `network` | `netdb.h` | `sockets` | `socket`, `connect`, `getpeername`, `getsockname`, `getaddrinfo`, `getnameinfo` |
 | `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child or any, `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD: wasi-libc's `O_CLOEXEC` is 0, so `open`, `pipe2` and `dup3` cannot set it), and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64) |
 | | | `threads` | the wasi-threads target: `-pthread`, a shared memory, atomics (wasm2go runs each guest thread on a goroutine) |
+| `users` | `getuid`/`geteuid`/`getgid`/`getegid`, the `setuid` and `setgid` families, `getgroups`/`setgroups` | `database` | `pwd.h` and `grp.h`: `getpwuid`/`getpwnam`/`getpwent` and their `_r` forms, `getgrgid`/`getgrnam`/`getgrent` and their `_r` forms; `getlogin`, `cuserid` |
+| `system` | nothing | `info` | `uname` (and `gethostname`) of the host's system |
+| | | `time_zones` | `localtime`, `mktime` and `strftime` in the zone `TZ` names, `tzset`, `tzname`, `timezone`, `daylight` |
 
 ## What a capability changes in the build
 
@@ -49,9 +53,12 @@ For each part given (a capability's base or a feature), wasmify
   flag it served: `WASMIFY_HOST_SOCKETS`);
 - puts the headers wasi-libc does not have into `<build>/host-include/`,
   which every compile gets on its include path: `wasmify_posix.h` with
-  `filesystem` and `process.spawn`, `spawn.h`, `sys/wait.h` and `unistd.h`
-  (the C library's, declaring `closefrom`) with `process.spawn`, `netdb.h`
-  with `network`;
+  `filesystem`, `process.spawn`, `users`, `system.info` and
+  `system.time_zones`; `spawn.h`, `sys/wait.h` and `unistd.h` (the C
+  library's, declaring `closefrom`) with `process.spawn`; `netdb.h` with
+  `network`; `pwd.h` and `grp.h` with `users.database`; `time.h` (the C
+  library's, declaring `tzset`, `tzname`, `timezone` and `daylight`) with
+  `system.time_zones`;
 - defines `WASMIFY_HOST_<CAPABILITY>` and `WASMIFY_HOST_<CAPABILITY>_<FEATURE>`
   (e.g. `WASMIFY_HOST_NETWORK_SOCKETS`) for every compile, the capture build
   included, so that the project's own sources can test them;

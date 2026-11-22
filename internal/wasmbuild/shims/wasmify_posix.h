@@ -1,8 +1,9 @@
 /* wasmify_posix.h — the host imports behind wasmify's POSIX shims.
  *
- * WASI preview1 has no file modes, owners, creation masks, locks or
- * processes. wasmify's host-capability shims (host_fs.cc, host_fcntl.cc and
- * host_subprocess.cc) implement
+ * WASI preview1 has no file modes, owners, creation masks, locks,
+ * processes, users or time zones. wasmify's host-capability shims
+ * (host_fs.cc, host_fcntl.cc, host_subprocess.cc, host_users.cc,
+ * host_system.cc and host_time.cc) implement
  * the libc functions for them on imports of the module
  * "wasip1_posix_extension", which the host implements (wasm2go's
  * WasiStubs). Every import of that module is declared here, once: the shims
@@ -30,6 +31,7 @@ extern "C" {
  * uses it, in the layout the host reads and writes. */
 struct __wasmify_filestat_ext;
 struct __wasmify_record_lock;
+struct __wasmify_zone;
 
 #define WASMIFY_POSIX_IMPORT(name) __attribute__((import_module("wasip1_posix_extension"), import_name(#name)))
 
@@ -108,6 +110,53 @@ int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
  * failed. */
 WASMIFY_POSIX_IMPORT(fd_closefrom)
 int __wasmify_host_fd_closefrom(int low_fd);
+
+/* ---- the process's user and groups, the system (host_users.cc,
+ *      host_system.cc) --------------------------------------------------- */
+/* The pid, the parent's pid, the real and effective user ids and the real
+ * and effective group ids, in that order. */
+WASMIFY_POSIX_IMPORT(proc_ids)
+int __wasmify_host_proc_ids(uint32_t ids[6]);
+WASMIFY_POSIX_IMPORT(proc_groups)
+int __wasmify_host_proc_groups(uint32_t *gids, int capacity, uint32_t *count);
+/* A user or a group of the host's databases, by id or by name: a record
+ * of the layout host_users.cc reads, at buf; *needed receives its size,
+ * also when buf is too small (-ERANGE). -ENOENT when there is none. */
+WASMIFY_POSIX_IMPORT(proc_user_by_id)
+int __wasmify_host_proc_user_by_id(uint32_t uid, void *buf, int buf_len, uint32_t *needed);
+WASMIFY_POSIX_IMPORT(proc_user_by_name)
+int __wasmify_host_proc_user_by_name(const char *name, int name_len, void *buf, int buf_len,
+                                     uint32_t *needed);
+WASMIFY_POSIX_IMPORT(proc_group_by_id)
+int __wasmify_host_proc_group_by_id(uint32_t gid, void *buf, int buf_len, uint32_t *needed);
+WASMIFY_POSIX_IMPORT(proc_group_by_name)
+int __wasmify_host_proc_group_by_name(const char *name, int name_len, void *buf, int buf_len,
+                                      uint32_t *needed);
+/* The index-th entry of the host's user database (getpwent) and of its
+ * group database (getgrent), as the lookups above hand one back; -ENOENT
+ * past the last. */
+WASMIFY_POSIX_IMPORT(proc_user_at)
+int __wasmify_host_proc_user_at(int index, void *buf, int len, uint32_t *needed);
+WASMIFY_POSIX_IMPORT(proc_group_at)
+int __wasmify_host_proc_group_at(int index, void *buf, int len, uint32_t *needed);
+/* The setuid and setgid families, for a process that is the host process:
+ * request names the call (host_users.cc's SET_ constants), a, b and c are
+ * its arguments. -ENOSYS when the process has no ids of the host's to
+ * change. */
+WASMIFY_POSIX_IMPORT(proc_setids)
+int __wasmify_host_proc_setids(int request, int a, int b, int c);
+WASMIFY_POSIX_IMPORT(proc_setgroups)
+int __wasmify_host_proc_setgroups(const uint32_t *gids, int count);
+/* What uname reports, for a process that is the host process: five strings
+ * (a u32 length, then the bytes). *needed receives the size of the record,
+ * also when buf is too small (-ERANGE). -ENOSYS otherwise. */
+WASMIFY_POSIX_IMPORT(proc_uname)
+int __wasmify_host_proc_uname(void *buf, int buf_len, uint32_t *needed);
+
+/* ---- time zones (host_time.cc) ------------------------------------------ */
+WASMIFY_POSIX_IMPORT(clock_zone)
+int __wasmify_host_clock_zone(const char *tz, int tz_len, int has_tz, int64_t t, int local,
+                              struct __wasmify_zone *out);
 
 #undef WASMIFY_POSIX_IMPORT
 

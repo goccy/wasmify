@@ -1,8 +1,9 @@
 // Package hostcap is what a wasm build is given of the host it runs on:
 // the capabilities of a POSIX system that WASI preview1 does not have,
 // which wasmify's host shims implement on host imports: of the module
-// "wasip1_posix_extension" for the file system and processes, of
-// "wasi_snapshot_preview1" for the network (wasmify.json's "host").
+// "wasip1_posix_extension" for the file system, processes, users and the
+// system, of "wasi_snapshot_preview1" for the network (wasmify.json's
+// "host").
 //
 // The capabilities follow the option groups of POSIX.1-2017 (Annex E),
 // each with the features that belong inside it:
@@ -10,6 +11,8 @@
 //	filesystem  {attributes, fifo, locking}
 //	network     {sockets}
 //	process     {spawn, threads}
+//	users       {database}
+//	system      {info, time_zones}
 //
 // A capability is given as true (with all its features) or as an object of
 // the features it is given (a feature left out is not). A capability that
@@ -30,6 +33,8 @@ const (
 	Filesystem = "filesystem"
 	Network    = "network"
 	Process    = "process"
+	Users      = "users"
+	System     = "system"
 )
 
 // capabilityFeatures is a capability of the schema and its features.
@@ -43,6 +48,8 @@ var schema = []capabilityFeatures{
 	{Filesystem, []string{"attributes", "fifo", "locking"}},
 	{Network, []string{"sockets"}},
 	{Process, []string{"spawn", "threads"}},
+	{Users, []string{"database"}},
+	{System, []string{"info", "time_zones"}},
 }
 
 func features(capability string) ([]string, bool) {

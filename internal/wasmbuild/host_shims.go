@@ -13,9 +13,10 @@ import (
 
 // hostShimFS holds wasmify's host shims: the libc functions of the host
 // capabilities (wasmify.json's "host"). Each source is guarded inside by a
-// macro of hostcap.Set.Macros: the file system's and the processes' by the
-// macros of the parts they serve, the network's by the macro of the
-// deprecated flag it served (WASMIFY_HOST_SOCKETS).
+// macro of hostcap.Set.Macros: the file system's, the processes', the
+// users' and the system's by the macros of the parts they serve, the
+// network's by the macro of the deprecated flag it served
+// (WASMIFY_HOST_SOCKETS).
 //
 //go:embed shims/*.cc
 var hostShimFS embed.FS
@@ -44,7 +45,7 @@ func hostShim(name string) ([]byte, error) {
 }
 
 // hostHeaderContent returns the content of a header a capability part puts
-// in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h);
+// in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h);
 // netdb.h, which is the POSIX-compat overlay's (the same file under both,
 // so that a project and the socket shim see one layout of struct addrinfo
 // whether or not the overlay is on); or the stub registry's (spawn.h,
@@ -80,8 +81,10 @@ const HostIncludeSubdir = "host-include"
 // DeployHostHeaders writes the headers of the given host capabilities into
 // <buildDir>/host-include and returns that directory ("" when no given part
 // has a header): per capability part the headers wasi-libc does not have
-// (wasmify_posix.h with filesystem and process.spawn, spawn.h, sys/wait.h
-// and unistd.h with process.spawn, netdb.h with network).
+// (wasmify_posix.h with filesystem, process.spawn, users, system.info and
+// system.time_zones; spawn.h, sys/wait.h and unistd.h with process.spawn;
+// netdb.h with network; pwd.h and grp.h with users.database; time.h with
+// system.time_zones).
 //
 // The directory is added to every wasm-build compile's include path (see
 // wasmCompileFlags), so the upstream sources and wasmify's shims resolve the

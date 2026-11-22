@@ -39,6 +39,14 @@ var hostParts = []hostPart{
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
 		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
 	{capability: hostcap.Process, feature: "threads"},
+
+	{capability: hostcap.Users, shims: []string{"host_users.cc"}, headers: []string{"wasmify_posix.h"}},
+	{capability: hostcap.Users, feature: "database", shims: []string{"host_users.cc"}, headers: []string{"pwd.h", "grp.h"}},
+
+	{capability: hostcap.System},
+	{capability: hostcap.System, feature: "info", shims: []string{"host_system.cc"}, headers: []string{"wasmify_posix.h"}},
+	{capability: hostcap.System, feature: "time_zones", shims: []string{"host_time.cc"},
+		headers: []string{"wasmify_posix.h", "time.h"}},
 }
 
 // hostShimOrder is the order the shims are deployed and compiled in.
@@ -46,6 +54,9 @@ var hostShimOrder = []string{
 	"host_sockets.cc",
 	"host_subprocess.cc",
 	"host_fcntl.cc",
+	"host_users.cc",
+	"host_time.cc",
+	"host_system.cc",
 	"host_fs.cc",
 }
 
