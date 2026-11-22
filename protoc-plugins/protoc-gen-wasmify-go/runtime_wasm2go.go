@@ -89,6 +89,7 @@ const unifiedImportsWasm2go = `import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"__WASM2GO_IMPORT__"
 	"__WASM2GO_IMPORT__/base"
@@ -123,7 +124,10 @@ const unifiedImportAnchorsWasm2go = `var (
 // the wasm2go base.EnvImports interface, so they cannot be a const).
 const moduleBodyWasm2go = `import (
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"__WASM2GO_IMPORT__"
 	"__WASM2GO_IMPORT__/base"
@@ -132,26 +136,31 @@ const moduleBodyWasm2go = `import (
 // Module is the bridge handle. It wraps the wasm2go-transpiled module
 // (*base.Module) and serialises every entry on m.mu.
 //
-// Reentrant callbacks — a host-import callback whose handler needs
-// to make further calls back into the transpiled module — are
-// supported by releasing m.mu around the user handler in
-// handleCallback.
+// Every activation of the transpiled module shares one C shadow stack
+// (the stack-pointer global), so activations must unwind in strict
+// LIFO order. m.mu is therefore held for the whole of an outermost
+// call, including while a callback handler runs. Reentrant callbacks —
+// a host-import callback whose handler makes further calls back into
+// the transpiled module — are supported for the handler's own
+// goroutine only: handleCallback records it in holderGID, and acquire
+// lets that goroutine re-enter without the lock. Its nested calls run
+// on top of the suspended outer frames and return before the handler
+// does, so LIFO order holds.
 //
-// Safety rests on a single structural property: every path that
-// touches transpiled module state goes through m.invoke, and
-// m.invoke holds m.mu for the entire duration of its call. The
-// release window in handleCallback simply lets another m.invoke
-// grab the mutex and run as a fully nested top-level call — same
-// goroutine via the user handler, different goroutine via an
-// unrelated caller, it doesn't matter. Either way the nested call
-// enters, balances its own state changes, and exits before the
-// outer call resumes, so the outer call never observes a mid-flight
-// inner call.
+// Releasing m.mu around the handler instead would let a second
+// goroutine's call suspend in a callback of its own on the same shadow
+// stack. If the first call then resumed and returned before it, the
+// stack pointer would rewind past the second call's live C++ frames,
+// and the next call would overwrite them.
 type Module struct {
-	// mu serialises every entry into the transpiled module (invoke +
-	// nested re-entry from inside a callback handler).
+	// mu serialises every entry into the transpiled module.
 	mu sync.Mutex
-	g  *base.Module
+	// holderGID is the ID of the goroutine running a callback handler
+	// while it holds mu on behalf of the outer call, or 0 when no
+	// handler is running. Only that goroutine may re-enter without
+	// taking mu.
+	holderGID atomic.Int64
+	g         *base.Module
 	// cbMu guards callbacks and nextCBID. RWMutex because lookup in
 	// handleCallback is hot (every host-import dispatch) while
 	// Register/Unregister are rare (typically once per lifetime of a
@@ -259,8 +268,7 @@ __WASM2GO_NEW__
 // restores the mutable wasm globals so a mid-call panic does not leak
 // an abandoned C++ activation frame.
 func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.release(m.acquire())
 	var reqPtr, reqLen wptr
 	if len(req) > 0 {
 		reqPtr = wasm2go.WasmAlloc(m.g, wptr(len(req)))
@@ -290,12 +298,55 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 	return out, nil
 }
 
+// acquire takes m.mu unless the calling goroutine is the one running a
+// callback handler, which already holds it on behalf of the outer call.
+// It reports whether it took the lock; pass the result to release.
+//
+// currentGID is only consulted while a handler is running, so ordinary
+// calls never pay for the runtime.Stack parse.
+func (m *Module) acquire() bool {
+	if holder := m.holderGID.Load(); holder != 0 && holder == currentGID() {
+		return false
+	}
+	m.mu.Lock()
+	return true
+}
+
+// release undoes acquire.
+func (m *Module) release(locked bool) {
+	if locked {
+		m.mu.Unlock()
+	}
+}
+
+// currentGID returns a stable per-goroutine identifier extracted
+// from runtime.Stack.
+func currentGID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Stack output starts with "goroutine N [...".
+	const prefix = "goroutine "
+	s := string(buf[:n])
+	if !strings.HasPrefix(s, prefix) {
+		return 0
+	}
+	rest := s[len(prefix):]
+	id := int64(0)
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + int64(c-'0')
+	}
+	return id
+}
+
 // resolveTypeName calls the C++ bridge to get the runtime type name of
 // the object at ptr. Returns a fully qualified C++ class name.
 func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	buf := pbAppendUint64(pbNewBuf(), 1, ptr)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.release(m.acquire())
 	reqPtr := wasm2go.WasmAlloc(m.g, wptr(len(buf)))
 	copy(wasm2go.Memory(m.g)[wptrOff(reqPtr):], buf)
 	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, wptr(len(buf)))
@@ -437,16 +488,18 @@ func (m *Module) handleCallback(callbackID, methodID int32, reqPtr, reqLen wptr)
 		copy(buf, mem[wptrOff(reqPtr):wptrOff(reqPtr)+uint64(reqLen)])
 		req = buf
 	}
-	// Release m.mu around the user handler so that nested calls
-	// back into the transpiled module can re-acquire it without
-	// deadlocking. The IIFE + defer guarantees Lock is retaken even
-	// if the handler panics, so the outer invoke's defer
-	// m.mu.Unlock() always sees a held mutex.
+	// Keep m.mu held around the user handler and mark this goroutine
+	// as its holder, so nested calls the handler makes on this
+	// goroutine re-enter without deadlocking while every other
+	// goroutine waits for the outermost call to return (see Module).
+	// The IIFE + defer restores the previous holder — the enclosing
+	// handler's, for a nested callback — even if the handler panics.
 	var resp []byte
 	var err error
 	func() {
-		m.mu.Unlock()
-		defer m.mu.Lock()
+		prev := m.holderGID.Load()
+		m.holderGID.Store(currentGID())
+		defer m.holderGID.Store(prev)
 		resp, err = handler.HandleCallback(methodID, req)
 	}()
 	if err != nil {
