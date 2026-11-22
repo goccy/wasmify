@@ -17,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/goccy/wasmify/internal/hostcap"
 )
 
 // SchemaVersion is the current wasmify.json schema version. Bump in lock-
@@ -38,9 +40,17 @@ type State struct {
 	// Output configures where wasmify's user-facing artifacts are
 	// written. Each per-artifact path is independently optional;
 	// relative paths resolve against the directory holding wasmify.json.
-	Output     *Output           `json:"output,omitempty"`
-	Selection  *Selection        `json:"user_selection,omitempty"`
-	Bridge     *BridgeConfig     `json:"bridge,omitempty"`
+	Output    *Output       `json:"output,omitempty"`
+	Selection *Selection    `json:"user_selection,omitempty"`
+	Bridge    *BridgeConfig `json:"bridge,omitempty"`
+	// Host is what the wasm is given of the host it runs on, beyond WASI
+	// preview1: the capabilities of a POSIX system (processes, sockets,
+	// file attributes, ...), each true or an object of its features (see
+	// package hostcap). wasmify compiles and links the host shims of the
+	// capabilities given; the wasm then imports their functions, which the
+	// host has to implement (the wasm2go runtime does). Unset, the wasm imports
+	// standard WASI only and is portable to any WASI runtime.
+	Host       *hostcap.Set      `json:"host,omitempty"`
 	WasmBuild  *WasmBuildConfig  `json:"wasm_build,omitempty"`
 	Skip       *SkipConfig       `json:"skip,omitempty"`
 	Phases     map[string]*Phase `json:"phases,omitempty"`
@@ -230,7 +240,7 @@ type WasmBuildConfig struct {
 	// EH-enabled libc++) is provisioned into wasi-sdk on demand — the first
 	// wasm64 build runs the same stages as `install-sdk --wasm64`.
 	// Requires a memory64-capable runtime (the wasm2go backend qualifies;
-	// wazero does not). Incompatible with HostThreads: no toolchain
+	// wazero does not). Incompatible with process.threads: no toolchain
 	// produces shared wasm64 memories, and wasm2go rejects atomics on a
 	// memory64 module. Mirrors the WASMIFY_WASM64 environment variable.
 	Wasm64 bool `json:"wasm64,omitempty"`
@@ -375,6 +385,9 @@ type BridgeConfig struct {
 	// buf option.
 	Wasm2GoImportPath string `json:"Wasm2GoImportPath,omitempty"`
 
+	// Deprecated: HostSockets is an alias of the "host" capabilities
+	// {"network": {"sockets": true}}; giving both is an error.
+	//
 	// HostSockets opts into host-provided outbound sockets. WASI preview1
 	// has no socket()/connect()/getaddrinfo(), so by default the generated
 	// wasm imports only standard wasi_snapshot_preview1 and is portable to
@@ -386,6 +399,9 @@ type BridgeConfig struct {
 	// runtime). Off by default to keep the wasm portable.
 	HostSockets bool `json:"HostSockets,omitempty"`
 
+	// Deprecated: HostSubprocess is an alias of the "host" capabilities
+	// {"process": {"spawn": true}}; giving both is an error.
+	//
 	// HostSubprocess opts into host-provided process spawning. WASI preview1
 	// cannot spawn processes; when this is true the bridge compile is given
 	// -DWASMIFY_HOST_SUBPROCESS, activating the project's posix_spawn/waitpid
@@ -394,6 +410,9 @@ type BridgeConfig struct {
 	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
 	HostSubprocess bool `json:"HostSubprocess,omitempty"`
 
+	// Deprecated: HostFS is an alias of the "host" capabilities
+	// {"filesystem": {"attributes": true}}; giving both is an error.
+	//
 	// HostFS opts into host-backed filesystem fidelity. WASI preview1 can
 	// neither change file modes nor report permission bits, and wasi-libc's
 	// cwd bookkeeping keeps ".." components live; when this is true the
@@ -405,6 +424,9 @@ type BridgeConfig struct {
 	// runtime). Off by default to keep the wasm portable.
 	HostFS bool `json:"HostFS,omitempty"`
 
+	// Deprecated: HostThreads is an alias of the "host" capabilities
+	// {"process": {"threads": true}}; giving both is an error.
+	//
 	// HostThreads opts into threads. The wasm is built for wasi-threads
 	// (-pthread, shared memory, atomics), which makes it import
 	// wasi_thread_spawn and export wasi_thread_start — and wasm2go runs each
@@ -927,4 +949,22 @@ func JSONSchema() string {
     "analyzed_at": { "type": "string", "format": "date-time" }
   }
 }`
+}
+
+// Aliases returns the deprecated host flags of the bridge config; a nil
+// config has none.
+func (b *BridgeConfig) Aliases() hostcap.Aliases {
+	if b == nil {
+		return hostcap.Aliases{}
+	}
+	return hostcap.Aliases{FS: b.HostFS, Sockets: b.HostSockets, Subprocess: b.HostSubprocess, Threads: b.HostThreads}
+}
+
+// HostTree returns the "host" capabilities as given in wasmify.json; none
+// when the key is absent.
+func (s *State) HostTree() hostcap.Set {
+	if s == nil || s.Host == nil {
+		return hostcap.Set{}
+	}
+	return *s.Host
 }
