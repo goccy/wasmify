@@ -16,8 +16,12 @@
 extern "C" {
 #endif
 
-/* sigset_t — wasi-sdk guards the __NEED_sigset_t define, so define it here */
-#ifndef __DEFINED_sigset_t
+/* sigset_t — wasi-sdk guards the __NEED_sigset_t define, so define it here.
+ * With the host capability signals it is the C library's own (one byte),
+ * which host_signal.cc's struct sigaction and signal sets are built on. */
+#ifdef WASMIFY_HOST_SIGNALS
+#include <__typedef_sigset_t.h>
+#elif !defined(__DEFINED_sigset_t)
 typedef struct __sigset_t { unsigned long __bits[128/sizeof(long)]; } sigset_t;
 #define __DEFINED_sigset_t
 #endif
@@ -66,6 +70,13 @@ struct sigaction {
 #define sa_sigaction __sa_handler.sa_sigaction
 #endif
 
+/* sigprocmask's how */
+#ifndef SIG_BLOCK
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+#endif
+
 /* Signal set manipulation */
 int sigemptyset(sigset_t *);
 int sigfillset(sigset_t *);
@@ -79,6 +90,7 @@ int sigpending(sigset_t *);
 /* sigaction and kill */
 int sigaction(int, const struct sigaction *__restrict, struct sigaction *__restrict);
 int kill(pid_t, int);
+int killpg(pid_t, int);
 
 #ifdef __cplusplus
 }

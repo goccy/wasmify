@@ -38,9 +38,12 @@ feature. A name the tree does not have is an error.
 | | | `locking` | `flock`, the record locks of `fcntl` (F_GETLK, F_SETLK, F_SETLKW) |
 | `network` | `netdb.h` | `sockets` | `socket`, `connect`, `getpeername`, `getsockname`, `getaddrinfo`, `getnameinfo` |
 | `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child or any, `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD: wasi-libc's `O_CLOEXEC` is 0, so `open`, `pipe2` and `dup3` cannot set it), and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64) |
+| | | `resources` | `getpid`/`getppid`, `getpriority`/`setpriority`/`nice`, `times` with the CPU time the host accounts |
 | | | `threads` | the wasi-threads target: `-pthread`, a shared memory, atomics (wasm2go runs each guest thread on a goroutine) |
 | `users` | `getuid`/`geteuid`/`getgid`/`getegid`, the `setuid` and `setgid` families, `getgroups`/`setgroups` | `database` | `pwd.h` and `grp.h`: `getpwuid`/`getpwnam`/`getpwent` and their `_r` forms, `getgrgid`/`getgrnam`/`getgrent` and their `_r` forms; `getlogin`, `cuserid` |
+| `signals` | the disposition table (`sigaction`, `signal`), the mask (`sigprocmask`, `sigsuspend`, `sigpending`), the signal sets, `raise`, `kill`/`killpg`, `pause`, `abort`; delivery at the calls and at the application's safe points (`__wasmify_signal_absorb`), and the SIGPIPE of a `write`, `writev` or `send` before it returns | `timers` | `alarm`, `ualarm`, `setitimer`/`getitimer` (ITIMER_REAL) |
 | `system` | nothing | `info` | `uname` (and `gethostname`) of the host's system |
+| | | `logging` | `syslog.h`: `openlog`, `syslog`, `vsyslog`, `closelog`, `setlogmask` |
 | | | `time_zones` | `localtime`, `mktime` and `strftime` in the zone `TZ` names, `tzset`, `tzname`, `timezone`, `daylight` |
 
 ## What a capability changes in the build
@@ -48,30 +51,50 @@ feature. A name the tree does not have is an error.
 For each part given (a capability's base or a feature), wasmify
 
 - compiles and links the shims that implement it (sources under
-  `<build>/host-shims/`; the file system's and the processes' guarded by
-  the macros of their parts, the network's by the macro of the deprecated
-  flag it served: `WASMIFY_HOST_SOCKETS`);
+  `<build>/host-shims/`; each guarded by the macros of its parts, the
+  network's by the macro of the deprecated flag it served:
+  `WASMIFY_HOST_SOCKETS`);
 - puts the headers wasi-libc does not have into `<build>/host-include/`,
   which every compile gets on its include path: `wasmify_posix.h` with
-  `filesystem`, `process.spawn`, `users`, `system.info` and
-  `system.time_zones`; `spawn.h`, `sys/wait.h` and `unistd.h` (the C
-  library's, declaring `closefrom`) with `process.spawn`; `netdb.h` with
-  `network`; `pwd.h` and `grp.h` with `users.database`; `time.h` (the C
-  library's, declaring `tzset`, `tzname`, `timezone` and `daylight`) with
-  `system.time_zones`;
+  `filesystem`, `process.spawn`, `process.resources`, `signals`, `users`,
+  `system.info`, `system.logging` and `system.time_zones`; `spawn.h`,
+  `sys/wait.h` and `unistd.h` (the C library's, declaring what the shims
+  define that it leaves out: `closefrom`, `getppid`, `nice`, `pause`) with
+  `process.spawn`, `process.resources` and `signals`; `netdb.h` with
+  `network`; `signal.h` (the POSIX-compat overlay's, with the C library's
+  one-byte `sigset_t`) with `signals`; `sys/time.h` (the C
+  library's, declaring the interval timer) with `signals.timers`;
+  `syslog.h` with `system.logging`; `pwd.h` and `grp.h` with
+  `users.database`; `time.h` (the C library's, declaring `tzset`, `tzname`,
+  `timezone` and `daylight`) with `system.time_zones`;
 - defines `WASMIFY_HOST_<CAPABILITY>` and `WASMIFY_HOST_<CAPABILITY>_<FEATURE>`
   (e.g. `WASMIFY_HOST_NETWORK_SOCKETS`) for every compile, the capture build
   included, so that the project's own sources can test them;
 - wraps at link the libc functions the shims replace (`chdir` and libc's
   path resolution with `filesystem`; `chmod`, `stat`, `open`, `mkdir`,
   `access`, ... with `filesystem.attributes`; `fcntl` with
-  `filesystem.locking`).
+  `filesystem.locking` and `process.spawn`; `write`, `writev` and `send`
+  with `signals`).
 
 ## `wasmify_posix.h`
 
 Every import of the module `wasip1_posix_extension` is declared once in
 `wasmify_posix.h`. An application includes it to call an import no libc
 function expresses.
+
+## Signals
+
+A WASI guest cannot be interrupted, so a signal reaches a handler at a
+point the program chooses. The program registers a flag word with
+`__wasmify_host_proc_signal_register`: a 4-byte aligned `uint32_t` the host
+sets to 1, atomically, when it records a signal for the process. The
+program reads it with an atomic load at its safe points and calls
+`__wasmify_signal_absorb` there, which delivers the recorded signals. The
+shim delivers the signals of its own calls (`raise`, `kill` of the process
+itself, `sigprocmask`, `sigsuspend`, `pause`, the SIGPIPE of a write) before
+they return. A program that has registered no word has no handlers run:
+the host gives every signal for it its default action, which ends the
+process for most signals. The shim registers no word of its own.
 
 ## Deprecated flags
 

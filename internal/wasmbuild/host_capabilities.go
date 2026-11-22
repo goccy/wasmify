@@ -38,13 +38,21 @@ var hostParts = []hostPart{
 	{capability: hostcap.Process},
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
 		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
+	{capability: hostcap.Process, feature: "resources", shims: []string{"host_process.cc"},
+		headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Process, feature: "threads"},
+
+	{capability: hostcap.Signals, shims: []string{"host_signal.cc"},
+		headers: []string{"wasmify_posix.h", "signal.h", "unistd.h"}, wraps: []string{"write", "writev", "send"}},
+	{capability: hostcap.Signals, feature: "timers", shims: []string{"host_signal.cc"}, headers: []string{"sys/time.h"}},
 
 	{capability: hostcap.Users, shims: []string{"host_users.cc"}, headers: []string{"wasmify_posix.h"}},
 	{capability: hostcap.Users, feature: "database", shims: []string{"host_users.cc"}, headers: []string{"pwd.h", "grp.h"}},
 
 	{capability: hostcap.System},
 	{capability: hostcap.System, feature: "info", shims: []string{"host_system.cc"}, headers: []string{"wasmify_posix.h"}},
+	{capability: hostcap.System, feature: "logging", shims: []string{"host_syslog.cc"},
+		headers: []string{"wasmify_posix.h", "syslog.h"}},
 	{capability: hostcap.System, feature: "time_zones", shims: []string{"host_time.cc"},
 		headers: []string{"wasmify_posix.h", "time.h"}},
 }
@@ -54,9 +62,12 @@ var hostShimOrder = []string{
 	"host_sockets.cc",
 	"host_subprocess.cc",
 	"host_fcntl.cc",
+	"host_process.cc",
 	"host_users.cc",
+	"host_signal.cc",
 	"host_time.cc",
 	"host_system.cc",
+	"host_syslog.cc",
 	"host_fs.cc",
 }
 

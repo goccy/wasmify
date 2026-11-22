@@ -14,6 +14,17 @@ extern "C" {
 void closefrom(int low_fd);
 #endif
 
+#ifdef WASMIFY_HOST_PROCESS_RESOURCES
+/* host_process.cc */
+pid_t getppid(void);
+int nice(int increment);
+#endif
+
+#ifdef WASMIFY_HOST_SIGNALS
+/* host_signal.cc */
+int pause(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

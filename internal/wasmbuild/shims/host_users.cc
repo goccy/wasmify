@@ -37,14 +37,6 @@ namespace {
 
 enum { ID_PID, ID_PPID, ID_UID, ID_EUID, ID_GID, ID_EGID };
 
-/* proc_ids fails only for memory out of range (EFAULT), which ids is not,
- * so getuid and the rest cannot fail, as POSIX has them. */
-uint32_t process_id(int which) {
-    uint32_t ids[6] = {0, 0, 0, 0, 0, 0};
-    (void)__wasmify_host_proc_ids(ids);
-    return ids[which];
-}
-
 #ifdef WASMIFY_HOST_USERS_DATABASE
 /* A record fetched from the host. The lookup functions return pointers
  * into it, which stay valid until the next lookup of the same kind — the
@@ -265,9 +257,9 @@ int set_ids(int request, uid_t a, uid_t b, uid_t c, uid_t want_real, uid_t want_
         errno = -rc;
         return -1;
     }
-    if ((want_real != (uid_t)-1 && want_real != process_id(real_which)) ||
-        (want_effective != (uid_t)-1 && want_effective != process_id(effective_which)) ||
-        (want_saved != (uid_t)-1 && want_saved != process_id(effective_which))) {
+    if ((want_real != (uid_t)-1 && want_real != __wasmify_process_id(real_which)) ||
+        (want_effective != (uid_t)-1 && want_effective != __wasmify_process_id(effective_which)) ||
+        (want_saved != (uid_t)-1 && want_saved != __wasmify_process_id(effective_which))) {
         errno = EPERM;
         return -1;
     }
@@ -280,10 +272,10 @@ const uid_t kKeep = (uid_t)-1;
 
 extern "C" {
 
-uid_t getuid(void) { return (uid_t)process_id(ID_UID); }
-uid_t geteuid(void) { return (uid_t)process_id(ID_EUID); }
-gid_t getgid(void) { return (gid_t)process_id(ID_GID); }
-gid_t getegid(void) { return (gid_t)process_id(ID_EGID); }
+uid_t getuid(void) { return (uid_t)__wasmify_process_id(ID_UID); }
+uid_t geteuid(void) { return (uid_t)__wasmify_process_id(ID_EUID); }
+gid_t getgid(void) { return (gid_t)__wasmify_process_id(ID_GID); }
+gid_t getegid(void) { return (gid_t)__wasmify_process_id(ID_EGID); }
 
 int setuid(uid_t uid) {
     return set_ids(SET_UID, uid, kKeep, kKeep, uid, uid, kKeep, ID_UID, ID_EUID);

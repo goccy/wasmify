@@ -45,11 +45,11 @@ func hostShim(name string) ([]byte, error) {
 }
 
 // hostHeaderContent returns the content of a header a capability part puts
-// in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h);
-// netdb.h, which is the POSIX-compat overlay's (the same file under both,
-// so that a project and the socket shim see one layout of struct addrinfo
-// whether or not the overlay is on); or the stub registry's (spawn.h,
-// sys/wait.h).
+// in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h,
+// sys/time.h, syslog.h); netdb.h and signal.h, which are the POSIX-compat
+// overlay's (the same file under both, so that a project and the shims see
+// one layout of struct addrinfo and struct sigaction whether or not the
+// overlay is on); or the stub registry's (spawn.h, sys/wait.h).
 func hostHeaderContent(name string) (string, error) {
 	if name == "wasmify_posix.h" {
 		return wasmifyPosixHeader, nil
@@ -61,8 +61,8 @@ func hostHeaderContent(name string) (string, error) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		return "", fmt.Errorf("embedded header <%s>: %w", name, err)
 	}
-	if name == "netdb.h" {
-		data, err := posixCompatFS.ReadFile("stubs/include/netdb.h")
+	if name == "netdb.h" || name == "signal.h" {
+		data, err := posixCompatFS.ReadFile("stubs/include/" + name)
 		if err != nil {
 			return "", fmt.Errorf("missing embedded header <%s>: %w", name, err)
 		}
@@ -81,10 +81,11 @@ const HostIncludeSubdir = "host-include"
 // DeployHostHeaders writes the headers of the given host capabilities into
 // <buildDir>/host-include and returns that directory ("" when no given part
 // has a header): per capability part the headers wasi-libc does not have
-// (wasmify_posix.h with filesystem, process.spawn, users, system.info and
-// system.time_zones; spawn.h, sys/wait.h and unistd.h with process.spawn;
-// netdb.h with network; pwd.h and grp.h with users.database; time.h with
-// system.time_zones).
+// (wasmify_posix.h with every part that has a shim on its imports;
+// spawn.h and sys/wait.h with process.spawn; unistd.h with process.spawn,
+// process.resources and signals; netdb.h with network; signal.h with
+// signals; sys/time.h with signals.timers; syslog.h with system.logging;
+// pwd.h and grp.h with users.database; time.h with system.time_zones).
 //
 // The directory is added to every wasm-build compile's include path (see
 // wasmCompileFlags), so the upstream sources and wasmify's shims resolve the

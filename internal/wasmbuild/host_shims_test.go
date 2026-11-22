@@ -122,6 +122,10 @@ func TestDeployHostShims(t *testing.T) {
 	}{
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
 		{hostWith("process.spawn"), []string{"host_subprocess.cc", "host_fcntl.cc"}},
+		{hostWith("process.resources"), []string{"host_process.cc"}},
+		{hostWith("signals"), []string{"host_signal.cc"}},
+		{hostWith("signals.timers"), []string{"host_signal.cc"}},
+		{hostWith("process.resources", "system.logging"), []string{"host_process.cc", "host_syslog.cc"}},
 		{hostWith("filesystem"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.attributes"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.fifo"), []string{"host_fs.cc"}},
@@ -196,6 +200,10 @@ func TestDeployHostHeaders(t *testing.T) {
 		{"users", []string{"wasmify_posix.h"}, []string{"pwd.h", "grp.h"}},
 		{"users.database", []string{"wasmify_posix.h", "pwd.h", "grp.h"}, nil},
 		{"system.time_zones", []string{"wasmify_posix.h", "time.h"}, nil},
+		{"signals", []string{"wasmify_posix.h", "signal.h", "unistd.h"}, []string{"sys/time.h"}},
+		{"process.resources", []string{"wasmify_posix.h", "unistd.h"}, []string{"signal.h"}},
+		{"signals.timers", []string{"wasmify_posix.h", "sys/time.h"}, nil},
+		{"system.logging", []string{"wasmify_posix.h", "syslog.h"}, nil},
 	} {
 		dir, err := DeployHostHeaders(t.TempDir(), hostWith(tt.part))
 		if err != nil {

@@ -10,9 +10,10 @@
 //
 //	filesystem  {attributes, fifo, locking}
 //	network     {sockets}
-//	process     {spawn, threads}
+//	process     {spawn, resources, threads}
+//	signals     {timers}
 //	users       {database}
-//	system      {info, time_zones}
+//	system      {info, logging, time_zones}
 //
 // A capability is given as true (with all its features) or as an object of
 // the features it is given (a feature left out is not). A capability that
@@ -33,6 +34,7 @@ const (
 	Filesystem = "filesystem"
 	Network    = "network"
 	Process    = "process"
+	Signals    = "signals"
 	Users      = "users"
 	System     = "system"
 )
@@ -47,9 +49,10 @@ type capabilityFeatures struct {
 var schema = []capabilityFeatures{
 	{Filesystem, []string{"attributes", "fifo", "locking"}},
 	{Network, []string{"sockets"}},
-	{Process, []string{"spawn", "threads"}},
+	{Process, []string{"spawn", "resources", "threads"}},
+	{Signals, []string{"timers"}},
 	{Users, []string{"database"}},
-	{System, []string{"info", "time_zones"}},
+	{System, []string{"info", "logging", "time_zones"}},
 }
 
 func features(capability string) ([]string, bool) {
