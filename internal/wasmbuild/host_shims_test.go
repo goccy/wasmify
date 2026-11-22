@@ -121,7 +121,7 @@ func TestDeployHostShims(t *testing.T) {
 		wantShims []string
 	}{
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
-		{hostWith("process.spawn"), []string{"host_subprocess.cc"}},
+		{hostWith("process.spawn"), []string{"host_subprocess.cc", "host_fcntl.cc"}},
 		{hostWith("filesystem"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.attributes"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.fifo"), []string{"host_fs.cc"}},
@@ -166,12 +166,12 @@ func TestDeployHostHeaders(t *testing.T) {
 	if want := filepath.Join(buildDir, HostIncludeSubdir); incDir != want {
 		t.Fatalf("include dir %q, want %q", incDir, want)
 	}
-	for _, header := range []string{"spawn.h", "sys/wait.h"} {
+	for _, header := range []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"} {
 		if _, err := os.Stat(filepath.Join(incDir, header)); err != nil {
 			t.Errorf("%s not deployed: %v", header, err)
 		}
 	}
-	for _, header := range []string{"netdb.h", "wasmify_posix.h"} {
+	for _, header := range []string{"netdb.h"} {
 		if _, err := os.Stat(filepath.Join(incDir, header)); err == nil {
 			t.Errorf("%s deployed without the part that needs it", header)
 		}

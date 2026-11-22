@@ -1,9 +1,11 @@
 /* host_fcntl.cc — fcntl for what the host keeps of a descriptor.
  *
- * Compiled when the host capability filesystem.locking (record locks) is
- * given.
+ * Compiled when the host capability process.spawn (the close-on-exec flag,
+ * which decides what a command inherits, and F_DUPFD) or
+ * filesystem.locking (record locks) is given; each request is handled
+ * when its capability is.
  */
-#ifdef WASMIFY_HOST_FILESYSTEM_LOCKING
+#if defined(WASMIFY_HOST_PROCESS_SPAWN) || defined(WASMIFY_HOST_FILESYSTEM_LOCKING)
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -29,11 +31,11 @@ struct __wasmify_record_lock {
 
 extern int __real_fcntl(int fd, int cmd, ...);
 
-/* The C library names the record locks where it has them: the wasm64 build
- * of wasi-libc does, wasm32's does not (a program there cannot ask for
- * them, and the requests below are only recognized where they have
+/* The C library names the record locks and F_DUPFD where it has them: the
+ * wasm64 build of wasi-libc does, wasm32's does not (a program there cannot
+ * ask for them, and the requests below are only recognized where they have
  * names). */
-#ifdef F_GETLK
+#if defined(WASMIFY_HOST_FILESYSTEM_LOCKING) && defined(F_GETLK)
 /* fcntl's record locks (F_GETLK, F_SETLK, F_SETLKW) on the host's file
  * behind fd, which wasi-libc refuses (ENOTSUP). */
 static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
@@ -69,12 +71,16 @@ static int __wasmify_fcntl_lock(int fd, int cmd, struct flock *fl) {
 }
 #endif
 
-/* fcntl: the record locks are the host's (wasi-libc refuses them). Every
- * other request is libc's. (The link routes fcntl here: -Wl,--wrap=fcntl.) */
+/* fcntl: with process.spawn the close-on-exec flag (F_GETFD, F_SETFD) is
+ * the host's, which hands a command the descriptors that are not marked
+ * under their numbers; F_DUPFD and F_DUPFD_CLOEXEC duplicate the descriptor
+ * under the lowest free number from the one given. With filesystem.locking
+ * the record locks are the host's. Every other request is libc's. (The link
+ * routes fcntl here: -Wl,--wrap=fcntl.) */
 int __wrap_fcntl(int fd, int cmd, ...) {
     va_list ap;
     va_start(ap, cmd);
-#ifdef F_GETLK
+#if defined(WASMIFY_HOST_FILESYSTEM_LOCKING) && defined(F_GETLK)
     if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
         struct flock *fl = va_arg(ap, struct flock *);
         va_end(ap);
@@ -83,6 +89,40 @@ int __wrap_fcntl(int fd, int cmd, ...) {
 #endif
     const int arg = va_arg(ap, int);
     va_end(ap);
+#if defined(WASMIFY_HOST_PROCESS_SPAWN) && defined(F_DUPFD)
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        if (arg < 0) { errno = EINVAL; return -1; }
+        int nfd = -1;
+        int rc = __wasmify_host_fd_dupfd(fd, arg, &nfd);
+        if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+        if (cmd == F_DUPFD_CLOEXEC) {
+            int old = 0;
+            rc = __wasmify_host_fd_cloexec(nfd, 1, 1, &old);
+            if (rc != 0) {
+                /* The duplicate the caller does not get is closed. The call
+                 * fails with the flag's error, which is what the caller
+                 * has to know; an error of the close has no way out. */
+                (void)close(nfd);
+                errno = (rc < 0) ? -rc : rc;
+                return -1;
+            }
+        }
+        return nfd;
+    }
+#endif
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
+    if (cmd == F_GETFD || cmd == F_SETFD) {
+        int old = 0;
+        const int rc = __wasmify_host_fd_cloexec(fd, cmd == F_SETFD, (arg & FD_CLOEXEC) != 0, &old);
+        /* The host keeps the flag for the descriptors of its table. A
+         * preopened directory is none of them (EBADF), and no command
+         * inherits it: libc answers for it as for any WASI descriptor, and
+         * fails with EBADF itself for a number that names nothing. */
+        if (rc == -EBADF) return __real_fcntl(fd, cmd, arg);
+        if (rc != 0) { errno = (rc < 0) ? -rc : rc; return -1; }
+        return cmd == F_GETFD ? (old ? FD_CLOEXEC : 0) : 0;
+    }
+#endif
     return __real_fcntl(fd, cmd, arg);
 }
 

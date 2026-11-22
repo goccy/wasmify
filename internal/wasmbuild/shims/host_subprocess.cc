@@ -1,13 +1,13 @@
 /* host_subprocess.cc — generic host-provided subprocess shim.
  *
  * This translation unit is deployed and compiled by wasmify itself, and only
- * when host subprocess support is opted in (bridge.HostSubprocess in
- * wasmify.json, which makes wasmify define WASMIFY_HOST_SUBPROCESS for this
- * compile). Without that opt-in the file is excluded entirely and the wasm
- * stays portable (standard wasi imports only).
+ * when the host capability process.spawn is given (wasmify.json's "host",
+ * which makes wasmify define WASMIFY_HOST_PROCESS_SPAWN for this compile).
+ * Without it the file is excluded entirely and the wasm stays portable
+ * (standard wasi imports only).
  *
  * WASI preview1 cannot spawn processes and wasi-libc provides no posix_spawn
- * or waitpid. When host subprocess support is opted in, we DEFINE the
+ * or waitpid. With process.spawn, we DEFINE the
  * posix_spawn family + waitpid here, backed by proc_spawn/proc_wait host
  * imports the WASI host implements in Go (e.g. via os/exec). A consuming
  * library's subprocess implementation that routes onto posix_spawn therefore
@@ -20,33 +20,20 @@
  * ends as the child's stdout/stderr. Other file actions and the attr object
  * carry no state and are no-ops. The spawned program is a HOST binary, gated
  * by the host's exec whitelist. */
-#ifdef WASMIFY_HOST_SUBPROCESS
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
 
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <sys/types.h>
 
+#include "wasmify_posix.h"
+
 extern "C" {
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_spawn")))
-extern int __wasmify_host_proc_spawn(const char *path, char *const argv[],
-                                     char *const envp[], int stdin_fd,
-                                     int stdout_fd, int stderr_fd,
-                                     const char *cwd, int *pid_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_wait")))
-extern int __wasmify_host_proc_wait(int pid, int options, int *status_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("pipe")))
-extern int __wasmify_host_pipe(int *fds_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup")))
-extern int __wasmify_host_fd_dup(int fd, int *fd_out);
-
-__attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_dup2")))
-extern int __wasmify_host_fd_dup2(int from, int to);
 
 /* dup()/dup2()/dup3(): wasi-libc has neither (WASI preview1 has only
  * fd_renumber, whose move semantics close the source). The host imports
@@ -138,12 +125,55 @@ int posix_spawn(pid_t *pid, const char *path,
     return __wasmify_host_spawn(pid, path, argv, envp, fa);
 }
 
+/* posix_spawnp: a name without a slash is searched for in the directories
+ * of the CALLING process's PATH — the guest's, which the host cannot see —
+ * the way execvp does it: each directory is tried in turn, a missing file
+ * moves on to the next, and a file that exists but cannot be executed is
+ * remembered so that the search reports EACCES rather than ENOENT. Without
+ * PATH the directories are the C library's default (musl's execvp). */
 int posix_spawnp(pid_t *pid, const char *file,
                  const posix_spawn_file_actions_t *fa,
                  const posix_spawnattr_t *attr,
                  char *const argv[], char *const envp[]) {
     (void)attr;
-    return __wasmify_host_spawn(pid, file, argv, envp, fa);
+    if (file == nullptr || *file == '\0') return ENOENT;
+    if (strchr(file, '/') != nullptr)
+        return __wasmify_host_spawn(pid, file, argv, envp, fa);
+
+    const char *path = getenv("PATH");
+    if (path == nullptr) path = "/usr/local/bin:/bin:/usr/bin";
+    const size_t file_len = strlen(file);
+    bool seen_eacces = false;
+    for (const char *dir = path;;) {
+        const char *end = dir;
+        while (*end != '\0' && *end != ':') end++;
+        const size_t dir_len = static_cast<size_t>(end - dir);
+        /* An empty entry names the current directory. */
+        std::string candidate;
+        if (dir_len > 0) {
+            candidate.append(dir, dir_len);
+        } else {
+            candidate.push_back('.');
+        }
+        candidate.push_back('/');
+        candidate.append(file, file_len);
+        const int rc = __wasmify_host_spawn(pid, candidate.c_str(), argv, envp, fa);
+        switch (rc) {
+        case 0:
+            return 0;
+        case EACCES:
+            seen_eacces = true;
+            break;
+        case ENOENT:
+        case ENOTDIR:
+            break;
+        default:
+            return rc;
+        }
+        if (*end == '\0') break;
+        dir = end + 1;
+    }
+    return seen_eacces ? EACCES : ENOENT;
 }
 
 /* pipe()/pipe2(): host-backed pipe for subprocess capture_output. The host
@@ -166,27 +196,32 @@ int pipe2(int fildes[2], int flags) {
 
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     int st = 0;
-    int rc = __wasmify_host_proc_wait(static_cast<int>(pid), options, &st);
+    int reaped = static_cast<int>(pid);
+    /* pid -1 (and the process-group forms, which have no meaning here: the
+     * host tracks children, not groups) waits for any child. */
+    int rc = pid > 0
+        ? __wasmify_host_proc_wait(static_cast<int>(pid), options, &st)
+        : __wasmify_host_proc_wait_any(options, &reaped, &st);
     if (rc == 0) {
         if (wstatus != nullptr) *wstatus = st;
-        return pid;
+        return static_cast<pid_t>(reaped);
     }
     int e = (rc < 0) ? -rc : rc;
     if (e == EAGAIN) {
-        return 0; /* WNOHANG: child still running */
+        return 0; /* WNOHANG: no child has finished yet */
     }
     errno = e;
     return static_cast<pid_t>(-1);
 }
 
 pid_t wait(int *wstatus) {
-    /* Reaping an arbitrary child is unsupported; the consumer always waits on a
-     * specific pid via waitpid(). */
-    (void)wstatus;
-    errno = ECHILD;
-    return static_cast<pid_t>(-1);
+    return waitpid(static_cast<pid_t>(-1), wstatus, 0);
 }
+
+/* closefrom(2): closes every descriptor from low_fd up. It returns nothing,
+ * so an error of the host's has no way to the caller. */
+void closefrom(int low_fd) { (void)__wasmify_host_fd_closefrom(low_fd); }
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_SUBPROCESS */
+#endif /* WASMIFY_HOST_PROCESS_SPAWN */

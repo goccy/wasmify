@@ -1,8 +1,8 @@
 // Package hostcap is what a wasm build is given of the host it runs on:
 // the capabilities of a POSIX system that WASI preview1 does not have,
 // which wasmify's host shims implement on host imports: of the module
-// "wasip1_posix_extension" for the file system, of "wasi_snapshot_preview1"
-// for the network and processes (wasmify.json's "host").
+// "wasip1_posix_extension" for the file system and processes, of
+// "wasi_snapshot_preview1" for the network (wasmify.json's "host").
 //
 // The capabilities follow the option groups of POSIX.1-2017 (Annex E),
 // each with the features that belong inside it:

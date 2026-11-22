@@ -403,9 +403,11 @@ type BridgeConfig struct {
 	// {"process": {"spawn": true}}; giving both is an error.
 	//
 	// HostSubprocess opts into host-provided process spawning. WASI preview1
-	// cannot spawn processes; when this is true the bridge compile is given
-	// -DWASMIFY_HOST_SUBPROCESS, activating the project's posix_spawn/waitpid
-	// shim (backed by proc_spawn/proc_wait host imports). The resulting wasm
+	// cannot spawn processes; when this is true every compile is given
+	// -DWASMIFY_HOST_PROCESS, -DWASMIFY_HOST_PROCESS_SPAWN and
+	// -DWASMIFY_HOST_SUBPROCESS, activating the posix_spawn/waitpid shim
+	// (backed by proc_spawn/proc_wait imports of wasip1_posix_extension) and
+	// wrapping fcntl for the close-on-exec flag. The resulting wasm
 	// then requires a host that implements those imports and EXECUTES HOST
 	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
 	HostSubprocess bool `json:"HostSubprocess,omitempty"`

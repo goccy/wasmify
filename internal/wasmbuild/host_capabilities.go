@@ -36,8 +36,8 @@ var hostParts = []hostPart{
 	{capability: hostcap.Network, feature: "sockets", shims: []string{"host_sockets.cc"}},
 
 	{capability: hostcap.Process},
-	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc"},
-		headers: []string{"spawn.h", "sys/wait.h"}},
+	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
+		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
 	{capability: hostcap.Process, feature: "threads"},
 }
 

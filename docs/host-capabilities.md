@@ -3,8 +3,8 @@
 WASI preview1 has no processes, file modes or owners, and only a few socket
 calls. A wasm that needs them is given them by the host it runs on:
 wasmify's host shims implement the libc functions on imports of the module
-`wasip1_posix_extension` (the file system) and on non-standard imports of
-`wasi_snapshot_preview1` (the network and processes), and the host
+`wasip1_posix_extension` (the file system and processes) and on
+non-standard imports of `wasi_snapshot_preview1` (the network), and the host
 implements those imports (the [wasm2go](https://github.com/goccy/wasm2go) runtime
 does). Without any capability the wasm imports standard WASI only and is
 portable to any WASI runtime.
@@ -36,7 +36,7 @@ feature. A name the tree does not have is an error.
 | | | `fifo` | `mkfifo` |
 | | | `locking` | `flock`, the record locks of `fcntl` (F_GETLK, F_SETLK, F_SETLKW) |
 | `network` | `netdb.h` | `sockets` | `socket`, `connect`, `getpeername`, `getsockname`, `getaddrinfo`, `getnameinfo` |
-| `process` | nothing | `spawn` | the `posix_spawn` family, `waitpid`/`wait`, `pipe`/`pipe2`, `dup`/`dup2`/`dup3` |
+| `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child or any, `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD: wasi-libc's `O_CLOEXEC` is 0, so `open`, `pipe2` and `dup3` cannot set it), and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64) |
 | | | `threads` | the wasi-threads target: `-pthread`, a shared memory, atomics (wasm2go runs each guest thread on a goroutine) |
 
 ## What a capability changes in the build
@@ -44,12 +44,13 @@ feature. A name the tree does not have is an error.
 For each part given (a capability's base or a feature), wasmify
 
 - compiles and links the shims that implement it (sources under
-  `<build>/host-shims/`; the file system's guarded by the macros of its
-  parts, the network's and the processes' by the macro of the deprecated
-  flag they served: `WASMIFY_HOST_SOCKETS`, `WASMIFY_HOST_SUBPROCESS`);
+  `<build>/host-shims/`; the file system's and the processes' guarded by
+  the macros of their parts, the network's by the macro of the deprecated
+  flag it served: `WASMIFY_HOST_SOCKETS`);
 - puts the headers wasi-libc does not have into `<build>/host-include/`,
   which every compile gets on its include path: `wasmify_posix.h` with
-  `filesystem`, `spawn.h` and `sys/wait.h` with `process.spawn`, `netdb.h`
+  `filesystem` and `process.spawn`, `spawn.h`, `sys/wait.h` and `unistd.h`
+  (the C library's, declaring `closefrom`) with `process.spawn`, `netdb.h`
   with `network`;
 - defines `WASMIFY_HOST_<CAPABILITY>` and `WASMIFY_HOST_<CAPABILITY>_<FEATURE>`
   (e.g. `WASMIFY_HOST_NETWORK_SOCKETS`) for every compile, the capture build

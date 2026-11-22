@@ -1,7 +1,8 @@
 /* wasmify_posix.h — the host imports behind wasmify's POSIX shims.
  *
- * WASI preview1 has no file modes, owners, creation masks or locks.
- * wasmify's host-capability shims (host_fs.cc and host_fcntl.cc) implement
+ * WASI preview1 has no file modes, owners, creation masks, locks or
+ * processes. wasmify's host-capability shims (host_fs.cc, host_fcntl.cc and
+ * host_subprocess.cc) implement
  * the libc functions for them on imports of the module
  * "wasip1_posix_extension", which the host implements (wasm2go's
  * WasiStubs). Every import of that module is declared here, once: the shims
@@ -74,12 +75,39 @@ int __wasmify_host_fd_flock(int fd, int lock, int wait);
 WASMIFY_POSIX_IMPORT(fd_path)
 int __wasmify_host_fd_path(int fd, char *buf, int buf_len, int *length);
 
-/* ---- descriptors (host_fcntl.cc) ---------------------------------------- */
+/* ---- descriptors and processes (host_subprocess.cc, host_fcntl.cc) ------ */
+WASMIFY_POSIX_IMPORT(proc_spawn)
+int __wasmify_host_proc_spawn(const char *path, char *const argv[], char *const envp[],
+                              int stdin_fd, int stdout_fd, int stderr_fd, const char *cwd,
+                              int *pid_out);
+WASMIFY_POSIX_IMPORT(proc_wait)
+int __wasmify_host_proc_wait(int pid, int options, int *status_out);
+WASMIFY_POSIX_IMPORT(proc_wait_any)
+int __wasmify_host_proc_wait_any(int options, int *pid_out, int *status_out);
+WASMIFY_POSIX_IMPORT(pipe)
+int __wasmify_host_pipe(int *fds_out);
+/* fd_dup, fd_dup2 and fd_dupfd return 0 or a positive errno. */
+WASMIFY_POSIX_IMPORT(fd_dup)
+int __wasmify_host_fd_dup(int fd, int *fd_out);
+WASMIFY_POSIX_IMPORT(fd_dup2)
+int __wasmify_host_fd_dup2(int from, int to);
+/* fd_dup under the lowest free number that is at least min. */
+WASMIFY_POSIX_IMPORT(fd_dupfd)
+int __wasmify_host_fd_dupfd(int fd, int min, int *fd_out);
 /* A record lock of the host's file behind fd: cmd 0 F_GETLK (the lock in
  * the way is written back, type F_UNLCK when there is none), 1 F_SETLK,
  * 2 F_SETLKW. */
 WASMIFY_POSIX_IMPORT(fd_lock)
 int __wasmify_host_fd_lock(int fd, int cmd, struct __wasmify_record_lock *lock);
+/* The close-on-exec flag of a descriptor: *old receives it as it was (0 or
+ * 1); with set non-zero it then becomes value. */
+WASMIFY_POSIX_IMPORT(fd_cloexec)
+int __wasmify_host_fd_cloexec(int fd, int set, int value, int *old);
+/* Closes every descriptor from low_fd up, each also when an earlier close
+ * failed. Returns 0, or the positive errno of the first close that
+ * failed. */
+WASMIFY_POSIX_IMPORT(fd_closefrom)
+int __wasmify_host_fd_closefrom(int low_fd);
 
 #undef WASMIFY_POSIX_IMPORT
 
