@@ -1,12 +1,13 @@
 // Package hostcap is what a wasm build is given of the host it runs on:
 // the capabilities of a POSIX system that WASI preview1 does not have,
-// which wasmify's host shims implement on host imports of the module
-// "wasi_snapshot_preview1" (wasmify.json's "host").
+// which wasmify's host shims implement on host imports: of the module
+// "wasip1_posix_extension" for the file system, of "wasi_snapshot_preview1"
+// for the network and processes (wasmify.json's "host").
 //
 // The capabilities follow the option groups of POSIX.1-2017 (Annex E),
 // each with the features that belong inside it:
 //
-//	filesystem  {attributes}
+//	filesystem  {attributes, fifo, locking}
 //	network     {sockets}
 //	process     {spawn, threads}
 //
@@ -39,7 +40,7 @@ type capabilityFeatures struct {
 
 // The features of each capability, in the order of the schema.
 var schema = []capabilityFeatures{
-	{Filesystem, []string{"attributes"}},
+	{Filesystem, []string{"attributes", "fifo", "locking"}},
 	{Network, []string{"sockets"}},
 	{Process, []string{"spawn", "threads"}},
 }
@@ -238,12 +239,12 @@ type Aliases struct {
 func (a Aliases) Any() bool { return a.FS || a.Sockets || a.Subprocess || a.Threads }
 
 // Set is what the aliases stand for: HostFS the file system with its
-// attributes; HostSockets the network's sockets; HostSubprocess
+// attributes and locks; HostSockets the network's sockets; HostSubprocess
 // process.spawn; HostThreads process.threads.
 func (a Aliases) Set() Set {
 	var s Set
 	if a.FS {
-		s.Enable(Filesystem, "attributes")
+		s.Enable(Filesystem, "attributes", "locking")
 	}
 	if a.Sockets {
 		s.Enable(Network, "sockets")

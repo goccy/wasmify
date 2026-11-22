@@ -85,11 +85,14 @@ func TestResolveAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range [][2]string{
-		{Filesystem, "attributes"}, {Network, "sockets"}, {Process, "spawn"}, {Process, "threads"},
+		{Filesystem, "attributes"}, {Filesystem, "locking"}, {Network, "sockets"}, {Process, "spawn"}, {Process, "threads"},
 	} {
 		if !s.Feature(f[0], f[1]) {
 			t.Errorf("the aliases do not give %s.%s", f[0], f[1])
 		}
+	}
+	if s.Feature(Filesystem, "fifo") {
+		t.Errorf("the aliases give more than they covered: %v", s.Macros())
 	}
 	var tree Set
 	tree.Enable(Network, "sockets")

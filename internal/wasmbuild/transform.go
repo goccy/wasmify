@@ -886,7 +886,7 @@ func wasmCompileFlags(cfg WasmConfig) []string {
 	}
 	if cfg.HostIncludeDir != "" && !cfg.Host.Empty() {
 		// Carries the headers wasi-libc omits for the capabilities given
-		// (spawn.h, netdb.h). Gated behind
+		// (wasmify_posix.h, spawn.h, netdb.h). Gated behind
 		// the macros above so its presence is inert when they are off.
 		flags = append(flags, "-I", cfg.HostIncludeDir)
 	}

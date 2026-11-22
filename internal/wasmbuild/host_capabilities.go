@@ -24,9 +24,13 @@ type hostPart struct {
 // (process.threads: effectiveTarget, wasmCompileFlags and the link) or a
 // base whose features bring all there is.
 var hostParts = []hostPart{
-	{capability: hostcap.Filesystem},
+	{capability: hostcap.Filesystem, shims: []string{"host_fs.cc"}, headers: []string{"wasmify_posix.h"},
+		wraps: []string{"chdir", "__wasilibc_find_relpath_alloc"}},
 	{capability: hostcap.Filesystem, feature: "attributes", shims: []string{"host_fs.cc"},
-		wraps: []string{"chmod", "stat", "lstat", "chdir"}},
+		wraps: []string{"chmod", "fchmod", "stat", "lstat", "fstat", "open", "mkdir", "access", "faccessat"}},
+	{capability: hostcap.Filesystem, feature: "fifo", shims: []string{"host_fs.cc"}},
+	{capability: hostcap.Filesystem, feature: "locking", shims: []string{"host_fs.cc", "host_fcntl.cc"},
+		wraps: []string{"fcntl"}},
 
 	{capability: hostcap.Network, shims: []string{"host_sockets.cc"}, headers: []string{"netdb.h"}},
 	{capability: hostcap.Network, feature: "sockets", shims: []string{"host_sockets.cc"}},
@@ -41,6 +45,7 @@ var hostParts = []hostPart{
 var hostShimOrder = []string{
 	"host_sockets.cc",
 	"host_subprocess.cc",
+	"host_fcntl.cc",
 	"host_fs.cc",
 }
 

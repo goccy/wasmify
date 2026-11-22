@@ -135,7 +135,7 @@ Generated artifacts (`build.json`, `api-spec.json`, `proto/`, `bridge/`, the `.w
 
 ### Host capabilities
 
-What a wasm needs of a POSIX system that WASI preview1 lacks (processes, sockets, file modes) is declared under `host`, by the option groups of POSIX.1-2017:
+What a wasm needs of a POSIX system that WASI preview1 lacks (processes, sockets, file modes and owners) is declared under `host`, by the option groups of POSIX.1-2017:
 
 ```jsonc
 {
@@ -147,7 +147,7 @@ What a wasm needs of a POSIX system that WASI preview1 lacks (processes, sockets
 }
 ```
 
-The capabilities are `filesystem` {attributes}, `network` {sockets} and `process` {spawn, threads}. wasmify compiles and links the host shims of what is given (libc functions on non-standard imports of the module `wasi_snapshot_preview1`, which the host implements; the wasm2go runtime does), with their headers, `WASMIFY_HOST_*` macros and link wraps. Without `host` the wasm imports standard WASI only. The bridge flags `HostFS`, `HostSockets`, `HostSubprocess` and `HostThreads` are deprecated aliases. See [`docs/host-capabilities.md`](docs/host-capabilities.md).
+The capabilities are `filesystem` {attributes, fifo, locking}, `network` {sockets} and `process` {spawn, threads}. wasmify compiles and links the host shims of what is given (libc functions on imports of the module `wasip1_posix_extension` for the file system and of `wasi_snapshot_preview1` for the rest, which the host implements; the wasm2go runtime does), with their headers, `WASMIFY_HOST_*` macros and link wraps. Without `host` the wasm imports standard WASI only. The bridge flags `HostFS`, `HostSockets`, `HostSubprocess` and `HostThreads` are deprecated aliases. See [`docs/host-capabilities.md`](docs/host-capabilities.md).
 
 ## Using the generated Go package
 
@@ -247,6 +247,6 @@ Global flag: `--non-interactive` (or env `WASMIFY_NON_INTERACTIVE=1`) — fails 
 ## Documentation
 
 - [`agents/wasmify.md`](agents/wasmify.md) — AI agent workflow (Claude Code `/wasmify` etc.).
-- [`docs/host-capabilities.md`](docs/host-capabilities.md) — the `host` capabilities: what each brings, the deprecated flags.
+- [`docs/host-capabilities.md`](docs/host-capabilities.md) — the `host` capabilities: what each brings, `wasmify_posix.h`, the deprecated flags.
 - [`protoc-plugins/README.md`](protoc-plugins/README.md) — wasm binary contract + proto options (plugin authors).
 - [`protoc-plugins/protoc-gen-wasmify-go/README.md`](protoc-plugins/protoc-gen-wasmify-go/README.md) — Go plugin design.

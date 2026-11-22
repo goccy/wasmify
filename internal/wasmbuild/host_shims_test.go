@@ -122,7 +122,10 @@ func TestDeployHostShims(t *testing.T) {
 	}{
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
 		{hostWith("process.spawn"), []string{"host_subprocess.cc"}},
+		{hostWith("filesystem"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.attributes"), []string{"host_fs.cc"}},
+		{hostWith("filesystem.fifo"), []string{"host_fs.cc"}},
+		{hostWith("filesystem.locking"), []string{"host_fcntl.cc", "host_fs.cc"}},
 		{hostWith("process.threads"), nil},
 	} {
 		buildDir := t.TempDir()
@@ -168,10 +171,17 @@ func TestDeployHostHeaders(t *testing.T) {
 			t.Errorf("%s not deployed: %v", header, err)
 		}
 	}
-	for _, header := range []string{"netdb.h"} {
+	for _, header := range []string{"netdb.h", "wasmify_posix.h"} {
 		if _, err := os.Stat(filepath.Join(incDir, header)); err == nil {
 			t.Errorf("%s deployed without the part that needs it", header)
 		}
+	}
+	fsDir, err := DeployHostHeaders(t.TempDir(), hostWith("filesystem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fsDir, "wasmify_posix.h")); err != nil {
+		t.Errorf("wasmify_posix.h not deployed with filesystem: %v", err)
 	}
 }
 

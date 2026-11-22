@@ -10,13 +10,21 @@ import (
 )
 
 // hostShimFS holds wasmify's host shims: the libc functions of the host
-// capabilities (wasmify.json's "host"). Each source is guarded inside by the
-// macro of the deprecated flag it served (WASMIFY_HOST_FS,
-// WASMIFY_HOST_SOCKETS, WASMIFY_HOST_SUBPROCESS), which hostcap.Set.Macros
-// defines for the part that stands for it (see hostParts).
+// capabilities (wasmify.json's "host"). Each source is guarded inside by a
+// macro of hostcap.Set.Macros: the file system's by the macros of the parts
+// it serves, the network's and the processes' by the macro of the
+// deprecated flag they served (WASMIFY_HOST_SOCKETS,
+// WASMIFY_HOST_SUBPROCESS).
 //
 //go:embed shims/*.cc
 var hostShimFS embed.FS
+
+// wasmifyPosixHeader declares every import of the "wasip1_posix_extension"
+// module the shims are built on. The shims and an application include it
+// from the host-include directory.
+//
+//go:embed shims/wasmify_posix.h
+var wasmifyPosixHeader string
 
 // hostShim returns the content of one of the shims.
 func hostShim(name string) ([]byte, error) {
@@ -28,11 +36,14 @@ func hostShim(name string) ([]byte, error) {
 }
 
 // hostHeaderContent returns the content of a header a capability part puts
-// in host-include: netdb.h, which is the POSIX-compat overlay's (the same
-// file under both, so that a project and the socket shim see one layout of
-// struct addrinfo whether or not the overlay is on); or the stub registry's
-// (spawn.h, sys/wait.h).
+// in host-include: wasmify_posix.h; netdb.h, which is the POSIX-compat
+// overlay's (the same file under both, so that a project and the socket
+// shim see one layout of struct addrinfo whether or not the overlay is on);
+// or the stub registry's (spawn.h, sys/wait.h).
 func hostHeaderContent(name string) (string, error) {
+	if name == "wasmify_posix.h" {
+		return wasmifyPosixHeader, nil
+	}
 	if name == "netdb.h" {
 		data, err := posixCompatFS.ReadFile("stubs/include/netdb.h")
 		if err != nil {
@@ -53,7 +64,8 @@ const HostIncludeSubdir = "host-include"
 // DeployHostHeaders writes the headers of the given host capabilities into
 // <buildDir>/host-include and returns that directory ("" when no given part
 // has a header): per capability part the headers wasi-libc does not have
-// (spawn.h and sys/wait.h with process.spawn, netdb.h with network).
+// (wasmify_posix.h with filesystem, spawn.h and sys/wait.h with
+// process.spawn, netdb.h with network).
 //
 // The directory is added to every wasm-build compile's include path (see
 // wasmCompileFlags), so the upstream sources and wasmify's shims resolve the

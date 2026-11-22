@@ -1,15 +1,91 @@
 package wasmbuild
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/goccy/wasm2go/transpile"
 	"github.com/goccy/wasmify/internal/hostcap"
 	"github.com/goccy/wasmify/internal/wasmbuild/wasm64"
 )
+
+// hostImportDecl is an import of wasmify_posix.h: the import's name, then
+// the C function declared for it.
+var hostImportDecl = regexp.MustCompile(`WASMIFY_POSIX_IMPORT\((\w+)\)\s*\n[^(;]*?\b(__wasmify_host_\w+)\(`)
+
+// Every import wasmify_posix.h declares is one the wasm2go runtime serves:
+// a program that refers to each is built for both pointer widths (wasm64
+// where its sysroot is installed), its import table has each under
+// wasip1_posix_extension, and wasm2go translates it, which it refuses for
+// a name of that module the runtime does not have. Skipped where no
+// wasi-sdk is installed.
+func TestHostImportsAreServedByWasm2go(t *testing.T) {
+	sdk, err := DetectWasiSDK("")
+	if err != nil {
+		t.Skipf("no wasi-sdk: %v", err)
+	}
+	decls := hostImportDecl.FindAllStringSubmatch(wasmifyPosixHeader, -1)
+	if len(decls) == 0 || len(decls) != strings.Count(wasmifyPosixHeader, "WASMIFY_POSIX_IMPORT(")-1 {
+		t.Fatalf("found %d import declarations in wasmify_posix.h, want every WASMIFY_POSIX_IMPORT but the macro's own", len(decls))
+	}
+	var program strings.Builder
+	program.WriteString("#include \"wasmify_posix.h\"\n__attribute__((used)) void *const refs[] = {\n")
+	for _, d := range decls {
+		fmt.Fprintf(&program, "    (void *)&%s,\n", d[2])
+	}
+	program.WriteString("};\nint main(void) { return refs[0] == 0; }\n")
+	for _, wasm64Build := range []bool{false, true} {
+		width := "wasm32"
+		if wasm64Build {
+			width = "wasm64"
+		}
+		t.Run(width, func(t *testing.T) {
+			if wasm64Build {
+				installed, err := wasm64.SysrootInstalled(sdk, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !installed {
+					t.Skip("no wasm64 sysroot")
+				}
+			}
+			dir := t.TempDir()
+			main := filepath.Join(dir, "main.c")
+			if err := os.WriteFile(main, []byte(program.String()), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wasmBin, err := os.ReadFile(buildHostProgram(t, sdk, dir, hostWith(hostcap.Filesystem), wasm64Build, main))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := transpile.Parse(bytes.NewReader(wasmBin))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			imported := map[string]bool{}
+			for _, i := range m.Imports {
+				if i.Module == "wasip1_posix_extension" {
+					imported[i.Name] = true
+				}
+			}
+			for _, d := range decls {
+				if !imported[d[1]] {
+					t.Errorf("%s is not imported from wasip1_posix_extension", d[1])
+				}
+			}
+			var out bytes.Buffer
+			if _, err := transpile.Translate(&out, m, transpile.Options{Package: "guest", OutputImportPath: "hostimports/guest", PureOnly: true}); err != nil {
+				t.Errorf("wasm2go does not serve the imports: %v", err)
+			}
+		})
+	}
+}
 
 // Each part of the capability tree, given alone, builds
 // for both pointer widths (wasm64 where its sysroot is installed) under the
