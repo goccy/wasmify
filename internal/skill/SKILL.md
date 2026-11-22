@@ -317,6 +317,16 @@ After the first `gen-proto` run, wasmify auto-discovers dependent libraries and 
 - `SkipClasses`: Classes to exclude entirely (e.g., test-only classes)
 - `SkipHeaders`: Headers that cause compilation issues
 - `SkipStaticMethods`: Static methods to exclude (defaults include protobuf internals)
+- `CustomBridgeSources`: The project's hand-written bridge sources (paths relative to the directory holding `wasmify.json`). `wasm-build` compiles and links each one into the bridge
+- `CustomBridgeHeaders`: The project's own headers (paths resolved like `CustomBridgeSources`) that `parse-headers` always parses on top of the headers it discovers from the build's `.d` files. Their declarations stay in `api-spec.json` even outside `project.root_dir`, so a helper declared next to a `CustomBridgeSources` file can be exported like any other function. The generated bridge includes the header by the path written here. Each must compile with the project's compile flags; `parse-headers` fails otherwise. Requires the auto-discovery mode (no `--header`)
+
+```json
+{
+  "CustomBridgeSources": ["helper.cc"],
+  "CustomBridgeHeaders": ["helper.h"],
+  "ExportFunctions": ["myproject_wasm::Helper"]
+}
+```
 
 ### Phase 8: GEN PROTO
 
