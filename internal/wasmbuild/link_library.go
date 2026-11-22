@@ -91,35 +91,7 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	}
 
 	compiler := filepath.Join(cfg.WasiSDKPath, "bin", "clang++")
-	args := wasmLinkFlags(cfg)
-	args = append(args,
-		"-Wl,--allow-multiple-definition",
-		"-o", outputFile,
-	)
-	// Extra linker flags (e.g. -Wl,--wrap=connect to route libc socket calls
-	// to host-provided shims in the bridge sources) from cfg.ExtraLDFlags. A nil
-	// slice appends nothing, so no guard is needed.
-	args = append(args, cfg.EffectiveExtraLDFlags()...)
-
-	// Add extra objects (e.g., bridge code) before archives. These
-	// objects carry the per-method `w_<svc>_<mid>` and
-	// `wasmify_get_type_name` exports — the references they make into
-	// the archive libraries are what pull the needed code in.
-	args = append(args, extraObjects...)
-	args = append(args, archives...)
-
-	// Resolve the LLVM SjLj runtime last. Code compiled with
-	// `-mllvm -wasm-enable-sjlj` lowers every setjmp/longjmp to calls into
-	// __wasm_setjmp / __wasm_longjmp / __wasm_setjmp_test, which live in the
-	// wasi-sysroot's libsetjmp.a (they implement the jump via wasm exception
-	// handling). Without -lsetjmp those stay UNDEFINED and the transpiler
-	// surfaces them as no-op host imports, so a longjmp silently falls through
-	// to the `unreachable` the compiler placed after it and traps at run time
-	// (this is how a guest's longjmp-based unwinding is realised at run time). -l is
-	// harmless when unreferenced: the linker only pulls archive members that
-	// something actually calls, so projects with no setjmp/longjmp are
-	// unaffected. It must come AFTER the archives that reference it.
-	args = append(args, "-lsetjmp")
+	args := libraryLinkArgs(cfg, outputFile, extraObjects, archives)
 
 	fmt.Fprintf(os.Stderr, "[wasm-build] Linking library: %s (%d archives, %d extra objects)\n",
 		targetName+".wasm", len(archives), len(extraObjects))
@@ -146,4 +118,42 @@ func LinkLibrary(targetName string, cfg WasmConfig, extraObjects []string) (stri
 	}
 
 	return outputFile, nil
+}
+
+// libraryLinkArgs returns the arguments of a library's link (LinkLibrary):
+// the options, the extra objects, the archives, and the libraries after them.
+func libraryLinkArgs(cfg WasmConfig, outputFile string, extraObjects, archives []string) []string {
+	args := wasmLinkOptions(cfg)
+	args = append(args,
+		"-Wl,--allow-multiple-definition",
+		"-o", outputFile,
+	)
+	// Extra linker flags (e.g. -Wl,--wrap=connect to route libc socket calls
+	// to host-provided shims in the bridge sources) from cfg.ExtraLDFlags. A nil
+	// slice appends nothing, so no guard is needed.
+	args = append(args, cfg.EffectiveExtraLDFlags()...)
+
+	// Add extra objects (e.g., bridge code) before archives. These
+	// objects carry the per-method `w_<svc>_<mid>` and
+	// `wasmify_get_type_name` exports — the references they make into
+	// the archive libraries are what pull the needed code in.
+	args = append(args, extraObjects...)
+	args = append(args, archives...)
+	// Libraries last (see wasiEmulationLibs): the bridge objects and the
+	// project's archives take precedence over what wasi-libc emulates.
+	args = append(args, wasiEmulationLibs()...)
+
+	// Resolve the LLVM SjLj runtime last. Code compiled with
+	// `-mllvm -wasm-enable-sjlj` lowers every setjmp/longjmp to calls into
+	// __wasm_setjmp / __wasm_longjmp / __wasm_setjmp_test, which live in the
+	// wasi-sysroot's libsetjmp.a (they implement the jump via wasm exception
+	// handling). Without -lsetjmp those stay UNDEFINED and the transpiler
+	// surfaces them as no-op host imports, so a longjmp silently falls through
+	// to the `unreachable` the compiler placed after it and traps at run time
+	// (this is how a guest's longjmp-based unwinding is realised at run time). -l is
+	// harmless when unreferenced: the linker only pulls archive members that
+	// something actually calls, so projects with no setjmp/longjmp are
+	// unaffected. It must come AFTER the archives that reference it.
+	args = append(args, "-lsetjmp")
+	return args
 }
