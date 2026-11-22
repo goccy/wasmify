@@ -2138,21 +2138,12 @@ func typeRefToProto(ref apispec.TypeRef) string {
 		// standard `string error = 15` field on every callback
 		// response, so on the wire there's nothing to add.
 		if inner, ok := statusOrInnerType(ref); ok {
-			resolved := resolveTypeName(strings.TrimSpace(inner))
-			if resolved == "" {
-				resolved = inner
+			// A vector payload is `repeated E`, as for a plain vector
+			// return; the bridge writes it element by element.
+			if elem, ok := vectorElemSpelling(inner); ok {
+				return "repeated " + statusOrVectorElemProto(elem)
 			}
-			if messageNameMap != nil {
-				if name, exists := messageNameMap[resolved]; exists {
-					if isValidProtoIdent(name) {
-						return name
-					}
-				}
-			}
-			if name := protoMessageName(resolved); isValidProtoIdent(name) {
-				return name
-			}
-			return "bytes"
+			return statusOrPayloadProto(inner)
 		}
 		// Library-specific string aliases (ExtraStringTypes, e.g.
 		// absl::string_view, absl::Cord) that the parser doesn't
@@ -2222,6 +2213,37 @@ func typeRefToProto(ref apispec.TypeRef) string {
 	default:
 		return "bytes"
 	}
+}
+
+// statusOrPayloadProto is the proto type of a StatusOr-like wrapper's
+// payload T: T's message.
+func statusOrPayloadProto(inner string) string {
+	resolved := resolveTypeName(strings.TrimSpace(inner))
+	if resolved == "" {
+		resolved = inner
+	}
+	if messageNameMap != nil {
+		if name, exists := messageNameMap[resolved]; exists {
+			if isValidProtoIdent(name) {
+				return name
+			}
+		}
+	}
+	if name := protoMessageName(resolved); isValidProtoIdent(name) {
+		return name
+	}
+	return "bytes"
+}
+
+// statusOrVectorElemProto is the proto type of the elements of a
+// StatusOr-like wrapper's `std::vector<E>` payload, matching what
+// vectorElemTypeRef makes the bridge write.
+func statusOrVectorElemProto(elem string) string {
+	ref := vectorElemTypeRef(elem)
+	if ref.Kind == apispec.TypeHandle {
+		return statusOrPayloadProto(elem)
+	}
+	return typeRefToProto(*ref)
 }
 
 // primitiveToPbType maps C primitive type names to Protobuf types.
