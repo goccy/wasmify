@@ -5,9 +5,29 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+// A library's link names the WASI emulation libraries after the extra
+// objects and the archives, so that a definition of the project's is seen
+// before the library's copy.
+func TestLibraryLinkArgsEmulationLibsLast(t *testing.T) {
+	cfg := WasmConfig{WasiSDKPath: "/opt/wasi-sdk", Target: "wasm32-wasip1"}
+	bridge, archive := "/build/obj/api_bridge.o", "/build/lib/libproject.a"
+	args := libraryLinkArgs(cfg, "/build/output/lib.wasm", []string{bridge}, []string{archive})
+	bridgeAt, archiveAt := slices.Index(args, bridge), slices.Index(args, archive)
+	if bridgeAt < 0 || archiveAt < 0 {
+		t.Fatalf("args %v lack the bridge object or the archive", args)
+	}
+	last := max(bridgeAt, archiveAt)
+	for _, lib := range wasiEmulationLibs() {
+		if i := slices.Index(args, lib); i <= last {
+			t.Errorf("%s at %d, want after the objects and archives (%d): %v", lib, i, last, args)
+		}
+	}
+}
 
 func TestLinkLibrary_NoLibDir(t *testing.T) {
 	tmp := t.TempDir()
