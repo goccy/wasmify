@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goccy/wasmify/internal/buildjson"
+	"github.com/goccy/wasmify/internal/wasmbuild/wasm64"
 )
 
 // MissingHeaderHandler is called when a missing header is detected during compilation.
@@ -43,6 +44,19 @@ type ExecuteHandlers struct {
 	OnSkipPersist   SkipPersister
 }
 
+// cacheTarget returns what the build cache's outputs were built for (see
+// BuildCache.Target): the effective target triple, and for wasm64 the
+// recipe of the compiler-rt builtins wasmify builds (wasm64.BuiltinsRevision),
+// which every wasm64 link takes, so that builtins of another recipe make the
+// cached links stale.
+func cacheTarget(cfg WasmConfig) string {
+	target := effectiveTarget(cfg)
+	if cfg.Wasm64 {
+		target += " builtins=" + wasm64.BuiltinsRevision
+	}
+	return target
+}
+
 // Execute runs all wasm build steps sequentially with build cache support.
 // Handlers enable interactive error recovery (missing header stubs, skip on error).
 func Execute(steps []WasmBuildStep, cfg WasmConfig, handlers ExecuteHandlers) ([]WasmBuildStep, error) {
@@ -55,7 +69,7 @@ func Execute(steps []WasmBuildStep, cfg WasmConfig, handlers ExecuteHandlers) ([
 		}
 	}
 
-	bc := LoadBuildCache(cfg.BuildDir, effectiveTarget(cfg))
+	bc := LoadBuildCache(cfg.BuildDir, cacheTarget(cfg))
 
 	// Execute in order: compile, archive, link
 	phases := []buildjson.StepType{

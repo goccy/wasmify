@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/goccy/wasmify/internal/buildjson"
+	"github.com/goccy/wasmify/internal/wasmbuild/wasm64"
 )
 
 // A target-triple change (wasm_build.wasm64 flipped, HostThreads
@@ -72,5 +73,17 @@ func TestBuildCacheSaveRecordsTarget(t *testing.T) {
 	}
 	if got := LoadBuildCache(tmp, "wasm64-wasip1").Target; got != "wasm64-wasip1" {
 		t.Fatalf("reloaded target = %q, want wasm64-wasip1", got)
+	}
+}
+
+// A wasm64 cache records the recipe of the compiler-rt builtins its links
+// took, so that a rebuild of them by another recipe discards the cached
+// links; a wasm32 cache records the triple alone.
+func TestCacheTargetNamesTheWasm64Builtins(t *testing.T) {
+	if got, want := cacheTarget(WasmConfig{Target: "wasm32-wasip1", Wasm64: true}), "wasm64-wasip1 builtins="+wasm64.BuiltinsRevision; got != want {
+		t.Errorf("wasm64 cache target = %q, want %q", got, want)
+	}
+	if got := cacheTarget(WasmConfig{Target: "wasm32-wasip1"}); got != "wasm32-wasip1" {
+		t.Errorf("wasm32 cache target = %q, want wasm32-wasip1", got)
 	}
 }
