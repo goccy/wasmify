@@ -386,15 +386,17 @@ type BridgeConfig struct {
 	Wasm2GoImportPath string `json:"Wasm2GoImportPath,omitempty"`
 
 	// Deprecated: HostSockets is an alias of the "host" capabilities
-	// {"network": {"sockets": true}}; giving both is an error.
+	// {"network": {"sockets": true, "resolver": true}}; giving both is an
+	// error.
 	//
-	// HostSockets opts into host-provided outbound sockets. WASI preview1
-	// has no socket()/connect()/getaddrinfo(), so by default the generated
-	// wasm imports only standard wasi_snapshot_preview1 and is portable to
-	// any wasi runtime. When this is true, the bridge compile is given
-	// -DWASMIFY_HOST_SOCKETS, which activates the project's socket shim
-	// (libc socket()/connect()/getaddrinfo() backed by sock_socket/
-	// sock_connect/sock_getaddrinfo host imports). The resulting wasm then
+	// HostSockets opts into host-provided sockets. WASI preview1 has no
+	// socket()/connect()/getaddrinfo(), so by default the generated wasm
+	// imports only standard wasi_snapshot_preview1 and is portable to any
+	// wasi runtime. When this is true, every compile is given
+	// -DWASMIFY_HOST_NETWORK, -DWASMIFY_HOST_NETWORK_SOCKETS,
+	// -DWASMIFY_HOST_NETWORK_RESOLVER and -DWASMIFY_HOST_SOCKETS, activating
+	// the socket shim (the libc socket and resolver functions backed by
+	// sock_* imports of wasip1_posix_extension). The resulting wasm then
 	// requires a host that implements those imports (e.g. the wasm2go
 	// runtime). Off by default to keep the wasm portable.
 	HostSockets bool `json:"HostSockets,omitempty"`

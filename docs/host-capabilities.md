@@ -3,11 +3,8 @@
 WASI preview1 has no processes, file modes or owners, and only a few socket
 calls. A wasm that needs them is given them by the host it runs on:
 wasmify's host shims implement the libc functions on imports of the module
-`wasip1_posix_extension` (the file system, processes, users and the system)
-and on non-standard imports of `wasi_snapshot_preview1` (the network), and
-the host
-implements those imports (the [wasm2go](https://github.com/goccy/wasm2go) runtime
-does). Without any capability the wasm imports standard WASI only and is
+`wasip1_posix_extension`, and the host implements those imports (the
+[wasm2go](https://github.com/goccy/wasm2go) runtime does). Without any capability the wasm imports standard WASI only and is
 portable to any WASI runtime.
 
 The capabilities are declared under `host` in `wasmify.json`. They follow
@@ -36,7 +33,8 @@ feature. A name the tree does not have is an error.
 | `filesystem` | the working directory as the kernel keeps it (`chdir` follows links before `..`), the empty path refused, `fchdir`, `chroot` (EPERM), `mkstemp` | `attributes` | `chmod`, `fchmod`, the modes, owners and block counts of `stat`/`lstat`/`fstat`, the mode of a creating `open` and of `mkdir`, `umask`, `access`/`faccessat` by the host's rules, `futimes`, `chown`/`lchown`/`fchown` |
 | | | `fifo` | `mkfifo` |
 | | | `locking` | `flock`, the record locks of `fcntl` (F_GETLK, F_SETLK, F_SETLKW) |
-| `network` | `netdb.h` | `sockets` | `socket`, `connect`, `getpeername`, `getsockname`, `getaddrinfo`, `getnameinfo` |
+| `network` | `netdb.h`, `inet_ntop` as glibc words an address | `sockets` | `socket`, `connect`, `bind`, `listen`, `accept`/`accept4`, `getpeername`/`getsockname`, the options and the receive and send timeouts, `send`/`recv` and `sendto`/`recvfrom`, `socketpair`, `shutdown` with the usual numbers, `poll` that watches a descriptor asked for nothing for its hang-up |
+| | | `resolver` | `getaddrinfo`, `getnameinfo`, `gethostbyname`/`gethostbyaddr`, the services, protocols and networks databases |
 | `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child or any, `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD: wasi-libc's `O_CLOEXEC` is 0, so `open`, `pipe2` and `dup3` cannot set it), and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64) |
 | | | `resources` | `getpid`/`getppid`, `getpriority`/`setpriority`/`nice`, `times` with the CPU time the host accounts |
 | | | `threads` | the wasi-threads target: `-pthread`, a shared memory, atomics (wasm2go runs each guest thread on a goroutine) |
@@ -51,12 +49,10 @@ feature. A name the tree does not have is an error.
 For each part given (a capability's base or a feature), wasmify
 
 - compiles and links the shims that implement it (sources under
-  `<build>/host-shims/`; each guarded by the macros of its parts, the
-  network's by the macro of the deprecated flag it served:
-  `WASMIFY_HOST_SOCKETS`);
+  `<build>/host-shims/`; each guarded by the macros of its parts);
 - puts the headers wasi-libc does not have into `<build>/host-include/`,
   which every compile gets on its include path: `wasmify_posix.h` with
-  `filesystem`, `process.spawn`, `process.resources`, `signals`, `users`,
+  `filesystem`, `network`, `process.spawn`, `process.resources`, `signals`, `users`,
   `system.info`, `system.logging` and `system.time_zones`; `spawn.h`,
   `sys/wait.h` and `unistd.h` (the C library's, declaring what the shims
   define that it leaves out: `closefrom`, `getppid`, `nice`, `pause`) with
@@ -73,8 +69,8 @@ For each part given (a capability's base or a feature), wasmify
 - wraps at link the libc functions the shims replace (`chdir` and libc's
   path resolution with `filesystem`; `chmod`, `stat`, `open`, `mkdir`,
   `access`, ... with `filesystem.attributes`; `fcntl` with
-  `filesystem.locking` and `process.spawn`; `write`, `writev` and `send`
-  with `signals`).
+  `filesystem.locking` and `process.spawn`; `inet_ntop` with `network`;
+  `write`, `writev` and `send` with `signals`).
 
 ## `wasmify_posix.h`
 
@@ -105,7 +101,7 @@ the tree. Giving one of them (or its environment variable) together with
 | Flag (`bridge`) | Environment | Stands for |
 |---|---|---|
 | `HostFS` | `WASMIFY_HOST_FS` | `"filesystem": {"attributes": true, "locking": true}` |
-| `HostSockets` | `WASMIFY_HOST_SOCKETS` | `"network": {"sockets": true}` |
+| `HostSockets` | `WASMIFY_HOST_SOCKETS` | `"network": {"sockets": true, "resolver": true}` |
 | `HostSubprocess` | `WASMIFY_HOST_SUBPROCESS` | `"process": {"spawn": true}` |
 | `HostThreads` | `WASMIFY_HOST_THREADS` | `"process": {"threads": true}` |
 

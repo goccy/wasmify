@@ -1,15 +1,13 @@
 // Package hostcap is what a wasm build is given of the host it runs on:
 // the capabilities of a POSIX system that WASI preview1 does not have,
-// which wasmify's host shims implement on host imports: of the module
-// "wasip1_posix_extension" for the file system, processes, users and the
-// system, of "wasi_snapshot_preview1" for the network (wasmify.json's
-// "host").
+// which wasmify's host shims implement on imports of the module
+// "wasip1_posix_extension" (wasmify.json's "host").
 //
 // The capabilities follow the option groups of POSIX.1-2017 (Annex E),
 // each with the features that belong inside it:
 //
 //	filesystem  {attributes, fifo, locking}
-//	network     {sockets}
+//	network     {sockets, resolver}
 //	process     {spawn, resources, threads}
 //	signals     {timers}
 //	users       {database}
@@ -48,7 +46,7 @@ type capabilityFeatures struct {
 // The features of each capability, in the order of the schema.
 var schema = []capabilityFeatures{
 	{Filesystem, []string{"attributes", "fifo", "locking"}},
-	{Network, []string{"sockets"}},
+	{Network, []string{"sockets", "resolver"}},
 	{Process, []string{"spawn", "resources", "threads"}},
 	{Signals, []string{"timers"}},
 	{Users, []string{"database"}},
@@ -249,15 +247,15 @@ type Aliases struct {
 func (a Aliases) Any() bool { return a.FS || a.Sockets || a.Subprocess || a.Threads }
 
 // Set is what the aliases stand for: HostFS the file system with its
-// attributes and locks; HostSockets the network's sockets; HostSubprocess
-// process.spawn; HostThreads process.threads.
+// attributes and locks; HostSockets the network's sockets and resolver;
+// HostSubprocess process.spawn; HostThreads process.threads.
 func (a Aliases) Set() Set {
 	var s Set
 	if a.FS {
 		s.Enable(Filesystem, "attributes", "locking")
 	}
 	if a.Sockets {
-		s.Enable(Network, "sockets")
+		s.Enable(Network, "sockets", "resolver")
 	}
 	if a.Subprocess {
 		s.Enable(Process, "spawn")

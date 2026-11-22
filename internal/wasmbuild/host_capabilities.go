@@ -32,8 +32,10 @@ var hostParts = []hostPart{
 	{capability: hostcap.Filesystem, feature: "locking", shims: []string{"host_fs.cc", "host_fcntl.cc"},
 		wraps: []string{"fcntl"}},
 
-	{capability: hostcap.Network, shims: []string{"host_sockets.cc"}, headers: []string{"netdb.h"}},
+	{capability: hostcap.Network, shims: []string{"host_sockets.cc"}, headers: []string{"wasmify_posix.h", "netdb.h"},
+		wraps: []string{"inet_ntop"}},
 	{capability: hostcap.Network, feature: "sockets", shims: []string{"host_sockets.cc"}},
+	{capability: hostcap.Network, feature: "resolver", shims: []string{"host_sockets.cc"}},
 
 	{capability: hostcap.Process},
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},

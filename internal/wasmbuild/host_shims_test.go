@@ -120,7 +120,9 @@ func TestDeployHostShims(t *testing.T) {
 		host      hostcap.Set
 		wantShims []string
 	}{
+		{hostWith("network"), []string{"host_sockets.cc"}},
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
+		{hostWith("network.resolver"), []string{"host_sockets.cc"}},
 		{hostWith("process.spawn"), []string{"host_subprocess.cc", "host_fcntl.cc"}},
 		{hostWith("process.resources"), []string{"host_process.cc"}},
 		{hostWith("signals"), []string{"host_signal.cc"}},
@@ -197,6 +199,7 @@ func TestDeployHostHeaders(t *testing.T) {
 		headers []string
 		absent  []string
 	}{
+		{"network", []string{"wasmify_posix.h", "netdb.h"}, nil},
 		{"users", []string{"wasmify_posix.h"}, []string{"pwd.h", "grp.h"}},
 		{"users.database", []string{"wasmify_posix.h", "pwd.h", "grp.h"}, nil},
 		{"system.time_zones", []string{"wasmify_posix.h", "time.h"}, nil},
@@ -237,8 +240,8 @@ func TestApplyEnvOverridesHostCapabilities(t *testing.T) {
 	if err := env.ResolveHost(); err != nil {
 		t.Fatal(err)
 	}
-	if !env.Host.Feature(hostcap.Network, "sockets") {
-		t.Fatalf("WASMIFY_HOST_SOCKETS should give network.sockets, got %v", env.Host.Macros())
+	if !env.Host.Feature(hostcap.Network, "sockets") || !env.Host.Feature(hostcap.Network, "resolver") {
+		t.Fatalf("WASMIFY_HOST_SOCKETS should give network.sockets and network.resolver, got %v", env.Host.Macros())
 	}
 	if env.Host.Has(hostcap.Process) {
 		t.Fatalf("only sockets was set, process should stay off")

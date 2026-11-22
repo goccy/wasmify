@@ -1,10 +1,11 @@
 /* wasmify_posix.h — the host imports behind wasmify's POSIX shims.
  *
  * WASI preview1 has no file modes, owners, creation masks, locks,
- * processes, signals, users, time zones or system logger. wasmify's
- * host-capability shims (host_fs.cc, host_fcntl.cc, host_subprocess.cc,
- * host_process.cc, host_signal.cc, host_users.cc, host_system.cc,
- * host_time.cc and host_syslog.cc) implement
+ * processes, signals, users, time zones or system logger, and only a few
+ * socket calls. wasmify's host-capability shims (host_fs.cc, host_fcntl.cc,
+ * host_subprocess.cc, host_process.cc, host_signal.cc, host_users.cc,
+ * host_system.cc, host_time.cc, host_syslog.cc and host_sockets.cc)
+ * implement
  * the libc functions for them on imports of the module
  * "wasip1_posix_extension", which the host implements (wasm2go's
  * WasiStubs). Every import of that module is declared here, once: the shims
@@ -32,6 +33,7 @@ extern "C" {
  * uses it, in the layout the host reads and writes. */
 struct __wasmify_filestat_ext;
 struct __wasmify_record_lock;
+struct __wasmify_sock_addr;
 struct __wasmify_zone;
 struct __wasmify_timer_state;
 
@@ -217,6 +219,80 @@ int __wasmify_host_proc_syslog(int severity, int facility, int options, const ch
                                int ident_len, const char *message, int message_len);
 WASMIFY_POSIX_IMPORT(proc_syslog_close)
 int __wasmify_host_proc_syslog_close(void);
+
+/* ---- sockets (host_sockets.cc) ------------------------------------------ */
+/* A socket of the family and type (host_sockets.cc's WASMIFY_SOCK_
+ * numbers). Returns the fd, or a negative errno. */
+WASMIFY_POSIX_IMPORT(sock_open)
+int __wasmify_host_sock_open(int family, int type);
+/* connect and bind take an address record (family 0: none) and, for a
+ * Unix-domain address, its path at (path, path_len). */
+WASMIFY_POSIX_IMPORT(sock_connect_addr)
+int __wasmify_host_sock_connect(int fd, const struct __wasmify_sock_addr *addr, const char *path,
+                                int path_len);
+WASMIFY_POSIX_IMPORT(sock_bind_addr)
+int __wasmify_host_sock_bind(int fd, const struct __wasmify_sock_addr *addr, const char *path,
+                             int path_len);
+/* The addresses of a host name, of one family or (family 0) of both, IPv4
+ * first: at most max records, *count receives their number. An address
+ * written in numbers is converted. -ENOENT when the name has none. */
+WASMIFY_POSIX_IMPORT(sock_resolve)
+int __wasmify_host_sock_resolve(const char *node, int len, int family,
+                                struct __wasmify_sock_addr *out, int max, unsigned int *count);
+/* gethostbyname's lookup: the number of IPv4 addresses (u32), the
+ * addresses (4 bytes each, as in s_addr), then the official name, not
+ * NUL-terminated. *needed receives the size of the record, also when buf
+ * is too small (-ERANGE). -ENOENT when the name has no IPv4 address. */
+WASMIFY_POSIX_IMPORT(sock_host_by_name)
+int __wasmify_host_sock_host_by_name(const char *node, int len, void *buf, int buf_len,
+                                     unsigned int *needed);
+/* The name of the host with an IP address, not NUL-terminated: *needed
+ * receives its length, also when buf is too small (-ERANGE). -ENOENT when
+ * the address has no name. */
+WASMIFY_POSIX_IMPORT(sock_reverse_addr)
+int __wasmify_host_sock_reverse(const struct __wasmify_sock_addr *addr, char *buf, int buf_len,
+                                unsigned int *needed);
+/* An entry of the host's services database, by name (by_port 0) or by
+ * port, for the protocol proto when it is not empty. The record is the port
+ * (u32), then the name and the protocol, each a u32 length and the bytes,
+ * then the number of aliases (u32) and the aliases. *needed receives the
+ * size of the record, also when buf is too small (-ERANGE). -ENOENT when
+ * there is no such service. */
+WASMIFY_POSIX_IMPORT(sock_service)
+int __wasmify_host_sock_service(const char *name, int name_len, int port, int by_port,
+                                const char *proto, int proto_len, void *buf, int buf_len,
+                                unsigned int *needed);
+WASMIFY_POSIX_IMPORT(sock_listen)
+int __wasmify_host_sock_listen(int fd, int backlog);
+/* The socket's local name (peer 0) or its peer's. */
+WASMIFY_POSIX_IMPORT(sock_name)
+int __wasmify_host_sock_name(int fd, int peer, struct __wasmify_sock_addr *out);
+/* sendto: with addr, a datagram to that address (path as for connect);
+ * without, a send to the socket's peer. flags are host_sockets.cc's
+ * WASMIFY_MSG_ flags. *sent receives the count. */
+WASMIFY_POSIX_IMPORT(sock_sendto_addr)
+int __wasmify_host_sock_sendto(int fd, const void *buf, int len, int flags,
+                               const struct __wasmify_sock_addr *addr, const char *path,
+                               int path_len, int *sent);
+/* recvfrom: one datagram (or, on a stream socket, what there is) into buf;
+ * flags are host_sockets.cc's WASMIFY_MSG_ flags. *from receives the
+ * sender's address, with family 0 when there is none. */
+WASMIFY_POSIX_IMPORT(sock_recvfrom_addr)
+int __wasmify_host_sock_recvfrom(int fd, void *buf, int len, int flags,
+                                 struct __wasmify_sock_addr *from, int *received);
+/* The receive (which 1) or send (which 2) timeout of a socket: *old_nanos
+ * receives the timeout before the call, in nanoseconds (0: no limit); with
+ * set it is then replaced by nanos. */
+WASMIFY_POSIX_IMPORT(sock_timeout)
+int __wasmify_host_sock_timeout(int fd, int which, int set, int64_t nanos, int64_t *old_nanos);
+/* A socket option (host_sockets.cc's WASMIFY_SOCKOPT_ numbers). */
+WASMIFY_POSIX_IMPORT(sock_setopt)
+int __wasmify_host_sock_setopt(int fd, int option, int value);
+WASMIFY_POSIX_IMPORT(sock_getopt)
+int __wasmify_host_sock_getopt(int fd, int option, int *value);
+/* Two Unix-domain sockets of the type, connected to each other. */
+WASMIFY_POSIX_IMPORT(sock_socketpair)
+int __wasmify_host_sock_socketpair(int family, int type, int fds[2]);
 
 #undef WASMIFY_POSIX_IMPORT
 

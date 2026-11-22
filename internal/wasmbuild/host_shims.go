@@ -12,11 +12,8 @@ import (
 )
 
 // hostShimFS holds wasmify's host shims: the libc functions of the host
-// capabilities (wasmify.json's "host"). Each source is guarded inside by a
-// macro of hostcap.Set.Macros: the file system's, the processes', the
-// users' and the system's by the macros of the parts they serve, the
-// network's by the macro of the deprecated flag it served
-// (WASMIFY_HOST_SOCKETS).
+// capabilities (wasmify.json's "host"). Each source is guarded inside by
+// the macros of hostcap.Set.Macros of the parts it serves.
 //
 //go:embed shims/*.cc
 var hostShimFS embed.FS

@@ -22,8 +22,10 @@ func TestSetFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.Feature(Network, "sockets") {
-		t.Error("network.sockets not given by network: true")
+	for _, f := range []string{"sockets", "resolver"} {
+		if !s.Feature(Network, f) {
+			t.Errorf("network.%s not given by network: true", f)
+		}
 	}
 	if !s.Feature(Process, "spawn") || s.Feature(Process, "threads") {
 		t.Errorf("process: spawn %v threads %v; want true false",
@@ -36,8 +38,9 @@ func TestSetFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !base.Has(Network) || base.Feature(Network, "sockets") {
-		t.Errorf("network: {} gives the base alone, got has %v sockets %v", base.Has(Network), base.Feature(Network, "sockets"))
+	if !base.Has(Network) || base.Feature(Network, "sockets") || base.Feature(Network, "resolver") {
+		t.Errorf("network: {} gives the base alone, got has %v sockets %v resolver %v", base.Has(Network),
+			base.Feature(Network, "sockets"), base.Feature(Network, "resolver"))
 	}
 }
 
@@ -85,7 +88,8 @@ func TestResolveAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range [][2]string{
-		{Filesystem, "attributes"}, {Filesystem, "locking"}, {Network, "sockets"}, {Process, "spawn"}, {Process, "threads"},
+		{Filesystem, "attributes"}, {Filesystem, "locking"}, {Network, "sockets"}, {Network, "resolver"},
+		{Process, "spawn"}, {Process, "threads"},
 	} {
 		if !s.Feature(f[0], f[1]) {
 			t.Errorf("the aliases do not give %s.%s", f[0], f[1])
