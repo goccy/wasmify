@@ -740,52 +740,65 @@ func cmdClassify(args []string) error {
 }
 
 // hostCaptureInjectFlags returns the extra compile flags (as one shell-split
-// string) to inject into the capture build's C/C++ compiles when wasmify.json's
-// bridge config opts into host sockets/subprocess: the POSIX-compat stub
-// headers (sys/socket.h, netdb.h, ...) unless opted out, the host-sockets
-// contract header (netdb.h, also without the overlay), the host-subprocess
-// stub headers (spawn.h, sys/wait.h), plus the -DWASMIFY_HOST_* macros the
-// stubs gate their declarations on. Returns "" when neither capability is
-// opted in. Mirrors what cmdWasmBuild deploys, so both phases see the same
-// declarations.
-func hostCaptureInjectFlags(dataDir, outDir string) string {
+// string) to inject into the capture build's C/C++ compiles when the project
+// is given host capabilities (wasmify.json's "host", or the deprecated bridge
+// flags HostSockets, HostSubprocess and HostThreads): the POSIX-compat stub
+// headers (sys/socket.h, netdb.h, ...) unless opted out, the host-include
+// directory when a capability given has headers (also without the overlay),
+// the -DWASMIFY_HOST_* macros the headers and the project's sources gate
+// their declarations on, and -pthread with process.threads. Returns "" when
+// no capability is given. Mirrors what cmdWasmBuild deploys, so both phases
+// see the same declarations.
+func hostCaptureInjectFlags(dataDir, outDir string) (string, error) {
 	s, err := state.Load(outDir)
-	if err != nil || s == nil || s.Bridge == nil {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	if !s.Bridge.HostSockets && !s.Bridge.HostSubprocess && !s.Bridge.HostThreads {
-		return ""
+	if s == nil {
+		return "", nil
 	}
-	buildDir := filepath.Join(dataDir, "wasm-build")
-	// Resolve the POSIX-compat opt-out the same way the replay phase does — via
-	// a WasmConfig option — so both phases agree regardless of whether the
-	// option was set in wasmify.json or through the environment.
+	// Resolve the POSIX-compat opt-out the same way the replay phase does —
+	// through a WasmConfig — so both phases agree regardless of whether it
+	// was set in wasmify.json or through the environment. The deprecated
+	// bridge flags count as wasmify.json has them: their WASMIFY_HOST_*
+	// variables are the replay's alone, and HostFS brings the capture nothing.
 	var cfg wasmbuild.WasmConfig
 	cfg.ApplyEnvOverrides()
+	aliases := s.Bridge.Aliases()
+	cfg.Host, cfg.HostGiven, cfg.HostAliases = s.HostTree(), s.Host != nil, aliases
+	if err := cfg.ResolveHost(); err != nil {
+		return "", err
+	}
+	if s.Host == nil {
+		aliases.FS = false
+		cfg.Host = aliases.Set()
+	}
+	if cfg.Host.Empty() {
+		return "", nil
+	}
+	buildDir := filepath.Join(dataDir, "wasm-build")
 	var flags []string
 	if !cfg.NoPosixCompat {
-		if compatDir, derr := wasmbuild.DeployPosixCompat(buildDir); derr == nil {
-			flags = append(flags, "-isystem", compatDir)
+		compatDir, err := wasmbuild.DeployPosixCompat(buildDir)
+		if err != nil {
+			return "", err
 		}
+		flags = append(flags, "-isystem", compatDir)
 	}
-	if s.Bridge.HostSubprocess {
-		if incDir, herr := wasmbuild.DeployHostSubprocessHeaders(buildDir); herr == nil {
-			flags = append(flags, "-isystem", incDir, "-DWASMIFY_HOST_SUBPROCESS")
-		}
+	incDir, err := wasmbuild.DeployHostHeaders(buildDir, cfg.Host)
+	if err != nil {
+		return "", err
 	}
-	if s.Bridge.HostSockets {
-		// netdb.h is the socket shim's layout contract; the captured build must
-		// compile the upstream's getaddrinfo() callers against the same header
-		// the replay does, whether or not the POSIX-compat overlay is on.
-		if incDir, herr := wasmbuild.DeployHostSocketsHeaders(buildDir); herr == nil {
-			flags = append(flags, "-isystem", incDir)
-		}
-		flags = append(flags, "-DWASMIFY_HOST_SOCKETS")
+	if incDir != "" {
+		flags = append(flags, "-isystem", incDir)
 	}
-	if s.Bridge.HostThreads {
-		flags = append(flags, "-DWASMIFY_HOST_THREADS", "-pthread")
+	for _, macro := range cfg.Host.Macros() {
+		flags = append(flags, "-D"+macro)
 	}
-	return strings.Join(flags, " ")
+	if cfg.Threads() {
+		flags = append(flags, "-pthread")
+	}
+	return strings.Join(flags, " "), nil
 }
 
 func cmdBuild(args []string) error {
@@ -866,7 +879,11 @@ func cmdBuild(args []string) error {
 	// compiled against netdb.h / sys/wait.h) compiles here too. The
 	// implementations are linked at wasm-build. The wrapper injects these into
 	// compile invocations only (see RunAsWrapper / WASMIFY_INJECT_COMPILE_FLAGS).
-	if inject := hostCaptureInjectFlags(dataDir, outDir); inject != "" {
+	inject, err := hostCaptureInjectFlags(dataDir, outDir)
+	if err != nil {
+		return err
+	}
+	if inject != "" {
 		env = append(env, "WASMIFY_INJECT_COMPILE_FLAGS="+inject)
 		fmt.Fprintf(os.Stderr, "[wasmify] Host-capability stub headers injected into capture compiles\n")
 	}
@@ -1350,23 +1367,21 @@ func cmdWasmBuild(args []string) error {
 	// the upstream submodule path.
 	cfg.ProjectRoot = outDir
 
-	// Opt-in host-provided sockets, declared in wasmify.json's bridge config.
-	// When set, the bridge compile gets -DWASMIFY_HOST_SOCKETS so the project's
-	// socket shim is included; otherwise the wasm stays portable (standard wasi
-	// imports only).
-	if s, serr := state.Load(outDir); serr == nil && s != nil && s.Bridge != nil {
-		if s.Bridge.HostSockets {
-			cfg.HostSockets = true
-		}
-		if s.Bridge.HostSubprocess {
-			cfg.HostSubprocess = true
-		}
-		if s.Bridge.HostFS {
-			cfg.HostFS = true
-		}
-		if s.Bridge.HostThreads {
-			cfg.HostThreads = true
-		}
+	// The host capabilities, declared as wasmify.json's "host" (or by the
+	// deprecated bridge flags): the host shims of the capabilities given are
+	// compiled and linked, with their headers, macros and link wraps;
+	// otherwise the wasm stays portable (standard wasi imports only).
+	// ResolveHost below folds the two forms together, after the environment.
+	s, err := state.Load(outDir)
+	if err != nil {
+		return err
+	}
+	if s != nil {
+		cfg.Host = s.HostTree()
+		cfg.HostGiven = s.Host != nil
+		cfg.HostAliases = s.Bridge.Aliases()
+	}
+	if s != nil && s.Bridge != nil {
 		if s.Bridge.MaxMemoryPages > 0 {
 			cfg.MaxMemoryPages = s.Bridge.MaxMemoryPages
 		}
@@ -1391,7 +1406,7 @@ func cmdWasmBuild(args []string) error {
 
 	// Optional wasm-build knobs declared under wasmify.json's `wasm_build` key
 	// (independent of whether the project has a bridge).
-	if s, serr := state.Load(outDir); serr == nil && s != nil && s.WasmBuild != nil {
+	if s != nil && s.WasmBuild != nil {
 		if s.WasmBuild.KeepSymbols {
 			cfg.KeepSymbols = true
 		}
@@ -1428,6 +1443,9 @@ func cmdWasmBuild(args []string) error {
 	// so an option set through wasmify.json and one set through the environment
 	// behave identically.
 	cfg.ApplyEnvOverrides()
+	if err := cfg.ResolveHost(); err != nil {
+		return err
+	}
 
 	// Detect wasi-sdk at the shared XDG install location. Unlike per-project
 	// build artifacts (under .wasmify/), the SDK is a toolchain installed
@@ -1446,19 +1464,19 @@ func cmdWasmBuild(args []string) error {
 	cfg.WasiSDKPath = sdkPath
 
 	// A wasm64 build needs the wasm64 sysroot flavor matching the target
-	// (wasi-libc, compiler-rt, EH-enabled libc++; with HostThreads the
+	// (wasi-libc, compiler-rt, EH-enabled libc++; with process.threads the
 	// -threads flavor, whose archives carry the atomics features a
 	// --shared-memory link demands) that the official SDK does not ship.
 	// Provision it on demand — the same stamped stages as
 	// `install-sdk --wasm64`, a no-op when already present.
 	if cfg.Wasm64 && !cfg.DryRun {
-		installed, err := wasm64.SysrootInstalled(sdkPath, cfg.HostThreads)
+		installed, err := wasm64.SysrootInstalled(sdkPath, cfg.Threads())
 		if err != nil {
 			return err
 		}
 		if !installed {
 			fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64 sysroot (first wasm64 build of this flavor)...\n")
-			if err := wasm64.InstallSysroot(sdkPath, cfg.HostThreads); err != nil {
+			if err := wasm64.InstallSysroot(sdkPath, cfg.Threads()); err != nil {
 				return err
 			}
 		}
@@ -1496,36 +1514,20 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 	}
 
-	// Host-capability opt-ins (resolved into cfg by ApplyEnvOverrides above): the
-	// subprocess capability adds stub headers + a -D macro to EVERY wasm-build
-	// compile (via wasmCompileFlags), so cfg must carry the include dir before
-	// TransformSteps runs.
-	hostSockets, hostSubprocess, hostFS := cfg.HostSockets, cfg.HostSubprocess, cfg.HostFS
-	if hostSubprocess {
-		// Materialize spawn.h/sys/wait.h into a build-local include dir and put
-		// it on every compile's -I (see wasmCompileFlags). Paired with the
-		// -DWASMIFY_HOST_SUBPROCESS macro wasmify defines only here, the upstream
-		// sources enable their posix_spawn path and resolve these headers WITHOUT
-		// touching the shared wasi-sdk sysroot. The upstream's own build phase
-		// never sees the macro, so it stays unmodified and needs neither.
-		incDir, herr := wasmbuild.DeployHostSubprocessHeaders(cfg.BuildDir)
+	// The headers of the host capabilities (spawn.h, netdb.h) go on EVERY
+	// wasm-build compile's -I (via wasmCompileFlags), together with their -D
+	// macros, so cfg must carry the include dir before TransformSteps runs. The upstream sources resolve
+	// them WITHOUT touching the shared wasi-sdk sysroot; the upstream's own
+	// build phase never sees the macros, so it stays unmodified.
+	if !cfg.Host.Empty() {
+		incDir, herr := wasmbuild.DeployHostHeaders(cfg.BuildDir, cfg.Host)
 		if herr != nil {
 			return herr
 		}
 		cfg.HostIncludeDir = incDir
-		fmt.Fprintf(os.Stderr, "[wasm-build] Host-subprocess headers: %s\n", incDir)
-	}
-	if hostSockets {
-		// Materialize netdb.h — the layout contract between the socket shim and
-		// every getaddrinfo() caller — into the same build-local include dir.
-		// Independent of the POSIX-compat overlay: a wasi-native project builds
-		// with NoPosixCompat and still opts in to host sockets.
-		incDir, herr := wasmbuild.DeployHostSocketsHeaders(cfg.BuildDir)
-		if herr != nil {
-			return herr
+		if incDir != "" {
+			fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability headers: %s\n", incDir)
 		}
-		cfg.HostIncludeDir = incDir
-		fmt.Fprintf(os.Stderr, "[wasm-build] Host-sockets headers: %s\n", incDir)
 	}
 
 	// Transform steps
@@ -1539,22 +1541,22 @@ func cmdWasmBuild(args []string) error {
 	if _, err := os.Stat(filepath.Join(bridgeDir, "api_bridge.cc")); err != nil {
 		return fmt.Errorf("bridge source not found at %s. Run 'wasmify gen-proto --package <name> --bridge-config <file>' before wasm-build", bridgeDir)
 	}
-	// Deploy wasmify's generic host-capability shims (socket / subprocess
-	// libc->import definitions) when the matching capability is opted in. The
-	// shim sources are then compiled and linked alongside the bridge so the
-	// host-backed socket()/posix_spawn()/... symbols resolve in the final wasm.
-	// With both capabilities off, nothing is deployed and the wasm stays
-	// portable (standard wasi imports only).
+	// Deploy wasmify's host shims (the libc functions of the capabilities
+	// given). The shim sources are then compiled and linked alongside the
+	// bridge so the host-backed socket()/posix_spawn()/chmod()/... symbols
+	// resolve in the final wasm. With no capability given, nothing is deployed
+	// and the wasm stays portable (standard wasi imports only).
 	var shimSrcs []string
-	if hostSockets || hostSubprocess || hostFS {
-		// The subprocess shim #includes <spawn.h>/<sys/wait.h>; it resolves them
-		// from the build-local host-include dir already on every compile's -I
-		// (deployed above, before TransformSteps). No sysroot mutation.
-		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, hostSockets, hostSubprocess, hostFS)
+	if !cfg.Host.Empty() {
+		shimSrcs, err = wasmbuild.DeployHostShims(cfg.BuildDir, cfg.Host)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability shims deployed (sockets=%v subprocess=%v fs=%v)\n", hostSockets, hostSubprocess, hostFS)
+		host, err := json.Marshal(cfg.Host)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "[wasm-build] Host-capability shims deployed for %s\n", host)
 	}
 
 	wasmSteps = wasmbuild.InjectBridgeSteps(wasmSteps, cfg, bridgeDir, shimSrcs)

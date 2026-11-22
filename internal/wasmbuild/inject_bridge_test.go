@@ -358,51 +358,51 @@ func TestAppendExtraLDFlags(t *testing.T) {
 	}
 }
 
-func TestBuildBridgeCompileArgsHostSockets(t *testing.T) {
+func TestBuildBridgeCompileArgsNetworkSockets(t *testing.T) {
 	base := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1"}
 
-	// Opt-in OFF (default): no -DWASMIFY_HOST_SOCKETS → portable wasm.
+	// No capability (default): no -DWASMIFY_HOST_NETWORK_SOCKETS → portable wasm.
 	off := buildBridgeCompileArgs("b.cc", "b.o", base, nil)
 	for _, a := range off {
-		if a == "-DWASMIFY_HOST_SOCKETS" {
-			t.Fatalf("HostSockets off but -DWASMIFY_HOST_SOCKETS present: %v", off)
+		if a == "-DWASMIFY_HOST_NETWORK_SOCKETS" {
+			t.Fatalf("network.sockets not given but -DWASMIFY_HOST_NETWORK_SOCKETS present: %v", off)
 		}
 	}
-	// Opt-in ON: the macro is defined so the project's socket shim compiles.
-	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", HostSockets: true}
+	// Given: the macro is defined so the socket shim compiles.
+	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", Host: hostWith("network.sockets")}
 	args := buildBridgeCompileArgs("b.cc", "b.o", on, nil)
 	found := false
 	for _, a := range args {
-		if a == "-DWASMIFY_HOST_SOCKETS" {
+		if a == "-DWASMIFY_HOST_NETWORK_SOCKETS" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("HostSockets on but -DWASMIFY_HOST_SOCKETS missing: %v", args)
+		t.Fatalf("network.sockets given but -DWASMIFY_HOST_NETWORK_SOCKETS missing: %v", args)
 	}
 }
 
-func TestBuildBridgeCompileArgsHostSubprocess(t *testing.T) {
+func TestBuildBridgeCompileArgsProcessSpawn(t *testing.T) {
 	base := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1"}
 
-	// Opt-in OFF (default): no -DWASMIFY_HOST_SUBPROCESS → portable wasm.
+	// No capability (default): no -DWASMIFY_HOST_PROCESS_SPAWN → portable wasm.
 	off := buildBridgeCompileArgs("b.cc", "b.o", base, nil)
 	for _, a := range off {
-		if a == "-DWASMIFY_HOST_SUBPROCESS" {
-			t.Fatalf("HostSubprocess off but -DWASMIFY_HOST_SUBPROCESS present: %v", off)
+		if a == "-DWASMIFY_HOST_PROCESS_SPAWN" {
+			t.Fatalf("process.spawn not given but -DWASMIFY_HOST_PROCESS_SPAWN present: %v", off)
 		}
 	}
-	// Opt-in ON: the macro is defined so the project's posix_spawn shim compiles.
-	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", HostSubprocess: true}
+	// Given: the macro is defined so the posix_spawn shim compiles.
+	on := WasmConfig{WasiSDKPath: "/fake/wasi-sdk", Target: "wasm32-wasip1", Host: hostWith("process.spawn")}
 	args := buildBridgeCompileArgs("b.cc", "b.o", on, nil)
 	found := false
 	for _, a := range args {
-		if a == "-DWASMIFY_HOST_SUBPROCESS" {
+		if a == "-DWASMIFY_HOST_PROCESS_SPAWN" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("HostSubprocess on but -DWASMIFY_HOST_SUBPROCESS missing: %v", args)
+		t.Fatalf("process.spawn given but -DWASMIFY_HOST_PROCESS_SPAWN missing: %v", args)
 	}
 }
 
