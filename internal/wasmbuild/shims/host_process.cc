@@ -1,28 +1,45 @@
-/* host_process.cc — the process: its id and its parent's, and its
- * resources.
+/* host_process.cc — the process: its id and its parent's, its
+ * environment, its process group and session, and its resources.
  *
- * WASI has none of this, and wasi-libc declares none of it. The host
- * answers through imports: a guest that runs as the host process (a command
+ * WASI has none of this but the environment, which libc keeps, and
+ * wasi-libc declares none of the rest. The host answers through imports: a guest that runs as the host process (a command
  * line tool) gets the host's ids, and an isolated one the fixed identity its
  * host gives it.
  *
  * Nothing is cached here: an instance can be a copy (a memory snapshot) of
  * one that asked a different host.
  *
- * Compiled when the host capability process.resources is given
- * (WASMIFY_HOST_PROCESS_RESOURCES): the ids, the scheduling priority and
- * the CPU times.
+ * Compiled when a host capability it serves is given: the ids, the
+ * scheduling priority and the CPU times with process.resources
+ * (WASMIFY_HOST_PROCESS_RESOURCES); the changes of the environment, which
+ * the host is told about (the link wraps setenv, unsetenv, putenv and
+ * clearenv), with process.environment (WASMIFY_HOST_PROCESS_ENVIRONMENT);
+ * process groups and sessions with process.job_control
+ * (WASMIFY_HOST_PROCESS_JOB_CONTROL).
  */
-#ifdef WASMIFY_HOST_PROCESS_RESOURCES
+#if defined(WASMIFY_HOST_PROCESS_RESOURCES) || defined(WASMIFY_HOST_PROCESS_ENVIRONMENT) || \
+    defined(WASMIFY_HOST_PROCESS_JOB_CONTROL)
 
 #include <sys/times.h>
 #include <sys/types.h>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <time.h>
 #include <unistd.h>
 
 #include "wasmify_posix.h"
+
+#ifdef WASMIFY_HOST_PROCESS_ENVIRONMENT
+extern "C" {
+int __real_setenv(const char *name, const char *value, int overwrite);
+int __real_unsetenv(const char *name);
+int __real_putenv(char *string);
+int __real_clearenv(void);
+extern char **environ;
+} /* extern "C" */
+#endif
 
 namespace {
 
@@ -31,10 +48,29 @@ int fail(int error) {
     return -1;
 }
 
+
+#ifdef WASMIFY_HOST_PROCESS_ENVIRONMENT
+/* A name setenv and unsetenv take: not empty, and without '='. */
+bool is_variable_name(const char *name) {
+    return name != nullptr && name[0] != '\0' && strchr(name, '=') == nullptr;
+}
+
+/* Tells the host that the variable of the name_len bytes at name is set to
+ * value, or removed (value null). 0, or -1 with errno set to the host's
+ * refusal. */
+int report_env(const char *name, size_t name_len, const char *value) {
+    const int rc = __wasmify_host_proc_setenv(name, (int)name_len, value != nullptr ? value : "",
+                                              value != nullptr ? (int)strlen(value) : 0,
+                                              value != nullptr);
+    return rc != 0 ? fail(-rc) : 0;
+}
+#endif
+
 } /* namespace */
 
 extern "C" {
 
+#ifdef WASMIFY_HOST_PROCESS_RESOURCES
 pid_t getpid(void) { return (pid_t)__wasmify_process_id(0); }
 pid_t getppid(void) { return (pid_t)__wasmify_process_id(1); }
 
@@ -107,7 +143,91 @@ clock_t times(struct tms *buf) {
     }
     return elapsed;
 }
+#endif
+
+#ifdef WASMIFY_HOST_PROCESS_ENVIRONMENT
+/* ---- the environment --------------------------------------------------------
+ * The environment is libc's own table. Every change to it goes through
+ * these (the link wraps the libc functions), which tell the host before
+ * libc makes it: a change the host refuses fails with the host's errno and
+ * leaves the table as it was. The C library's checks come first, so that
+ * the host is told only of changes it makes. A C library that cannot make a
+ * change the host has taken (ENOMEM) leaves the host told of it. */
+int __wrap_setenv(const char *name, const char *value, int overwrite) {
+    if (!is_variable_name(name) || value == nullptr) return fail(EINVAL);
+    if (!overwrite && getenv(name) != nullptr) return 0;
+    if (report_env(name, strlen(name), value) != 0) return -1;
+    return __real_setenv(name, value, overwrite);
+}
+
+int __wrap_unsetenv(const char *name) {
+    if (!is_variable_name(name)) return fail(EINVAL);
+    if (report_env(name, strlen(name), nullptr) != 0) return -1;
+    return __real_unsetenv(name);
+}
+
+/* A string without a value, or without a name, is unsetenv's, as musl's
+ * putenv has it. */
+int __wrap_putenv(char *string) {
+    const char *eq = strchr(string, '=');
+    if (eq == nullptr || eq == string) return __wrap_unsetenv(string);
+    if (report_env(string, (size_t)(eq - string), eq + 1) != 0) return -1;
+    return __real_putenv(string);
+}
+
+/* The variables are removed one at a time, each told to the host first:
+ * when the host refuses one, the variables before it are gone on both
+ * sides and the rest are kept on both. An entry unsetenv cannot remove
+ * (one without a name, or without '=') is left to the final clearenv of
+ * the C library. */
+int __wrap_clearenv(void) {
+    size_t i = 0;
+    while (environ != nullptr && environ[i] != nullptr) {
+        const size_t len = strcspn(environ[i], "=");
+        if (len == 0 || environ[i][len] != '=') {
+            i++;
+            continue;
+        }
+        char *name = strndup(environ[i], len);
+        if (name == nullptr) return fail(ENOMEM);
+        const int rc = report_env(name, strlen(name), nullptr);
+        const int removed = rc == 0 ? __real_unsetenv(name) : -1;
+        const int error = errno;
+        free(name);
+        errno = error;
+        if (removed != 0) return -1;
+    }
+    return __real_clearenv();
+}
+#endif
+
+#ifdef WASMIFY_HOST_PROCESS_JOB_CONTROL
+/* ---- process groups and sessions ---------------------------------------------
+ * The host keeps them: the processes of a program are its to know. */
+pid_t getpgid(pid_t pid) {
+    int pgid = 0;
+    const int rc = __wasmify_host_proc_getpgid((int)pid, &pgid);
+    if (rc != 0) return (pid_t)fail(-rc);
+    return (pid_t)pgid;
+}
+
+pid_t getpgrp(void) { return getpgid(0); }
+
+int setpgid(pid_t pid, pid_t pgid) {
+    const int rc = __wasmify_host_proc_setpgid((int)pid, (int)pgid);
+    if (rc != 0) return fail(-rc);
+    return 0;
+}
+
+pid_t setsid(void) {
+    int sid = 0;
+    const int rc = __wasmify_host_proc_setsid(&sid);
+    if (rc != 0) return (pid_t)fail(-rc);
+    return (pid_t)sid;
+}
+#endif
 
 } /* extern "C" */
 
-#endif /* WASMIFY_HOST_PROCESS_RESOURCES */
+#endif /* WASMIFY_HOST_PROCESS_RESOURCES || WASMIFY_HOST_PROCESS_ENVIRONMENT ||
+          WASMIFY_HOST_PROCESS_JOB_CONTROL */

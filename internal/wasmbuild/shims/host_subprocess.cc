@@ -8,10 +8,10 @@
  *
  * WASI preview1 cannot spawn processes and wasi-libc provides no posix_spawn
  * or waitpid. With process.spawn, we DEFINE the
- * posix_spawn family + waitpid here, backed by proc_spawn/proc_wait host
- * imports the WASI host implements in Go (e.g. via os/exec). A consuming
- * library's subprocess implementation that routes onto posix_spawn therefore
- * runs against this path.
+ * posix_spawn family + waitpid here, and execv/execvp, backed by
+ * proc_spawn/proc_wait/proc_exec host imports the WASI host implements in
+ * Go (e.g. via os/exec). A consuming library's subprocess implementation
+ * that routes onto posix_spawn therefore runs against this path.
  *
  * Stdio remapping IS supported: posix_spawn_file_actions records, via adddup2,
  * which guest fd becomes each of the child's fds 0/1/2 (stored in
@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -125,20 +126,19 @@ int posix_spawn(pid_t *pid, const char *path,
     return __wasmify_host_spawn(pid, path, argv, envp, fa);
 }
 
-/* posix_spawnp: a name without a slash is searched for in the directories
- * of the CALLING process's PATH — the guest's, which the host cannot see —
- * the way execvp does it: each directory is tried in turn, a missing file
- * moves on to the next, and a file that exists but cannot be executed is
- * remembered so that the search reports EACCES rather than ENOENT. Without
- * PATH the directories are the C library's default (musl's execvp). */
-int posix_spawnp(pid_t *pid, const char *file,
-                 const posix_spawn_file_actions_t *fa,
-                 const posix_spawnattr_t *attr,
-                 char *const argv[], char *const envp[]) {
-    (void)attr;
+/* posix_spawnp and execvp: a name without a slash is searched for in the
+ * directories of the CALLING process's PATH — the guest's, which the host
+ * cannot see — the way execvp does it: run(path) starts the command at
+ * each candidate path in turn and returns 0 or the errno it failed with; a
+ * missing file moves on to the next, and a file that exists but cannot be
+ * executed is remembered so that the search reports EACCES rather than
+ * ENOENT. Without PATH the directories are the C library's default (musl's
+ * execvp). Returns 0 or the errno of the search. */
+extern "C++" {
+template <typename Run>
+static int __wasmify_search_path(const char *file, Run run) {
     if (file == nullptr || *file == '\0') return ENOENT;
-    if (strchr(file, '/') != nullptr)
-        return __wasmify_host_spawn(pid, file, argv, envp, fa);
+    if (strchr(file, '/') != nullptr) return run(file);
 
     const char *path = getenv("PATH");
     if (path == nullptr) path = "/usr/local/bin:/bin:/usr/bin";
@@ -157,7 +157,7 @@ int posix_spawnp(pid_t *pid, const char *file,
         }
         candidate.push_back('/');
         candidate.append(file, file_len);
-        const int rc = __wasmify_host_spawn(pid, candidate.c_str(), argv, envp, fa);
+        const int rc = run(candidate.c_str());
         switch (rc) {
         case 0:
             return 0;
@@ -174,6 +174,115 @@ int posix_spawnp(pid_t *pid, const char *file,
         dir = end + 1;
     }
     return seen_eacces ? EACCES : ENOENT;
+}
+} /* extern "C++" */
+
+int posix_spawnp(pid_t *pid, const char *file,
+                 const posix_spawn_file_actions_t *fa,
+                 const posix_spawnattr_t *attr,
+                 char *const argv[], char *const envp[]) {
+    (void)attr;
+    return __wasmify_search_path(file, [&](const char *path) {
+        return __wasmify_host_spawn(pid, path, argv, envp, fa);
+    });
+}
+
+/* ---- exec -------------------------------------------------------------------
+ * A process image cannot be replaced: the host starts the command with this
+ * process's environment, working directory and descriptors 0, 1 and 2, and
+ * the process becomes it (proc_exec). It keeps its pid, every signal sent
+ * to it goes to the command, its descriptors are closed, and it ends the
+ * way the command ends, running nothing of the program's own. So the exec
+ * functions return only when the command could not be started, with errno
+ * set. */
+
+/* Starts the command in the process's working directory; returns the errno
+ * of a command that could not be started, or getcwd's when the directory
+ * cannot be told. */
+static int __wasmify_exec(const char *path, char *const argv[], char *const envp[]) {
+    char *cwd = getcwd(nullptr, 0);
+    if (cwd == nullptr) return errno;
+    const int error = -__wasmify_host_proc_exec(path, argv, envp, cwd);
+    free(cwd);
+    return error;
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    errno = __wasmify_exec(path, argv, envp);
+    return -1;
+}
+
+int execv(const char *path, char *const argv[]) { return execve(path, argv, environ); }
+
+int execvp(const char *file, char *const argv[]) {
+    errno = __wasmify_search_path(
+        file, [&](const char *path) { return __wasmify_exec(path, argv, environ); });
+    return -1;
+}
+
+/* The arguments of execl, execlp and execle, arg0 and those after it up to
+ * the null pointer (which is consumed), as an argv to free; NULL with errno
+ * ENOMEM. */
+static char **__wasmify_exec_args(const char *arg0, va_list *ap) {
+    size_t n = 0;
+    if (arg0 != nullptr) {
+        va_list count;
+        va_copy(count, *ap);
+        for (n = 1; va_arg(count, const char *) != nullptr; n++) {
+        }
+        va_end(count);
+    }
+    char **argv = static_cast<char **>(malloc((n + 1) * sizeof(char *)));
+    if (argv == nullptr) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    if (n > 0) {
+        argv[0] = const_cast<char *>(arg0);
+        for (size_t i = 1; i < n; i++) argv[i] = va_arg(*ap, char *);
+        (void)va_arg(*ap, char *); /* the null pointer that ends the list */
+    }
+    argv[n] = nullptr;
+    return argv;
+}
+
+/* Frees argv and fails with the errno the exec left. */
+static int __wasmify_exec_failed(char **argv) {
+    const int error = errno;
+    free(argv);
+    errno = error;
+    return -1;
+}
+
+int execl(const char *path, const char *arg0, ...) {
+    va_list ap;
+    va_start(ap, arg0);
+    char **argv = __wasmify_exec_args(arg0, &ap);
+    va_end(ap);
+    if (argv == nullptr) return -1;
+    execv(path, argv);
+    return __wasmify_exec_failed(argv);
+}
+
+int execlp(const char *file, const char *arg0, ...) {
+    va_list ap;
+    va_start(ap, arg0);
+    char **argv = __wasmify_exec_args(arg0, &ap);
+    va_end(ap);
+    if (argv == nullptr) return -1;
+    execvp(file, argv);
+    return __wasmify_exec_failed(argv);
+}
+
+int execle(const char *path, const char *arg0, ...) {
+    va_list ap;
+    va_start(ap, arg0);
+    char **argv = __wasmify_exec_args(arg0, &ap);
+    char *const *envp = argv != nullptr ? va_arg(ap, char *const *) : nullptr;
+    va_end(ap);
+    if (argv == nullptr) return -1;
+    execve(path, argv, envp);
+    return __wasmify_exec_failed(argv);
 }
 
 /* pipe()/pipe2(): host-backed pipe for subprocess capture_output. The host

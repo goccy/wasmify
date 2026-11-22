@@ -1,11 +1,11 @@
 /* wasmify_posix.h — the host imports behind wasmify's POSIX shims.
  *
  * WASI preview1 has no file modes, owners, creation masks, locks,
- * processes, signals, users, time zones or system logger, and only a few
- * socket calls. wasmify's host-capability shims (host_fs.cc, host_fcntl.cc,
- * host_subprocess.cc, host_process.cc, host_signal.cc, host_users.cc,
- * host_system.cc, host_time.cc, host_syslog.cc and host_sockets.cc)
- * implement
+ * processes, signals, terminals, users, System V IPC, time zones or system
+ * logger, and only a few socket calls. wasmify's host-capability shims
+ * (host_fs.cc, host_fcntl.cc, host_subprocess.cc, host_process.cc,
+ * host_signal.cc, host_tty.cc, host_users.cc, host_ipc.cc, host_system.cc,
+ * host_time.cc, host_syslog.cc and host_sockets.cc) implement
  * the libc functions for them on imports of the module
  * "wasip1_posix_extension", which the host implements (wasm2go's
  * WasiStubs). Every import of that module is declared here, once: the shims
@@ -36,6 +36,7 @@ struct __wasmify_record_lock;
 struct __wasmify_sock_addr;
 struct __wasmify_zone;
 struct __wasmify_timer_state;
+struct sembuf;
 
 #define WASMIFY_POSIX_IMPORT(name) __attribute__((import_module("wasip1_posix_extension"), import_name(#name)))
 
@@ -72,6 +73,11 @@ int __wasmify_host_path_create_directory_mode(const char *path, int len, unsigne
 /* Creates a FIFO. -ENOSYS where the filesystem has none. */
 WASMIFY_POSIX_IMPORT(path_mkfifo)
 int __wasmify_host_path_mkfifo(const char *path, int len, unsigned int mode);
+/* Tells the host the working directory the guest changes to, an absolute
+ * path with its leading slash, before the guest does: an error is the
+ * embedder's refusal, and the guest's chdir then fails with it. */
+WASMIFY_POSIX_IMPORT(proc_chdir)
+int __wasmify_host_proc_chdir(const char *path, int len);
 /* lock: 0 unlock, 1 shared, 2 exclusive. wait: non-zero to block. */
 WASMIFY_POSIX_IMPORT(fd_flock)
 int __wasmify_host_fd_flock(int fd, int lock, int wait);
@@ -86,6 +92,13 @@ WASMIFY_POSIX_IMPORT(proc_spawn)
 int __wasmify_host_proc_spawn(const char *path, char *const argv[], char *const envp[],
                               int stdin_fd, int stdout_fd, int stderr_fd, const char *cwd,
                               int *pid_out);
+/* The process becomes the command path, as proc_spawn starts one with
+ * the process's descriptors 0, 1 and 2 as its standard streams: it keeps
+ * its pid, its descriptors are closed, and it ends the way the command
+ * ends. Returns only when the command could not be started. */
+WASMIFY_POSIX_IMPORT(proc_exec)
+int __wasmify_host_proc_exec(const char *path, char *const argv[], char *const envp[],
+                             const char *cwd);
 WASMIFY_POSIX_IMPORT(proc_wait)
 int __wasmify_host_proc_wait(int pid, int options, int *status_out);
 WASMIFY_POSIX_IMPORT(proc_wait_any)
@@ -162,7 +175,23 @@ WASMIFY_POSIX_IMPORT(clock_zone)
 int __wasmify_host_clock_zone(const char *tz, int tz_len, int has_tz, int64_t t, int local,
                               struct __wasmify_zone *out);
 
-/* ---- the process's resources (host_process.cc) -------------------------- */
+/* ---- the process's environment, process groups and resources
+ *      (host_process.cc) ------------------------------------------------- */
+/* Tells the host a change of the environment before the guest makes it:
+ * name is set to value, or removed when has_value is 0. An error is the
+ * embedder's refusal, and the guest's call then fails with it. */
+WASMIFY_POSIX_IMPORT(proc_setenv)
+int __wasmify_host_proc_setenv(const char *name, int name_len, const char *value, int value_len,
+                               int has_value);
+/* Process groups and sessions: the group of pid (0: the caller); moving pid
+ * (0: the caller, or a child of it) into group pgid (0: one of its own);
+ * starting a session, whose id is written at sid_out. */
+WASMIFY_POSIX_IMPORT(proc_getpgid)
+int __wasmify_host_proc_getpgid(int pid, int *pgid_out);
+WASMIFY_POSIX_IMPORT(proc_setpgid)
+int __wasmify_host_proc_setpgid(int pid, int pgid);
+WASMIFY_POSIX_IMPORT(proc_setsid)
+int __wasmify_host_proc_setsid(int *sid_out);
 /* The nice value: which and who as getpriority takes them. With set
  * non-zero the value is changed first; the value then in effect is written
  * at nice_out. -ENOSYS for a process that is not a process of the host. */
@@ -293,6 +322,78 @@ int __wasmify_host_sock_getopt(int fd, int option, int *value);
 /* Two Unix-domain sockets of the type, connected to each other. */
 WASMIFY_POSIX_IMPORT(sock_socketpair)
 int __wasmify_host_sock_socketpair(int family, int type, int fds[2]);
+/* ---- System V IPC (host_ipc.cc) ----------------------------------------- */
+/* The objects are the host's, in Linux's numbers and in the structures of
+ * Linux on a 64-bit architecture (sys/ipc.h). A call that passes a
+ * structure (msgctl, semctl and shmctl but for the commands that take
+ * none, msgsnd, msgrcv) and shmat and shmdt are -ENOSYS for a wasm32
+ * program, whose long is not the structures' width. */
+/* msgget, semget and shmget (kind 0 message queue, 1 semaphore set, 2
+ * shared memory segment): the id of the object of the kind with the key,
+ * at id; arg is the number of semaphores of a set or the size of a
+ * segment. */
+WASMIFY_POSIX_IMPORT(ipc_get)
+int __wasmify_host_ipc_get(int kind, int key, unsigned long long arg, int flags, int *id);
+/* msgctl, semctl and shmctl: the command cmd on the object id (num: the
+ * semaphore of a set). For IPC_STAT and IPC_SET buf is the kind's
+ * structure; for GETALL and SETALL the values of the set's semaphores
+ * (unsigned short each, as many as the set has); for SETVAL arg is the
+ * value. What the call returns is written at result. */
+WASMIFY_POSIX_IMPORT(ipc_ctl)
+int __wasmify_host_ipc_ctl(int kind, int id, int num, int cmd, long long arg, void *buf,
+                           long long *result);
+/* semop: the nops operations at ops (struct sembuf each). */
+WASMIFY_POSIX_IMPORT(ipc_semop)
+int __wasmify_host_ipc_semop(int id, const struct sembuf *ops, unsigned long long nops);
+/* msgsnd: the message at msg (its type, a long, then size bytes). */
+WASMIFY_POSIX_IMPORT(ipc_msgsnd)
+int __wasmify_host_ipc_msgsnd(int id, const void *msg, unsigned long long size, int flags);
+/* msgrcv: a message of the type into msg (its type, then at most size
+ * bytes); the number of its bytes is written at received. */
+WASMIFY_POSIX_IMPORT(ipc_msgrcv)
+int __wasmify_host_ipc_msgrcv(int id, void *msg, unsigned long long size, long long type,
+                              int flags, long long *received);
+/* shmat: the segment id is attached over the size bytes at addr, which the
+ * program has set aside for it and which start at a page boundary of the
+ * host, as far as the segment's whole pages go; flags are shmat's
+ * (SHM_RDONLY). -ENOMEM where the program's memory is not one a segment
+ * can be attached over. */
+WASMIFY_POSIX_IMPORT(ipc_shmat)
+int __wasmify_host_ipc_shmat(int id, void *addr, unsigned long long size, int flags);
+/* shmdt: the segment ipc_shmat attached at addr is detached, and its
+ * memory is the program's again, all zero. */
+WASMIFY_POSIX_IMPORT(ipc_shmdt)
+int __wasmify_host_ipc_shmdt(const void *addr);
+
+/* ---- the host's numbers, its terminals and its system calls ------------- */
+/* Whose numbers the program sees: 0 this C library's own, 1 those the host
+ * gives (host_number_at). Returns no errno. */
+WASMIFY_POSIX_IMPORT(host_numbering)
+int __wasmify_host_numbering(void);
+/* The index-th number of a family (1: the error numbers): its name in C
+ * (at most name_cap bytes at name, not NUL-terminated, its length at
+ * name_len) and its value. -ENOENT past the last one, -ERANGE for a name
+ * longer than name_cap. */
+WASMIFY_POSIX_IMPORT(host_number_at)
+int __wasmify_host_number_at(int family, int index, char *name, int name_cap,
+                             uint32_t *name_len, int64_t *value);
+/* A request of a terminal, in Linux's numbers (asm-generic: host_tty.cc's
+ * <sys/ioctl.h> and <termios.h>), made of the host's terminal behind fd:
+ * arg is the int the request takes, or the address of what it takes.
+ * Returns what the call returned (0 or more), or a negative errno: -ENOTTY
+ * for a request that is not one of a terminal's and for a descriptor that
+ * is no terminal. */
+WASMIFY_POSIX_IMPORT(fd_ioctl)
+int __wasmify_host_fd_ioctl(int fd, unsigned int request, uintptr_t arg);
+/* The host's system call of the number (the Linux ABI's) with nargs (at
+ * most six) arguments at args, an argument whose bit is set in addresses
+ * being an address of this memory; its result is written at result.
+ * -ENOSYS where the host makes no system calls for the program; 1 when the
+ * host does not make the call for a forked process. The caller knows which
+ * arguments are addresses; syscall(2) does not say it. */
+WASMIFY_POSIX_IMPORT(sys_syscall)
+int __wasmify_host_sys_syscall(long long number, const unsigned long long *args, int nargs,
+                               unsigned int addresses, long long *result);
 
 #undef WASMIFY_POSIX_IMPORT
 

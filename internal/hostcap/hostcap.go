@@ -8,14 +8,17 @@
 //
 //	filesystem  {attributes, fifo, locking}
 //	network     {sockets, resolver}
-//	process     {spawn, resources, threads}
+//	process     {spawn, environment, job_control, resources, threads}
 //	signals     {timers}
+//	terminal    {pseudo}
 //	users       {database}
+//	ipc         {sysv}
 //	system      {info, logging, time_zones}
 //
 // A capability is given as true (with all its features) or as an object of
 // the features it is given (a feature left out is not). A capability that
-// is given at all also brings what it is without any feature (its base).
+// is given at all also brings what it is without any feature (its base). A
+// feature that needs another capability says so (Validate).
 package hostcap
 
 import (
@@ -33,7 +36,9 @@ const (
 	Network    = "network"
 	Process    = "process"
 	Signals    = "signals"
+	Terminal   = "terminal"
 	Users      = "users"
+	IPC        = "ipc"
 	System     = "system"
 )
 
@@ -47,9 +52,11 @@ type capabilityFeatures struct {
 var schema = []capabilityFeatures{
 	{Filesystem, []string{"attributes", "fifo", "locking"}},
 	{Network, []string{"sockets", "resolver"}},
-	{Process, []string{"spawn", "resources", "threads"}},
+	{Process, []string{"spawn", "environment", "job_control", "resources", "threads"}},
 	{Signals, []string{"timers"}},
+	{Terminal, []string{"pseudo"}},
 	{Users, []string{"database"}},
+	{IPC, []string{"sysv"}},
 	{System, []string{"info", "logging", "time_zones"}},
 }
 
@@ -117,6 +124,14 @@ func (s Set) Feature(capability, feature string) bool {
 
 // Empty reports whether no capability is given.
 func (s Set) Empty() bool { return len(s.caps) == 0 }
+
+// Validate refuses a set in which a feature lacks what it needs.
+func (s Set) Validate() error {
+	if s.Feature(Process, "job_control") && !s.Has(Terminal) {
+		return fmt.Errorf("host: process.job_control needs terminal (tcgetpgrp and tcsetpgrp are functions of a terminal)")
+	}
+	return nil
+}
 
 // Macros are the -D macros of the set, sorted: WASMIFY_HOST_<CAPABILITY>
 // for each capability given and WASMIFY_HOST_<CAPABILITY>_<FEATURE> for
@@ -267,14 +282,17 @@ func (a Aliases) Set() Set {
 }
 
 // Resolve is the capabilities of a build: the tree, or what the aliases
-// stand for. given is whether wasmify.json has the "host" key (an empty
-// tree included); giving it and an alias is an error.
+// stand for, validated. given is whether wasmify.json has the "host" key
+// (an empty tree included); giving it and an alias is an error.
 func Resolve(tree Set, given bool, aliases Aliases) (Set, error) {
 	if given && aliases.Any() {
 		return Set{}, fmt.Errorf("host: give the capabilities either as wasmify.json's \"host\" or by the deprecated HostFS/HostSockets/HostSubprocess/HostThreads flags (or their WASMIFY_HOST_* variables), not both")
 	}
 	if aliases.Any() {
 		return aliases.Set(), nil
+	}
+	if err := tree.Validate(); err != nil {
+		return Set{}, err
 	}
 	return tree, nil
 }

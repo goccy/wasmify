@@ -80,6 +80,39 @@ func TestSetJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// A feature that needs another capability is refused without it, and by
+// Resolve.
+func TestValidate(t *testing.T) {
+	for _, tt := range []struct{ text, want string }{
+		{`{"process": {"job_control": true}}`, "process.job_control needs terminal"},
+		{`{"process": {"job_control": true}, "terminal": {}}`, ""},
+		{`{"process": true, "terminal": true, "ipc": true}`, ""},
+		{`{"terminal": true}`, ""},
+	} {
+		s, err := parse(t, tt.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Validate()
+		switch {
+		case tt.want == "" && err != nil:
+			t.Errorf("%s: %v", tt.text, err)
+		case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+			t.Errorf("%s: error %v, want one containing %q", tt.text, err, tt.want)
+		}
+	}
+	var all Set
+	all.EnableAll()
+	if err := all.Validate(); err != nil {
+		t.Errorf("every capability: %v", err)
+	}
+	var bad Set
+	bad.Enable(Process, "job_control")
+	if _, err := Resolve(bad, true, Aliases{}); err == nil {
+		t.Error("Resolve does not validate")
+	}
+}
+
 // The deprecated bridge flags stand for the features they covered; giving
 // them and the tree is an error.
 func TestResolveAliases(t *testing.T) {

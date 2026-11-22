@@ -124,7 +124,14 @@ func TestDeployHostShims(t *testing.T) {
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
 		{hostWith("network.resolver"), []string{"host_sockets.cc"}},
 		{hostWith("process.spawn"), []string{"host_subprocess.cc", "host_fcntl.cc"}},
+		{hostWith("process"), nil},
+		{hostWith("process.environment"), []string{"host_process.cc"}},
+		{hostWith("process.job_control"), []string{"host_process.cc", "host_tty.cc"}},
 		{hostWith("process.resources"), []string{"host_process.cc"}},
+		{hostWith("terminal"), []string{"host_tty.cc"}},
+		{hostWith("terminal.pseudo"), []string{"host_tty.cc"}},
+		{hostWith("ipc"), nil},
+		{hostWith("ipc.sysv"), []string{"host_ipc.cc"}},
 		{hostWith("signals"), []string{"host_signal.cc"}},
 		{hostWith("signals.timers"), []string{"host_signal.cc"}},
 		{hostWith("process.resources", "system.logging"), []string{"host_process.cc", "host_syslog.cc"}},
@@ -207,6 +214,10 @@ func TestDeployHostHeaders(t *testing.T) {
 		{"process.resources", []string{"wasmify_posix.h", "unistd.h"}, []string{"signal.h"}},
 		{"signals.timers", []string{"wasmify_posix.h", "sys/time.h"}, nil},
 		{"system.logging", []string{"wasmify_posix.h", "syslog.h"}, nil},
+		{"process.environment", []string{"wasmify_posix.h"}, []string{"unistd.h"}},
+		{"process.job_control", []string{"wasmify_posix.h", "unistd.h"}, []string{"termios.h", "sys/ioctl.h"}},
+		{"terminal", []string{"wasmify_posix.h", "termios.h", "sys/ioctl.h", "unistd.h"}, nil},
+		{"ipc.sysv", []string{"wasmify_posix.h", "sys/ipc.h", "sys/msg.h", "sys/sem.h", "sys/shm.h"}, nil},
 	} {
 		dir, err := DeployHostHeaders(t.TempDir(), hostWith(tt.part))
 		if err != nil {

@@ -12,6 +12,30 @@ extern "C" {
 #ifdef WASMIFY_HOST_PROCESS_SPAWN
 /* host_subprocess.cc */
 void closefrom(int low_fd);
+int execve(const char *path, char *const argv[], char *const envp[]);
+int execv(const char *path, char *const argv[]);
+int execvp(const char *file, char *const argv[]);
+int execl(const char *path, const char *arg0, ...) __attribute__((__sentinel__));
+int execlp(const char *file, const char *arg0, ...) __attribute__((__sentinel__));
+int execle(const char *path, const char *arg0, ...) __attribute__((__sentinel__(1)));
+#endif
+
+#ifdef WASMIFY_HOST_PROCESS_JOB_CONTROL
+/* host_process.cc */
+pid_t getpgid(pid_t pid);
+pid_t getpgrp(void);
+int setpgid(pid_t pid, pid_t pgid);
+pid_t setsid(void);
+#endif
+
+#ifdef WASMIFY_HOST_TERMINAL
+/* host_tty.cc */
+char *ttyname(int fd);
+int ttyname_r(int fd, char *name, size_t size);
+#ifdef WASMIFY_HOST_PROCESS_JOB_CONTROL
+pid_t tcgetpgrp(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
+#endif
 #endif
 
 #ifdef WASMIFY_HOST_PROCESS_RESOURCES

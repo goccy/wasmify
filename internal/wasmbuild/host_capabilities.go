@@ -21,8 +21,9 @@ type hostPart struct {
 
 // hostParts lists every part of the capability tree, in the order of the
 // schema. A part with nothing is one that changes the target
-// (process.threads: effectiveTarget, wasmCompileFlags and the link) or a
-// base whose features bring all there is.
+// (process.threads: effectiveTarget, wasmCompileFlags and the link), a
+// base whose features bring all there is, or one that has nothing yet
+// (terminal.pseudo).
 var hostParts = []hostPart{
 	{capability: hostcap.Filesystem, shims: []string{"host_fs.cc"}, headers: []string{"wasmify_posix.h"},
 		wraps: []string{"chdir", "__wasilibc_find_relpath_alloc"}},
@@ -40,6 +41,10 @@ var hostParts = []hostPart{
 	{capability: hostcap.Process},
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
 		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
+	{capability: hostcap.Process, feature: "environment", shims: []string{"host_process.cc"}, headers: []string{"wasmify_posix.h"},
+		wraps: []string{"setenv", "unsetenv", "putenv", "clearenv"}},
+	{capability: hostcap.Process, feature: "job_control", shims: []string{"host_process.cc", "host_tty.cc"},
+		headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Process, feature: "resources", shims: []string{"host_process.cc"},
 		headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Process, feature: "threads"},
@@ -48,8 +53,16 @@ var hostParts = []hostPart{
 		headers: []string{"wasmify_posix.h", "signal.h", "unistd.h"}, wraps: []string{"write", "writev", "send"}},
 	{capability: hostcap.Signals, feature: "timers", shims: []string{"host_signal.cc"}, headers: []string{"sys/time.h"}},
 
+	{capability: hostcap.Terminal, shims: []string{"host_tty.cc"},
+		headers: []string{"wasmify_posix.h", "termios.h", "sys/ioctl.h", "unistd.h"}, wraps: []string{"ioctl"}},
+	{capability: hostcap.Terminal, feature: "pseudo"},
+
 	{capability: hostcap.Users, shims: []string{"host_users.cc"}, headers: []string{"wasmify_posix.h"}},
 	{capability: hostcap.Users, feature: "database", shims: []string{"host_users.cc"}, headers: []string{"pwd.h", "grp.h"}},
+
+	{capability: hostcap.IPC},
+	{capability: hostcap.IPC, feature: "sysv", shims: []string{"host_ipc.cc"},
+		headers: []string{"wasmify_posix.h", "sys/ipc.h", "sys/msg.h", "sys/sem.h", "sys/shm.h"}},
 
 	{capability: hostcap.System},
 	{capability: hostcap.System, feature: "info", shims: []string{"host_system.cc"}, headers: []string{"wasmify_posix.h"}},
@@ -67,8 +80,10 @@ var hostShimOrder = []string{
 	"host_process.cc",
 	"host_users.cc",
 	"host_signal.cc",
+	"host_tty.cc",
 	"host_time.cc",
 	"host_system.cc",
+	"host_ipc.cc",
 	"host_syslog.cc",
 	"host_fs.cc",
 }

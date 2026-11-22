@@ -44,8 +44,8 @@
  * path_open_mode/path_create_directory_mode, where the process's umask —
  * kept by the host, set through proc_umask — is taken out of it; flock is
  * fd_flock; and chdir finds the directory as the kernel does, following
- * each symbolic link on the way and taking ".." from what it reached,
- * before wasi-libc records it.
+ * each symbolic link on the way and taking ".." from what it reached, and
+ * tells the host where it goes (proc_chdir), before wasi-libc records it.
  * Paths cross the imports preopen-relative, like path_open's. The empty
  * path is refused where every libc path function resolves its argument
  * (__wasilibc_find_relpath_alloc), and in the wrappers here that resolve a
@@ -369,20 +369,25 @@ int __wrap_lstat(const char *path, struct stat *st) {
 #endif
 
 /* chdir resolves path with realpath(3), which follows each symbolic link
- * and takes ".." from what it reached, before wasi-libc records it. */
+ * and takes ".." from what it reached, before wasi-libc records it. The
+ * host is told the directory (proc_chdir) once it is one the guest can
+ * change to, and the guest changes to it only when the host takes it. */
 int __wrap_chdir(const char *path) {
     if (__wasmify_fs_no_path(path)) return -1;
     char out[PATH_MAX];
     if (realpath(path, out) == nullptr) return -1;
+    struct stat st;
+    if (stat(out, &st) != 0) return -1;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
     /* chdir(2) needs search permission on the directory, which libc's
      * chdir does not ask about (it opens the directory, which reading
-     * permission allows): a directory of mode 0644 is refused with EACCES.
-     * A path that is no directory is left to libc, which says what it is. */
+     * permission allows): a directory of mode 0644 is refused with EACCES. */
     const int searchable = __wasmify_fs_access(out, X_OK, 1);
-    if (searchable != 0 && searchable != -ENOSYS) {
-        struct stat st;
-        if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) return __wasmify_fs_result(searchable);
-    }
+    if (searchable != 0 && searchable != -ENOSYS) return __wasmify_fs_result(searchable);
+    if (__wasmify_fs_result(__wasmify_host_proc_chdir(out, (int)strlen(out))) != 0) return -1;
     return __real_chdir(out);
 }
 

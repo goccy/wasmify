@@ -43,7 +43,8 @@ func hostShim(name string) ([]byte, error) {
 
 // hostHeaderContent returns the content of a header a capability part puts
 // in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h,
-// sys/time.h, syslog.h); netdb.h and signal.h, which are the POSIX-compat
+// sys/time.h, syslog.h, termios.h, sys/ioctl.h, sys/ipc.h, sys/msg.h,
+// sys/sem.h, sys/shm.h); netdb.h and signal.h, which are the POSIX-compat
 // overlay's (the same file under both, so that a project and the shims see
 // one layout of struct addrinfo and struct sigaction whether or not the
 // overlay is on); or the stub registry's (spawn.h, sys/wait.h).
@@ -80,9 +81,11 @@ const HostIncludeSubdir = "host-include"
 // has a header): per capability part the headers wasi-libc does not have
 // (wasmify_posix.h with every part that has a shim on its imports;
 // spawn.h and sys/wait.h with process.spawn; unistd.h with process.spawn,
-// process.resources and signals; netdb.h with network; signal.h with
-// signals; sys/time.h with signals.timers; syslog.h with system.logging;
-// pwd.h and grp.h with users.database; time.h with system.time_zones).
+// process.resources, process.job_control, signals and terminal; netdb.h
+// with network; signal.h with signals; sys/time.h with signals.timers;
+// termios.h and sys/ioctl.h with terminal; syslog.h with system.logging;
+// pwd.h and grp.h with users.database; sys/ipc.h, sys/msg.h, sys/sem.h and
+// sys/shm.h with ipc.sysv; time.h with system.time_zones).
 //
 // The directory is added to every wasm-build compile's include path (see
 // wasmCompileFlags), so the upstream sources and wasmify's shims resolve the

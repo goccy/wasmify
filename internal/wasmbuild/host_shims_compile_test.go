@@ -198,3 +198,67 @@ func buildHostProgram(t *testing.T, sdk, dir string, host hostcap.Set, wasm64 bo
 	run("clang++", link...)
 	return wasm
 }
+
+// A program that calls every exec function, built with process.spawn for
+// both pointer widths (wasm64 where its sysroot is installed), links them
+// from the subprocess shim and imports proc_exec. Skipped where no
+// wasi-sdk is installed.
+func TestHostExecFamilyLinks(t *testing.T) {
+	sdk, err := DetectWasiSDK("")
+	if err != nil {
+		t.Skipf("no wasi-sdk: %v", err)
+	}
+	const program = `#include <unistd.h>
+extern char **environ;
+int main(int argc, char **argv) {
+    char *const args[] = {"sh", "-c", "exit 0", 0};
+    switch (argc) {
+    case 1: return execl("/bin/sh", "sh", "-c", "exit 0", (char *)0);
+    case 2: return execlp("sh", "sh", "-c", "exit 0", (char *)0);
+    case 3: return execle("/bin/sh", "sh", "-c", "exit 0", (char *)0, environ);
+    case 4: return execve("/bin/sh", args, environ);
+    case 5: return execv("/bin/sh", args);
+    default: return execvp(argv[0], args);
+    }
+}
+`
+	for _, wasm64Build := range []bool{false, true} {
+		width := "wasm32"
+		if wasm64Build {
+			width = "wasm64"
+		}
+		t.Run(width, func(t *testing.T) {
+			if wasm64Build {
+				installed, err := wasm64.SysrootInstalled(sdk, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !installed {
+					t.Skip("no wasm64 sysroot")
+				}
+			}
+			dir := t.TempDir()
+			main := filepath.Join(dir, "main.c")
+			if err := os.WriteFile(main, []byte(program), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			wasmBin, err := os.ReadFile(buildHostProgram(t, sdk, dir, hostWith("process.spawn"), wasm64Build, main))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := transpile.Parse(bytes.NewReader(wasmBin))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			imported := false
+			for _, i := range m.Imports {
+				if i.Module == "wasip1_posix_extension" && i.Name == "proc_exec" {
+					imported = true
+				}
+			}
+			if !imported {
+				t.Error("proc_exec is not imported")
+			}
+		})
+	}
+}
