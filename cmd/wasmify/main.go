@@ -1451,10 +1451,16 @@ func cmdWasmBuild(args []string) error {
 	// --shared-memory link demands) that the official SDK does not ship.
 	// Provision it on demand — the same stamped stages as
 	// `install-sdk --wasm64`, a no-op when already present.
-	if cfg.Wasm64 && !cfg.DryRun && !wasm64.SysrootInstalled(sdkPath, cfg.HostThreads) {
-		fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64 sysroot (first wasm64 build of this flavor)...\n")
-		if err := wasm64.InstallSysroot(sdkPath, cfg.HostThreads); err != nil {
+	if cfg.Wasm64 && !cfg.DryRun {
+		installed, err := wasm64.SysrootInstalled(sdkPath, cfg.HostThreads)
+		if err != nil {
 			return err
+		}
+		if !installed {
+			fmt.Fprintf(os.Stderr, "[wasm-build] Provisioning the wasm64 sysroot (first wasm64 build of this flavor)...\n")
+			if err := wasm64.InstallSysroot(sdkPath, cfg.HostThreads); err != nil {
+				return err
+			}
 		}
 	}
 

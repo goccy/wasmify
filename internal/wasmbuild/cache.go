@@ -15,7 +15,8 @@ import (
 type BuildCache struct {
 	Entries map[string]CacheEntry `json:"entries"` // key = cache key (step ID based)
 	// Target is the effective target triple every cached output was
-	// built for. The triple is a global property of the build
+	// built for, with the recipe of the compiler-rt builtins a wasm64 link
+	// takes (see cacheTarget). The triple is a global property of the build
 	// directory — obj files, archives and the link must all agree on
 	// pointer width and sysroot flavor — so a triple change (e.g.
 	// wasm_build.wasm64 flipped, HostThreads toggled) invalidates the
@@ -35,9 +36,9 @@ type CacheEntry struct {
 }
 
 // LoadBuildCache loads the build cache from buildDir/build-cache.json.
-// target is the effective target triple this build compiles for; a
-// cache recorded for a different triple is discarded wholesale (see
-// BuildCache.Target).
+// target is the effective target triple this build compiles for (with the
+// wasm64 builtins recipe, see cacheTarget); a cache recorded for a
+// different one is discarded wholesale (see BuildCache.Target).
 func LoadBuildCache(buildDir, target string) *BuildCache {
 	fresh := func() *BuildCache {
 		return &BuildCache{

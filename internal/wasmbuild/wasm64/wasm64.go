@@ -9,15 +9,24 @@ package wasm64
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 //go:embed build_sysroot.sh patches/*.patch
 var assets embed.FS
+
+// BuiltinsRevision names the recipe the compiler-rt builtins are built
+// with; build_sysroot.sh stamps it next to the archive, and an install
+// stamped otherwise (by an earlier recipe) is not complete. wasm-cmp-int:
+// the soft-float comparisons return an int, the result LLVM's WebAssembly
+// backend calls them with.
+const BuiltinsRevision = "wasm-cmp-int"
 
 // InstallSysroot builds and installs the wasm64-wasip1 sysroot into
 // sdkPath; threads selects the wasm64-wasip1-threads flavor (wasi-libc's
@@ -60,6 +69,7 @@ func InstallSysroot(sdkPath string, threads bool) error {
 	cmd.Env = append(os.Environ(),
 		"WASI_SDK_PATH="+sdkPath,
 		"PATCH_DIR="+filepath.Join(stage, "patches"),
+		"BUILTINS_REVISION="+BuiltinsRevision,
 	)
 	if threads {
 		cmd.Env = append(cmd.Env, "WASM64_THREADS=1")
@@ -73,8 +83,10 @@ func InstallSysroot(sdkPath string, threads bool) error {
 }
 
 // SysrootInstalled reports whether sdkPath already carries a complete
-// wasm64 sysroot of the requested flavor (all stage stamps present).
-func SysrootInstalled(sdkPath string, threads bool) bool {
+// wasm64 sysroot of the requested flavor (all stage stamps present, the
+// builtins' of the current recipe). A stamp that cannot be read for another
+// reason than its absence is an error.
+func SysrootInstalled(sdkPath string, threads bool) (bool, error) {
 	triple := "wasm64-wasip1"
 	if threads {
 		triple = "wasm64-wasip1-threads"
@@ -82,8 +94,33 @@ func SysrootInstalled(sdkPath string, threads bool) bool {
 	libDir := filepath.Join(sdkPath, "share", "wasi-sysroot", "lib", triple)
 	for _, stamp := range []string{".wasmify-libc-tag", ".wasmify-cxx-tag"} {
 		if _, err := os.Stat(filepath.Join(libDir, stamp)); err != nil {
-			return false
+			if errors.Is(err, fs.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
 		}
 	}
-	return true
+	return builtinsCurrent(sdkPath, triple)
+}
+
+// builtinsCurrent reports whether the compiler-rt builtins of the triple
+// in the SDK's clang resource directory carry the stamp of the current
+// recipe: "<LLVM version> <BuiltinsRevision>".
+func builtinsCurrent(sdkPath, triple string) (bool, error) {
+	rtTriple := strings.Replace(triple, "wasm64-", "wasm64-unknown-", 1)
+	stamps, err := filepath.Glob(filepath.Join(sdkPath, "lib", "clang", "*", "lib", rtTriple, ".wasmify-tag"))
+	if err != nil {
+		return false, err
+	}
+	for _, stamp := range stamps {
+		data, err := os.ReadFile(stamp)
+		if err != nil {
+			return false, err
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) == 2 && fields[1] == BuiltinsRevision {
+			return true, nil
+		}
+	}
+	return false, nil
 }
