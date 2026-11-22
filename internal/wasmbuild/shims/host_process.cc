@@ -1,5 +1,5 @@
 /* host_process.cc — the process: its id and its parent's, its
- * environment, its process group and session, and its resources.
+ * environment, its process group and session, its resources, and fork.
  *
  * WASI has none of this but the environment, which libc keeps, and
  * wasi-libc declares none of the rest. The host answers through imports: a guest that runs as the host process (a command
@@ -15,10 +15,11 @@
  * the host is told about (the link wraps setenv, unsetenv, putenv and
  * clearenv), with process.environment (WASMIFY_HOST_PROCESS_ENVIRONMENT);
  * process groups and sessions with process.job_control
- * (WASMIFY_HOST_PROCESS_JOB_CONTROL).
+ * (WASMIFY_HOST_PROCESS_JOB_CONTROL); __wasmify_fork and the child's entry
+ * with process.fork (WASMIFY_HOST_PROCESS_FORK).
  */
 #if defined(WASMIFY_HOST_PROCESS_RESOURCES) || defined(WASMIFY_HOST_PROCESS_ENVIRONMENT) || \
-    defined(WASMIFY_HOST_PROCESS_JOB_CONTROL)
+    defined(WASMIFY_HOST_PROCESS_JOB_CONTROL) || defined(WASMIFY_HOST_PROCESS_FORK)
 
 #include <sys/times.h>
 #include <sys/types.h>
@@ -227,7 +228,35 @@ pid_t setsid(void) {
 }
 #endif
 
+#ifdef WASMIFY_HOST_PROCESS_FORK
+/* ---- fork ----------------------------------------------------------------------
+ * What the child runs is kept here, where the child's copy of the memory
+ * has it too. */
+static int (*g_fork_child)(void *arg);
+static void *g_fork_arg;
+
+pid_t __wasmify_fork(int (*child)(void *arg), void *arg) {
+    g_fork_child = child;
+    g_fork_arg = arg;
+    int pid = -1;
+    const int rc = __wasmify_host_proc_fork(&pid);
+    if (rc != 0) return (pid_t)fail(-rc);
+    return (pid_t)pid;
+}
+
+/* The child's entry: the host runs this export once in the copy of the
+ * memory, and the child ends with its result as its exit status, as _exit
+ * ends a process: the atexit handlers do not run and stdio is not flushed
+ * (a child that wants them calls exit itself). */
+__attribute__((export_name("__wasip1_posix_extension_fork_child"))) int __wasmify_fork_child(void) {
+#ifdef WASMIFY_HOST_SIGNALS
+    __wasmify_signal_fork_child();
+#endif
+    return g_fork_child(g_fork_arg);
+}
+#endif
+
 } /* extern "C" */
 
 #endif /* WASMIFY_HOST_PROCESS_RESOURCES || WASMIFY_HOST_PROCESS_ENVIRONMENT ||
-          WASMIFY_HOST_PROCESS_JOB_CONTROL */
+          WASMIFY_HOST_PROCESS_JOB_CONTROL || WASMIFY_HOST_PROCESS_FORK */

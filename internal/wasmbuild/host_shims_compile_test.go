@@ -262,3 +262,74 @@ int main(int argc, char **argv) {
 		})
 	}
 }
+
+// A program that forks with __wasmify_fork, built with process.fork for
+// both pointer widths (with and without signals), exports the child's
+// entry __wasip1_posix_extension_fork_child as a function () -> i32 and imports proc_fork.
+// Skipped where no wasi-sdk is installed.
+func TestHostForkChildExport(t *testing.T) {
+	sdk, err := DetectWasiSDK("")
+	if err != nil {
+		t.Skipf("no wasi-sdk: %v", err)
+	}
+	const program = `#include "wasmify_posix.h"
+static int child(void *arg) { return *(int *)arg; }
+int main(void) {
+    static int status = 7;
+    return __wasmify_fork(child, &status) < 0;
+}
+`
+	for _, wasm64 := range []bool{false, true} {
+		for _, parts := range [][]string{
+			{"process.fork", "process.spawn"},
+			{"process.fork", "process.spawn", "signals"},
+		} {
+			width := "wasm32"
+			if wasm64 {
+				width = "wasm64"
+			}
+			t.Run(strings.Join(parts, "+")+"/"+width, func(t *testing.T) {
+				t.Parallel()
+				dir := t.TempDir()
+				main := filepath.Join(dir, "main.c")
+				if err := os.WriteFile(main, []byte(program), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				wasmBin, err := os.ReadFile(buildHostProgram(t, sdk, dir, hostWith(parts...), wasm64, main))
+				if err != nil {
+					t.Fatal(err)
+				}
+				m, err := transpile.Parse(bytes.NewReader(wasmBin))
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				exported := false
+				for _, e := range m.Exports {
+					if e.Name != "__wasip1_posix_extension_fork_child" {
+						continue
+					}
+					exported = true
+					if e.Kind != 0 {
+						t.Fatalf("__wasip1_posix_extension_fork_child is exported with kind %d, want a function", e.Kind)
+					}
+					ft := m.FuncTypeOf(e.Index)
+					if len(ft.Params) != 0 || len(ft.Results) != 1 || ft.Results[0] != 0x7f {
+						t.Errorf("__wasip1_posix_extension_fork_child has params %v and results %v, want () -> i32", ft.Params, ft.Results)
+					}
+				}
+				if !exported {
+					t.Error("__wasip1_posix_extension_fork_child is not exported")
+				}
+				imported := false
+				for _, i := range m.Imports {
+					if i.Module == "wasip1_posix_extension" && i.Name == "proc_fork" {
+						imported = true
+					}
+				}
+				if !imported {
+					t.Error("proc_fork is not imported")
+				}
+			})
+		}
+	}
+}

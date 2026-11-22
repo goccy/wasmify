@@ -41,6 +41,7 @@ var hostParts = []hostPart{
 	{capability: hostcap.Process},
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
 		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
+	{capability: hostcap.Process, feature: "fork", shims: []string{"host_process.cc"}, headers: []string{"wasmify_posix.h"}},
 	{capability: hostcap.Process, feature: "environment", shims: []string{"host_process.cc"}, headers: []string{"wasmify_posix.h"},
 		wraps: []string{"setenv", "unsetenv", "putenv", "clearenv"}},
 	{capability: hostcap.Process, feature: "job_control", shims: []string{"host_process.cc", "host_tty.cc"},

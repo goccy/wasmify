@@ -8,7 +8,7 @@
 //
 //	filesystem  {attributes, fifo, locking}
 //	network     {sockets, resolver}
-//	process     {spawn, environment, job_control, resources, threads}
+//	process     {spawn, fork, environment, job_control, resources, threads}
 //	signals     {timers}
 //	terminal    {pseudo}
 //	users       {database}
@@ -52,7 +52,7 @@ type capabilityFeatures struct {
 var schema = []capabilityFeatures{
 	{Filesystem, []string{"attributes", "fifo", "locking"}},
 	{Network, []string{"sockets", "resolver"}},
-	{Process, []string{"spawn", "environment", "job_control", "resources", "threads"}},
+	{Process, []string{"spawn", "fork", "environment", "job_control", "resources", "threads"}},
 	{Signals, []string{"timers"}},
 	{Terminal, []string{"pseudo"}},
 	{Users, []string{"database"}},
@@ -127,8 +127,15 @@ func (s Set) Empty() bool { return len(s.caps) == 0 }
 
 // Validate refuses a set in which a feature lacks what it needs.
 func (s Set) Validate() error {
+	var errs []string
+	if s.Feature(Process, "fork") && !s.Feature(Process, "spawn") {
+		errs = append(errs, "process.fork needs process.spawn (a forked child is waited for with waitpid)")
+	}
 	if s.Feature(Process, "job_control") && !s.Has(Terminal) {
-		return fmt.Errorf("host: process.job_control needs terminal (tcgetpgrp and tcsetpgrp are functions of a terminal)")
+		errs = append(errs, "process.job_control needs terminal (tcgetpgrp and tcsetpgrp are functions of a terminal)")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("host: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -288,11 +295,12 @@ func Resolve(tree Set, given bool, aliases Aliases) (Set, error) {
 	if given && aliases.Any() {
 		return Set{}, fmt.Errorf("host: give the capabilities either as wasmify.json's \"host\" or by the deprecated HostFS/HostSockets/HostSubprocess/HostThreads flags (or their WASMIFY_HOST_* variables), not both")
 	}
+	s := tree
 	if aliases.Any() {
-		return aliases.Set(), nil
+		s = aliases.Set()
 	}
-	if err := tree.Validate(); err != nil {
+	if err := s.Validate(); err != nil {
 		return Set{}, err
 	}
-	return tree, nil
+	return s, nil
 }

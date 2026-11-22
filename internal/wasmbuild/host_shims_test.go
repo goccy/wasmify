@@ -132,6 +132,7 @@ func TestDeployHostShims(t *testing.T) {
 		{hostWith("terminal.pseudo"), []string{"host_tty.cc"}},
 		{hostWith("ipc"), nil},
 		{hostWith("ipc.sysv"), []string{"host_ipc.cc"}},
+		{hostWith("process.spawn", "process.fork"), []string{"host_subprocess.cc", "host_fcntl.cc", "host_process.cc"}},
 		{hostWith("signals"), []string{"host_signal.cc"}},
 		{hostWith("signals.timers"), []string{"host_signal.cc"}},
 		{hostWith("process.resources", "system.logging"), []string{"host_process.cc", "host_syslog.cc"}},

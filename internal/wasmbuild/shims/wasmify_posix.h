@@ -203,6 +203,16 @@ int __wasmify_host_proc_priority(int which, int who, int set, int value, int *ni
 WASMIFY_POSIX_IMPORT(proc_times)
 int __wasmify_host_proc_times(uint64_t times[4]);
 
+/* ---- fork (host_process.cc) --------------------------------------------- */
+/* fork(2)'s host side: the host makes a child process from a copy of this
+ * one's memory and descriptors and writes its pid at pid_out (the copy has
+ * none). The child has no native call stack: the host enters it through
+ * the export __wasip1_posix_extension_fork_child (see __wasmify_fork).
+ * -ENOSYS where the host cannot fork, -EAGAIN when making the child
+ * failed. */
+WASMIFY_POSIX_IMPORT(proc_fork)
+int __wasmify_host_proc_fork(int *pid_out);
+
 /* ---- signals and the interval timer (host_signal.cc) -------------------- */
 /* Registers the word of this memory the host stores 1 into, atomically,
  * when it records a signal for this process: an uninterruptible guest
@@ -408,6 +418,18 @@ static inline uint32_t __wasmify_process_id(int which) {
 }
 
 /* ---- building blocks the shims export ----------------------------------- */
+
+/* host_process.cc, with process.fork. Forks this process: returns the
+ * child's pid, or -1 with errno set. Nothing returns in the child; the host
+ * calls the export __wasip1_posix_extension_fork_child (no parameters, an
+ * i32 result) of the new instance, which calls child(arg) there — arg
+ * points into the copied memory — and the child ends with its result as
+ * its exit status, as _exit ends a process (no atexit handlers, no stdio
+ * flush). The child is an instance the host has not seen: a program whose
+ * signal handlers run at its safe points registers its flag word again
+ * there (proc_signal_register), and then tells the host its dispositions
+ * (__wasmify_signal_report). */
+pid_t __wasmify_fork(int (*child)(void *arg), void *arg);
 
 /* host_signal.cc. The signal mask and the signal sets are the shim's (a
  * sigset_t names a set; see there), and so is delivery: a signal is
