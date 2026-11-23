@@ -3206,7 +3206,7 @@ func writeReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 			// *_result to the response. Plain error types (absl::Status)
 			// carry no payload, so the error pattern alone is correct.
 			if inner, ok := statusOrInnerType(ref); ok {
-				if successWrite := writeStatusOrSuccessExpr(inner, fieldNum, varName); successWrite != "" {
+				if successWrite := writeStatusOrSuccessExpr(inner, ref.IsRef, fieldNum, varName); successWrite != "" {
 					return code + " else { " + successWrite + " }"
 				}
 			}
@@ -3224,6 +3224,11 @@ func writeReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 // into the response writer. Repeated primitive/enum types use packed
 // encoding via ProtoWriter's write_repeated_* helpers; repeated strings and
 // handles use one tag per element.
+//
+// ref.IsRef tells whether varName refers to a vector that outlives the
+// call (a `const std::vector<T>&` return, a field) or is the dispatch
+// function's own local (a by-value return): handles may borrow elements
+// of the former, but must not point into the latter.
 func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) string {
 	if ref.Inner == nil {
 		return fmt.Sprintf("// TODO: serialize vector (unknown element type) %s", ref.Name)
@@ -3236,6 +3241,8 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 		deref := "(*" + varName + ")"
 		refNoPtr := ref
 		refNoPtr.IsPointer = false
+		// The pointee is not ours: borrow its elements as from a reference.
+		refNoPtr.IsRef = true
 		return fmt.Sprintf("if (%s) { %s }", varName, writeVectorReturnExpr(refNoPtr, fieldNum, deref))
 	}
 	inner := *ref.Inner
@@ -3269,12 +3276,8 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 		// Two sub-cases:
 		//   vector<T*> / vector<const T*>: iterate as-is and write each
 		//       non-null pointer directly.
-		//   vector<T>  (T is a handle-promoted encapsulated class): each
-		//       element lives on the vector's stack and would die when
-		//       _result goes out of scope. Heap-copy each element so the
-		//       caller receives stable handle pointers. Requires T to
-		//       have an accessible copy constructor and operator new —
-		//       bridgeable-type filters should already enforce this.
+		//   vector<T>  (T is a handle-promoted encapsulated class): see
+		//       the end of this case.
 		if inner.IsPointer {
 			return fmt.Sprintf("for (auto* _h : %s) { if (_h) _pw.write_handle(%d, reinterpret_cast<uint64_t>(_h)); }", varName, fieldNum)
 		}
@@ -3290,15 +3293,25 @@ func writeVectorReturnExpr(ref apispec.TypeRef, fieldNum int, varName string) st
 			return fmt.Sprintf("for (const auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(_elem))); }", varName, fieldNum)
 		}
 		if isSmartPointerType(cppTypeName(inner)) || isSmartPointerType(innerName) {
-			// unique_ptr<T>: non-owning access via .get(). We use const
-			// iteration because the source may be a `const vector&` (e.g.,
-			// returned from a getter); calling .release() would require
-			// mutation and fail for const containers. The caller receives
-			// a non-owning raw pointer valid for the lifetime of the owner.
-			return fmt.Sprintf("for (const auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(_elem.get())); }", varName, fieldNum)
+			// unique_ptr<T>: a referenced vector keeps owning its
+			// elements, so the handles borrow them via .get(). A by-value
+			// result destroys its unique_ptrs with it: release them so
+			// the objects outlive the call.
+			if ref.IsRef {
+				return fmt.Sprintf("for (const auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(_elem.get())); }", varName, fieldNum)
+			}
+			return fmt.Sprintf("for (auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(_elem.release())); }", varName, fieldNum)
 		}
-		// Non-pointer, non-smart-pointer handle: take address of element
-		return fmt.Sprintf("for (const auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(&_elem)); }", varName, fieldNum)
+		// Plain vector<T> elements. A referenced vector outlives the
+		// call, so the handles borrow its elements. A by-value result
+		// is the dispatch function's local and its elements die with
+		// it: move each one to the heap so the caller owns a stable
+		// object. Requires T to be move- or copy-constructible, which
+		// a by-value vector<T> already needs.
+		if ref.IsRef {
+			return fmt.Sprintf("for (const auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(&_elem)); }", varName, fieldNum)
+		}
+		return fmt.Sprintf("for (auto& _elem : %s) { _pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(_elem)))); }", varName, fieldNum)
 	case apispec.TypeValue:
 		// vector<Value>: serialize each element as a submessage by recursing
 		// through writeValueReturnExpr on a per-element temporary. A sub
@@ -5073,8 +5086,11 @@ func trampolineReturnSupported(t apispec.TypeRef) bool {
 	if isErrorOnlyReturnType(t) {
 		return true
 	}
-	if _, ok := statusOrInnerType(t); ok {
-		return true
+	if inner, ok := statusOrInnerType(t); ok {
+		// writeStatusOrTrampolineRead reads one handle, but a vector
+		// payload arrives as a repeated field.
+		_, isVector := vectorElemSpelling(inner)
+		return !isVector
 	}
 	if isViewOfStringType(t) {
 		// `absl::Span<const std::string>` — the trampoline
@@ -5150,16 +5166,26 @@ func statusOrInnerType(t apispec.TypeRef) (string, bool) {
 // "const Type *", "std::unique_ptr<T>", "bool"); `varName` is the
 // local holding the wrapper. The success branch dereferences via
 // `*varName`, mirroring how absl::StatusOr exposes its payload.
+// isRef tells whether varName is bound to a wrapper that outlives the
+// call rather than being the dispatch function's own local.
 //
 // Returns "" if the inner type isn't recognised, in which case the
 // caller should fall back to emitting only the error branch (the
 // safest degradation — the Go side observes (nil, nil) instead of a
 // crash). Adding a case here unbreaks the corresponding family of
 // bridge exports.
-func writeStatusOrSuccessExpr(inner string, fieldNum int, varName string) string {
+func writeStatusOrSuccessExpr(inner string, isRef bool, fieldNum int, varName string) string {
 	inner = strings.TrimSpace(inner)
 	if inner == "" {
 		return ""
+	}
+
+	// A vector payload is a repeated field, written element by element
+	// like a vector return: unless the wrapper is a reference, the
+	// vector is the StatusOr local, so its elements must not be borrowed.
+	if elem, ok := vectorElemSpelling(inner); ok {
+		ref := apispec.TypeRef{Kind: apispec.TypeVector, IsRef: isRef, Inner: vectorElemTypeRef(elem)}
+		return writeVectorReturnExpr(ref, fieldNum, "(*"+varName+")")
 	}
 
 	// Pointer-to-handle (`T*`, `const T*`): the most common case for
@@ -5209,6 +5235,46 @@ func writeStatusOrSuccessExpr(inner string, fieldNum int, varName string) string
 	// By-value class payload — heap-allocate a copy via move so the
 	// emitted handle outlives the StatusOr local.
 	return fmt.Sprintf("_pw.write_handle(%d, reinterpret_cast<uint64_t>(new auto(std::move(*%s))));", fieldNum, varName)
+}
+
+// vectorElemSpelling returns the element spelling E of a `std::vector<E>`
+// spelling, as a StatusOr-like wrapper's template argument names it.
+func vectorElemSpelling(spelling string) (string, bool) {
+	s := strings.TrimSpace(spelling)
+	if !strings.HasPrefix(s, "std::vector<") && !strings.HasPrefix(s, "vector<") {
+		return "", false
+	}
+	elem := extractTemplateArgFromQualType(s)
+	// std::vector<E, Alloc>: the element is the first argument.
+	if first, _, ok := splitTemplateArgs(elem); ok {
+		elem = strings.TrimSpace(first)
+	}
+	return elem, elem != ""
+}
+
+// vectorElemTypeRef classifies a vector element spelling the way the parser
+// would have classified it inside a TypeVector, for the payloads that only
+// reach the generator as a template-argument string.
+func vectorElemTypeRef(elem string) *apispec.TypeRef {
+	bare := stripCppTypeQualifiers(elem)
+	isPointer := strings.HasSuffix(strings.TrimSpace(elem), "*")
+	switch {
+	case tryPrimitiveToPbType(bare) != "":
+		return &apispec.TypeRef{Kind: apispec.TypePrimitive, Name: bare}
+	case bare == "std::string" || bare == "string":
+		return &apispec.TypeRef{Kind: apispec.TypeString, Name: bare}
+	case enumQualNames[resolveTypeName(bare)]:
+		return &apispec.TypeRef{Kind: apispec.TypeEnum, Name: resolveTypeName(bare)}
+	}
+	if c := lookupValueClass(bare); c != nil && !c.IsHandle && !isPointer {
+		return &apispec.TypeRef{Kind: apispec.TypeValue, Name: bare, QualType: elem}
+	}
+	return &apispec.TypeRef{
+		Kind:      apispec.TypeHandle,
+		Name:      bare,
+		QualType:  elem,
+		IsPointer: isPointer,
+	}
 }
 
 // trampolineTypeDecl returns the C++ type used in the override's
@@ -6397,10 +6463,11 @@ func writeGetterBody(b *strings.Builder, c *apispec.Class, f *apispec.Field, ind
 		// Vector fields: bind by const reference to avoid copying.
 		// Copying vectors of move-only elements (e.g., unique_ptr) is
 		// impossible; copying vectors of non-default-constructible types
-		// also fails. writeReturnExpr handles iteration — it works the
-		// same whether the source is by-value or by-reference.
+		// also fails. Handles to its elements borrow them from _self.
 		fmt.Fprintf(b, "%sconst auto& _result = _self->%s;\n", indent, f.Name)
-		fmt.Fprintf(b, "%s%s\n", indent, writeReturnExpr(f.Type, 1, "_result"))
+		fieldRef := f.Type
+		fieldRef.IsRef = true
+		fmt.Fprintf(b, "%s%s\n", indent, writeReturnExpr(fieldRef, 1, "_result"))
 	} else {
 		fmt.Fprintf(b, "%sauto _result = _self->%s;\n", indent, f.Name)
 		fmt.Fprintf(b, "%s%s\n", indent, writeReturnExpr(f.Type, 1, "_result"))
