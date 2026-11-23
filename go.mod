@@ -1,10 +1,10 @@
 module github.com/goccy/wasmify
 
-go 1.25.5
+go 1.25.12
 
 require (
 	github.com/bufbuild/protocompile v0.14.1
-	github.com/goccy/wasm2go v0.5.15
+	github.com/goccy/wasm2go v0.6.2
 	google.golang.org/protobuf v1.36.11
 )
 

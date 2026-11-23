@@ -340,14 +340,14 @@ __RESULT_CODEC__
 // wasi_snapshot_preview1: the caller can substitute its own implementation of
 // the host interface and pre-size linear memory.
 const wasm2goOptionsWasi = `// Options configure the module the generated API runs on. The zero
-// value is what Init uses: the default WASI implementation (the host
-// filesystem, environment and stdio), the engine's own initial memory
+// value is what Init uses: the WASI implementation of the host process,
+// base.NewWASI(base.HostWASIConfig()), the engine's own initial memory
 // reservation, and its wasm32 4 GiB ceiling.
 type Options struct {
 	// WASI replaces the wasi_snapshot_preview1 implementation the guest
-	// runs against. base.DefaultWASI() returns the default one, whose
-	// setters scope the filesystem to a directory (or an arbitrary
-	// base.FS), replace the environment and redirect stdio; any
+	// runs against. base.NewWASI builds one from a base.WASIConfig (its
+	// filesystem, environment, stdio and the policies of what the guest
+	// may do; base.HostWASIConfig() is the host process's); any
 	// implementation of the interface will do. nil keeps the default.
 	WASI base.Wasi_snapshot_preview1Imports
 
@@ -652,18 +652,20 @@ type EnvImports = wasm2go.EnvImports
 `
 
 // wasm2goSinglePkgBaseAliasWasiGo re-exports the WASI host surface in
-// single-package mode, where wasm2go emits WasiStubs / DefaultWASI /
-// Wasi_snapshot_preview1Imports into the engine package instead of base/. The
-// bridge names them through base/ in both modes, so the alias keeps
-// Options.WASI spelled the same way whichever layout wasm2go chose. Appended
-// only when the engine imports wasi_snapshot_preview1 — the interface does not
-// exist otherwise.
+// single-package mode, where wasm2go emits WasiStubs / WASIConfig / NewWASI /
+// HostWASIConfig / Wasi_snapshot_preview1Imports into the engine package
+// instead of base/. The bridge names them through base/ in both modes, so
+// the alias keeps Options.WASI spelled the same way whichever layout
+// wasm2go chose. Appended only when the engine imports
+// wasi_snapshot_preview1 — the interface does not exist otherwise.
 const wasm2goSinglePkgBaseAliasWasiGo = `
 type Wasi_snapshot_preview1Imports = wasm2go.Wasi_snapshot_preview1Imports
 type WasiStubs = wasm2go.WasiStubs
 type FS = wasm2go.FS
+type WASIConfig = wasm2go.WASIConfig
 
-func DefaultWASI() *WasiStubs { return wasm2go.DefaultWASI() }
+func NewWASI(cfg WASIConfig) *WasiStubs { return wasm2go.NewWASI(cfg) }
+func HostWASIConfig() WASIConfig        { return wasm2go.HostWASIConfig() }
 `
 
 // wasm2goMaxMemSetter returns the SetMaxMemory shim emitted into the engine

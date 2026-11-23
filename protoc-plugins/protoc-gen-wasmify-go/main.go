@@ -1273,7 +1273,7 @@ func generateModule(pkg string) string {
 				wasiRest = ", " + newArgs
 			}
 			construct = "\twasi := opts.WASI\n" +
-				"\tif wasi == nil {\n\t\twasi = base.DefaultWASI()\n\t}\n" +
+				"\tif wasi == nil {\n\t\twasi = base.NewWASI(base.HostWASIConfig())\n\t}\n" +
 				"\tif opts.MemoryReserveBytes > 0 {\n" +
 				"\t\tm.g = wasm2go.NewWithWASIReserve(wasi, " + reserveArgs + "opts.MemoryReserveBytes)\n" +
 				"\t} else {\n" +
