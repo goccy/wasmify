@@ -136,6 +136,17 @@ int getnameinfo(const struct sockaddr *__restrict, socklen_t,
 struct hostent *gethostbyname(const char *);
 struct hostent *gethostbyaddr(const void *, socklen_t, int);
 
+/* h_errno: why gethostbyname or gethostbyaddr found nothing. */
+#ifndef HOST_NOT_FOUND
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
+#define NO_ADDRESS     NO_DATA
+#endif
+int *__h_errno_location(void);
+#define h_errno (*__h_errno_location())
+
 /* --- the networks, services and protocols databases --- */
 
 struct netent {

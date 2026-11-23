@@ -43,11 +43,12 @@ func hostShim(name string) ([]byte, error) {
 
 // hostHeaderContent returns the content of a header a capability part puts
 // in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h,
-// sys/time.h, syslog.h, termios.h, sys/ioctl.h, sys/ipc.h, sys/msg.h,
-// sys/sem.h, sys/shm.h); netdb.h and signal.h, which are the POSIX-compat
-// overlay's (the same file under both, so that a project and the shims see
-// one layout of struct addrinfo and struct sigaction whether or not the
-// overlay is on); or the stub registry's (spawn.h, sys/wait.h).
+// fcntl.h, bits/alltypes.h, sys/time.h, syslog.h, termios.h, sys/ioctl.h, sys/ipc.h, sys/msg.h,
+// sys/sem.h, sys/shm.h); netdb.h, signal.h and sys/socket.h, which are the
+// POSIX-compat overlay's (the same file under both, so that a project and
+// the shims see one layout of struct addrinfo and struct sigaction, and one
+// numbering of shutdown's SHUT_ names, whether or not the overlay is on); or
+// the stub registry's (spawn.h, sys/wait.h).
 func hostHeaderContent(name string) (string, error) {
 	if name == "wasmify_posix.h" {
 		return wasmifyPosixHeader, nil
@@ -59,7 +60,7 @@ func hostHeaderContent(name string) (string, error) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		return "", fmt.Errorf("embedded header <%s>: %w", name, err)
 	}
-	if name == "netdb.h" || name == "signal.h" {
+	if name == "netdb.h" || name == "signal.h" || name == "sys/socket.h" {
 		data, err := posixCompatFS.ReadFile("stubs/include/" + name)
 		if err != nil {
 			return "", fmt.Errorf("missing embedded header <%s>: %w", name, err)
@@ -80,9 +81,10 @@ const HostIncludeSubdir = "host-include"
 // <buildDir>/host-include and returns that directory ("" when no given part
 // has a header): per capability part the headers wasi-libc does not have
 // (wasmify_posix.h with every part that has a shim on its imports;
-// spawn.h and sys/wait.h with process.spawn; unistd.h with process.spawn,
-// process.resources, process.job_control, signals and terminal; netdb.h
-// with network; signal.h with signals; sys/time.h with signals.timers;
+// spawn.h, sys/wait.h and fcntl.h with process.spawn; unistd.h with process.spawn,
+// process.resources, process.job_control, signals, terminal and users; netdb.h
+// with network; sys/socket.h with network.sockets; signal.h and
+// bits/alltypes.h with signals; sys/time.h with signals.timers;
 // termios.h and sys/ioctl.h with terminal; syslog.h with system.logging;
 // pwd.h and grp.h with users.database; sys/ipc.h, sys/msg.h, sys/sem.h and
 // sys/shm.h with ipc.sysv; time.h with system.time_zones).

@@ -103,6 +103,10 @@ WASMIFY_POSIX_IMPORT(proc_wait)
 int __wasmify_host_proc_wait(int pid, int options, int *status_out);
 WASMIFY_POSIX_IMPORT(proc_wait_any)
 int __wasmify_host_proc_wait_any(int options, int *pid_out, int *status_out);
+/* proc_wait_any for the processes of group pgid (> 0) alone: ECHILD when
+ * the group has none. */
+WASMIFY_POSIX_IMPORT(proc_wait_group)
+int __wasmify_host_proc_wait_group(int pgid, int options, int *pid_out, int *status_out);
 WASMIFY_POSIX_IMPORT(pipe)
 int __wasmify_host_pipe(int *fds_out);
 /* fd_dup, fd_dup2 and fd_dupfd return 0 or a positive errno. */
@@ -308,7 +312,8 @@ WASMIFY_POSIX_IMPORT(sock_name)
 int __wasmify_host_sock_name(int fd, int peer, struct __wasmify_sock_addr *out);
 /* sendto: with addr, a datagram to that address (path as for connect);
  * without, a send to the socket's peer. flags are host_sockets.cc's
- * WASMIFY_MSG_ flags. *sent receives the count. */
+ * WASMIFY_MSG_ flags of a send (DONTWAIT 4; NOSIGNAL 8, without which a
+ * broken connection also posts SIGPIPE). *sent receives the count. */
 WASMIFY_POSIX_IMPORT(sock_sendto_addr)
 int __wasmify_host_sock_sendto(int fd, const void *buf, int len, int flags,
                                const struct __wasmify_sock_addr *addr, const char *path,
@@ -456,11 +461,9 @@ void __wasmify_signal_after_call(void);
  * kind 0 blocks the signals of mask, 1 unblocks them, 2 makes mask the
  * mask, 3 only asks; a signal it unblocks that came meanwhile is delivered
  * before it returns. *old receives the mask before. Returns 0, or -1 with
- * errno set (ENOMEM when the table of sets is full, EINVAL for another
- * kind); the mask is unchanged then. */
+ * errno set (EINVAL for another kind); the mask is unchanged then. */
 int __wasmify_signal_native_mask(int kind, uint64_t mask, uint64_t *old);
-/* The mask a sigset_t holds, and a sigset_t made to hold a mask (0, or -1
- * with errno set when the table of sets is full). */
+/* The mask a sigset_t holds, and a sigset_t made to hold a mask (0). */
 uint64_t __wasmify_signal_set_mask(const void *set);
 int __wasmify_signal_set_store(void *set, uint64_t mask);
 /* A wait of native code with a signal mask of its own (epoll_pwait, ppoll,

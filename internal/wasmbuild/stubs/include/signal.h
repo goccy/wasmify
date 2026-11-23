@@ -17,10 +17,11 @@ extern "C" {
 #endif
 
 /* sigset_t — wasi-sdk guards the __NEED_sigset_t define, so define it here.
- * With the host capability signals it is the C library's own (one byte),
- * which host_signal.cc's struct sigaction and signal sets are built on. */
+ * With the host capability signals it is host-include's (bits/alltypes.h):
+ * a set of 64 signals, which host_signal.cc's signal sets are built on. */
 #ifdef WASMIFY_HOST_SIGNALS
-#include <__typedef_sigset_t.h>
+#define __NEED_sigset_t
+#include <bits/alltypes.h>
 #elif !defined(__DEFINED_sigset_t)
 typedef struct __sigset_t { unsigned long __bits[128/sizeof(long)]; } sigset_t;
 #define __DEFINED_sigset_t

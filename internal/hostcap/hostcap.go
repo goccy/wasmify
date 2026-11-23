@@ -10,7 +10,7 @@
 //	network     {sockets, resolver}
 //	process     {spawn, fork, environment, job_control, resources, threads}
 //	signals     {timers}
-//	terminal    {pseudo}
+//	terminal    {}
 //	users       {database}
 //	ipc         {sysv}
 //	system      {info, logging, time_zones}
@@ -54,7 +54,7 @@ var schema = []capabilityFeatures{
 	{Network, []string{"sockets", "resolver"}},
 	{Process, []string{"spawn", "fork", "environment", "job_control", "resources", "threads"}},
 	{Signals, []string{"timers"}},
-	{Terminal, []string{"pseudo"}},
+	{Terminal, nil},
 	{Users, []string{"database"}},
 	{IPC, []string{"sysv"}},
 	{System, []string{"info", "logging", "time_zones"}},
@@ -130,9 +130,6 @@ func (s Set) Validate() error {
 	var errs []string
 	if s.Feature(Process, "fork") && !s.Feature(Process, "spawn") {
 		errs = append(errs, "process.fork needs process.spawn (a forked child is waited for with waitpid)")
-	}
-	if s.Feature(Process, "job_control") && !s.Has(Terminal) {
-		errs = append(errs, "process.job_control needs terminal (tcgetpgrp and tcsetpgrp are functions of a terminal)")
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("host: %s", strings.Join(errs, "; "))

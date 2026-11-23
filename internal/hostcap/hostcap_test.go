@@ -84,7 +84,8 @@ func TestSetJSONRoundTrip(t *testing.T) {
 // Resolve.
 func TestValidate(t *testing.T) {
 	for _, tt := range []struct{ text, want string }{
-		{`{"process": {"job_control": true}}`, "process.job_control needs terminal"},
+		{`{"process": {"job_control": true}}`, ""},
+		{`{"process": true}`, ""},
 		{`{"process": {"fork": true}}`, "process.fork needs process.spawn"},
 		{`{"process": {"fork": true, "spawn": true}}`, ""},
 		{`{"process": {"job_control": true}, "terminal": {}}`, ""},
@@ -108,15 +109,10 @@ func TestValidate(t *testing.T) {
 	if err := all.Validate(); err != nil {
 		t.Errorf("every capability: %v", err)
 	}
-	var bad Set
-	bad.Enable(Process, "job_control")
 	var fork Set
 	fork.Enable(Process, "fork")
 	if _, err := Resolve(fork, true, Aliases{}); err == nil {
 		t.Error("Resolve takes process.fork without process.spawn")
-	}
-	if _, err := Resolve(bad, true, Aliases{}); err == nil {
-		t.Error("Resolve does not validate")
 	}
 }
 

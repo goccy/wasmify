@@ -25,8 +25,8 @@ A capability is `true` (with every feature), `false` or absent (nothing),
 or an object of its features (a feature left out is not given). A
 capability given at all also brings its base: what it is without any
 feature. A name the tree does not have is an error, and so is a feature
-without what it needs: `process.job_control` needs `terminal` (`tcgetpgrp`
-and `tcsetpgrp` are functions of a terminal).
+without what it needs: `process.fork` needs `process.spawn` (the child is
+waited for with `waitpid`).
 
 ## The tree
 
@@ -37,15 +37,15 @@ and `tcsetpgrp` are functions of a terminal).
 | | | `locking` | `flock`, the record locks of `fcntl` (F_GETLK, F_SETLK, F_SETLKW) |
 | `network` | `netdb.h`, `inet_ntop` as glibc words an address | `sockets` | `socket`, `connect`, `bind`, `listen`, `accept`/`accept4`, `getpeername`/`getsockname`, the options and the receive and send timeouts, `send`/`recv` and `sendto`/`recvfrom`, `socketpair`, `shutdown` with the usual numbers, `poll` that watches a descriptor asked for nothing for its hang-up |
 | | | `resolver` | `getaddrinfo`, `getnameinfo`, `gethostbyname`/`gethostbyaddr`, the services, protocols and networks databases |
-| `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child or any, `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD: wasi-libc's `O_CLOEXEC` is 0, so `open`, `pipe2` and `dup3` cannot set it), and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64); `execv`/`execvp` (`execvp` searching the guest's `PATH`): the process becomes the command, keeps its pid and ends the way the command ends |
+| `process` | nothing | `spawn` | the `posix_spawn` family (`posix_spawnp` searching the guest's `PATH`), `waitpid`/`wait` for one child, any, or one of a process group (the caller's, or -pid's), `pipe`/`pipe2`, `dup`/`dup2`/`dup3`, `closefrom`, the close-on-exec flag of `fcntl` (F_GETFD, F_SETFD) and of `O_CLOEXEC` given to `open`, `openat`, `pipe2` or `dup3` (host-include's `fcntl.h`; wasi-libc's is 0; the descriptors of `fopen`'s "e" mode and of `opendir`, which wasi-libc opens without these functions, are not marked), `O_NONBLOCK` of `pipe2`, and its `F_DUPFD`/`F_DUPFD_CLOEXEC` where the C library names them (wasm64); `execv`/`execvp` (`execvp` searching the guest's `PATH`): the process becomes the command, keeps its pid and ends the way the command ends |
 | | | `fork` | `__wasmify_fork(child, arg)` (`wasmify_posix.h`): the host copies the process, and the child runs `child(arg)` through the export `__wasip1_posix_extension_fork_child` and ends with its result; needs `process.spawn` (the child is waited for with `waitpid`) |
 | | | `environment` | `setenv`, `unsetenv`, `putenv`, `clearenv` tell the host each change before the C library makes it; a change the host refuses fails with its errno |
-| | | `job_control` | `getpgid`, `getpgrp`, `setpgid`, `setsid`; `tcgetpgrp`, `tcsetpgrp` |
+| | | `job_control` | `getpgid`, `getpgrp`, `setpgid`, `setsid`; `tcgetpgrp`, `tcsetpgrp` when `terminal` is given too |
 | | | `resources` | `getpid`/`getppid`, `getpriority`/`setpriority`/`nice`, `times` with the CPU time the host accounts |
 | | | `threads` | the wasi-threads target: `-pthread`, a shared memory, atomics (wasm2go runs each guest thread on a goroutine) |
-| `terminal` | `termios.h` and the requests of a terminal of `ioctl` (`sys/ioctl.h`: TCGETS, TIOCGWINSZ, ...), in Linux's numbers, made of the host's terminal: `tcgetattr`, `tcsetattr`, the speeds, `tcdrain`, `tcflow`, `tcflush`, `tcsendbreak`; `ttyname`/`ttyname_r`, `ctermid` | `pseudo` | nothing yet |
+| `terminal` | `termios.h` and the requests of a terminal of `ioctl` (`sys/ioctl.h`: TCGETS, TIOCGWINSZ, ...), in Linux's numbers, made of the host's terminal: `tcgetattr`, `tcsetattr`, the speeds, `tcdrain`, `tcflow`, `tcflush`, `tcsendbreak`; `ttyname`/`ttyname_r`, `ctermid` | | |
 | `users` | `getuid`/`geteuid`/`getgid`/`getegid`, the `setuid` and `setgid` families, `getgroups`/`setgroups` | `database` | `pwd.h` and `grp.h`: `getpwuid`/`getpwnam`/`getpwent` and their `_r` forms, `getgrgid`/`getgrnam`/`getgrent` and their `_r` forms; `getlogin`, `cuserid` |
-| `signals` | the disposition table (`sigaction`, `signal`), the mask (`sigprocmask`, `sigsuspend`, `sigpending`), the signal sets, `raise`, `kill`/`killpg`, `pause`, `abort`; delivery at the calls and at the application's safe points (`__wasmify_signal_absorb`), and the SIGPIPE of a `write`, `writev` or `send` before it returns | `timers` | `alarm`, `ualarm`, `setitimer`/`getitimer` (ITIMER_REAL) |
+| `signals` | the disposition table (`sigaction`, `signal`), the mask (`sigprocmask`, `sigsuspend`, `sigpending`), the signal sets, `raise`, `kill`/`killpg`, `pause`, `abort`; delivery at the calls and at the application's safe points (`__wasmify_signal_absorb`), and the SIGPIPE of a `write`, `writev`, `send` or `sendto` before it returns; `sigset_t` is a 64-bit set (host-include's `bits/alltypes.h`) | `timers` | `alarm`, `ualarm`, `setitimer`/`getitimer` (ITIMER_REAL) |
 | `ipc` | nothing | `sysv` | `sys/ipc.h`, `sys/msg.h`, `sys/sem.h`, `sys/shm.h`: `msgget`, `msgctl`, `msgsnd`, `msgrcv`, `semget`, `semctl`, `semop`, `shmget`, `shmctl`, `shmat`/`shmdt` (the segment attached over memory `shmat` takes for it), `ftok`, on the host's objects; a call that passes a structure, and `shmat`/`shmdt`, need wasm64 (ENOSYS for wasm32) |
 | `system` | nothing | `info` | `uname` (and `gethostname`) of the host's system |
 | | | `logging` | `syslog.h`: `openlog`, `syslog`, `vsyslog`, `closelog`, `setlogmask` |
@@ -63,13 +63,18 @@ For each part given (a capability's base or a feature), wasmify
   `process.job_control`, `process.resources`, `signals`, `terminal`,
   `users`, `ipc.sysv`, `system.info`, `system.logging` and
   `system.time_zones`; `spawn.h` and `sys/wait.h` with `process.spawn`;
+  `fcntl.h` (the C library's, with an `O_CLOEXEC` of its own that `open`,
+  `openat`, `pipe2` and `dup3` honour) with `process.spawn`;
   `unistd.h` (the C library's, declaring what the shims define that it
   leaves out: `closefrom`, `execv` and `execvp` with `process.spawn`,
   `getppid` and `nice` with `process.resources`, the process groups with
-  `process.job_control`, `pause` with `signals`, `ttyname` with
-  `terminal`) with each of those; `netdb.h` with `network`; `signal.h`
-  (the POSIX-compat overlay's, with the C library's one-byte `sigset_t`)
-  with `signals`; `sys/time.h` (the C library's, declaring the interval
+  `process.job_control`, `pause` with `signals`, `alarm` with
+  `signals.timers`, `ttyname` with `terminal`, the ids with `users`) with
+  each of those; `netdb.h` with `network`; `sys/socket.h` (the
+  POSIX-compat overlay's, with shutdown's usual numbers) with
+  `network.sockets`; `signal.h` (the POSIX-compat overlay's) and
+  `bits/alltypes.h` (the C library's, with a 64-bit `sigset_t`) with
+  `signals`; `sys/time.h` (the C library's, declaring the interval
   timer) with `signals.timers`; `termios.h` and `sys/ioctl.h` (the C
   library's, with the requests of a terminal) with `terminal`;
   `syslog.h` with `system.logging`; `pwd.h` and `grp.h` with
@@ -82,7 +87,8 @@ For each part given (a capability's base or a feature), wasmify
 - wraps at link the libc functions the shims replace (`chdir` and libc's
   path resolution with `filesystem`; `chmod`, `stat`, `open`, `mkdir`,
   `access`, ... with `filesystem.attributes`; `fcntl` with
-  `filesystem.locking` and `process.spawn`; `inet_ntop` with `network`;
+  `filesystem.locking` and `process.spawn`; `open` and `openat` with
+  `process.spawn`; `inet_ntop` with `network`;
   `setenv`, `unsetenv`, `putenv` and `clearenv` with
   `process.environment`; `write`, `writev` and `send` with `signals`;
   `ioctl` with `terminal`).

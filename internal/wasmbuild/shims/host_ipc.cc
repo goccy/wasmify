@@ -98,12 +98,17 @@ int shmctl(int id, int cmd, struct shmid_ds *buf) {
 int semctl(int id, int num, int cmd, ...) {
     union ipc_semun arg;
     arg.buf = nullptr;
+    /* the commands that take the fourth argument, as Linux has them */
     switch (cmd) {
     case IPC_STAT:
     case IPC_SET:
+    case IPC_INFO:
     case GETALL:
     case SETALL:
-    case SETVAL: {
+    case SETVAL:
+    case 18: /* SEM_STAT */
+    case 19: /* SEM_INFO */
+    case 20: /* SEM_STAT_ANY */ {
         va_list ap;
         va_start(ap, cmd);
         arg = va_arg(ap, union ipc_semun);

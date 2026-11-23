@@ -270,39 +270,42 @@ const uid_t kKeep = (uid_t)-1;
 
 } /* namespace */
 
+/* The functions are defined weakly, like those of host_fs.cc: a project
+ * that links its own in an object file of its own keeps it (one in an
+ * archive member is not pulled in for a symbol defined already). */
 extern "C" {
 
-uid_t getuid(void) { return (uid_t)__wasmify_process_id(ID_UID); }
-uid_t geteuid(void) { return (uid_t)__wasmify_process_id(ID_EUID); }
-gid_t getgid(void) { return (gid_t)__wasmify_process_id(ID_GID); }
-gid_t getegid(void) { return (gid_t)__wasmify_process_id(ID_EGID); }
+__attribute__((weak)) uid_t getuid(void) { return (uid_t)__wasmify_process_id(ID_UID); }
+__attribute__((weak)) uid_t geteuid(void) { return (uid_t)__wasmify_process_id(ID_EUID); }
+__attribute__((weak)) gid_t getgid(void) { return (gid_t)__wasmify_process_id(ID_GID); }
+__attribute__((weak)) gid_t getegid(void) { return (gid_t)__wasmify_process_id(ID_EGID); }
 
-int setuid(uid_t uid) {
+__attribute__((weak)) int setuid(uid_t uid) {
     return set_ids(SET_UID, uid, kKeep, kKeep, uid, uid, kKeep, ID_UID, ID_EUID);
 }
-int seteuid(uid_t uid) {
+__attribute__((weak)) int seteuid(uid_t uid) {
     return set_ids(SET_EUID, uid, kKeep, kKeep, kKeep, uid, kKeep, ID_UID, ID_EUID);
 }
-int setreuid(uid_t ruid, uid_t euid) {
+__attribute__((weak)) int setreuid(uid_t ruid, uid_t euid) {
     return set_ids(SET_REUID, ruid, euid, kKeep, ruid, euid, kKeep, ID_UID, ID_EUID);
 }
-int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+__attribute__((weak)) int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
     return set_ids(SET_RESUID, ruid, euid, suid, ruid, euid, suid, ID_UID, ID_EUID);
 }
-int setgid(gid_t gid) {
+__attribute__((weak)) int setgid(gid_t gid) {
     return set_ids(SET_GID, gid, kKeep, kKeep, gid, gid, kKeep, ID_GID, ID_EGID);
 }
-int setegid(gid_t gid) {
+__attribute__((weak)) int setegid(gid_t gid) {
     return set_ids(SET_EGID, gid, kKeep, kKeep, kKeep, gid, kKeep, ID_GID, ID_EGID);
 }
-int setregid(gid_t rgid, gid_t egid) {
+__attribute__((weak)) int setregid(gid_t rgid, gid_t egid) {
     return set_ids(SET_REGID, rgid, egid, kKeep, rgid, egid, kKeep, ID_GID, ID_EGID);
 }
-int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
+__attribute__((weak)) int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
     return set_ids(SET_RESGID, rgid, egid, sgid, rgid, egid, sgid, ID_GID, ID_EGID);
 }
 
-int getgroups(int size, gid_t list[]) {
+__attribute__((weak)) int getgroups(int size, gid_t list[]) {
     uint32_t count = 0;
     if (size < 0) {
         errno = EINVAL;
@@ -321,7 +324,7 @@ int getgroups(int size, gid_t list[]) {
     return (int)count;
 }
 
-int setgroups(size_t size, const gid_t *list) {
+__attribute__((weak)) int setgroups(size_t size, const gid_t *list) {
     /* gid_t is the u32 the host reads; a process that is not the host
      * process has no privilege to change its groups */
     const int rc = __wasmify_host_proc_setgroups((const uint32_t *)list, (int)size);
@@ -333,29 +336,29 @@ int setgroups(size_t size, const gid_t *list) {
 }
 
 #ifdef WASMIFY_HOST_USERS_DATABASE
-struct passwd *getpwuid(uid_t uid) {
+__attribute__((weak)) struct passwd *getpwuid(uid_t uid) {
     return decode_user(g_user_rec, &g_user, fetch(g_user_rec, user_by_id(uid)));
 }
 
-struct passwd *getpwnam(const char *name) {
+__attribute__((weak)) struct passwd *getpwnam(const char *name) {
     if (!name) return NULL;
     return decode_user(g_user_rec, &g_user, fetch(g_user_rec, user_by_name(name)));
 }
 
-struct group *getgrgid(gid_t gid) {
+__attribute__((weak)) struct group *getgrgid(gid_t gid) {
     return decode_group(g_group_rec, &g_group, fetch(g_group_rec, group_by_id(gid)));
 }
 
-struct group *getgrnam(const char *name) {
+__attribute__((weak)) struct group *getgrnam(const char *name) {
     if (!name) return NULL;
     return decode_group(g_group_rec, &g_group, fetch(g_group_rec, group_by_name(name)));
 }
 
-int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t size, struct passwd **result) {
+__attribute__((weak)) int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t size, struct passwd **result) {
     return user_r(user_by_id(uid), pw, buf, size, result);
 }
 
-int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t size,
+__attribute__((weak)) int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t size,
                struct passwd **result) {
     if (!name) {
         *result = NULL;
@@ -364,11 +367,11 @@ int getpwnam_r(const char *name, struct passwd *pw, char *buf, size_t size,
     return user_r(user_by_name(name), pw, buf, size, result);
 }
 
-int getgrgid_r(gid_t gid, struct group *gr, char *buf, size_t size, struct group **result) {
+__attribute__((weak)) int getgrgid_r(gid_t gid, struct group *gr, char *buf, size_t size, struct group **result) {
     return group_r(group_by_id(gid), gr, buf, size, result);
 }
 
-int getgrnam_r(const char *name, struct group *gr, char *buf, size_t size,
+__attribute__((weak)) int getgrnam_r(const char *name, struct group *gr, char *buf, size_t size,
                struct group **result) {
     if (!name) {
         *result = NULL;
@@ -378,49 +381,75 @@ int getgrnam_r(const char *name, struct group *gr, char *buf, size_t size,
 }
 
 /* Walking the databases: the entries of the host's, one after the other,
- * from the first again after setpwent, setgrent or the end of the walk. A
- * process that is not the host process has none. */
+ * from the first again after setpwent or setgrent. Once a walk has ended
+ * (or failed) it returns NULL until it is set back. A process that is not
+ * the host process has none. The walk is the index of the next entry, or
+ * -1 when it has ended. */
 static int g_user_walk = 0;
 static int g_group_walk = 0;
 
-void setpwent(void) { g_user_walk = 0; }
-void endpwent(void) { g_user_walk = 0; }
-struct passwd *getpwent(void) {
+__attribute__((weak)) void setpwent(void) { g_user_walk = 0; }
+__attribute__((weak)) void endpwent(void) { g_user_walk = 0; }
+__attribute__((weak)) struct passwd *getpwent(void) {
+    if (g_user_walk < 0) return NULL;
     const int index = g_user_walk++;
     struct passwd *pw = decode_user(g_user_rec, &g_user, fetch(g_user_rec, [index](void *buf, int len, uint32_t *needed) {
         return __wasmify_host_proc_user_at(index, buf, len, needed);
     }));
-    if (!pw) g_user_walk = 0;
+    if (!pw) g_user_walk = -1;
     return pw;
 }
-void setgrent(void) { g_group_walk = 0; }
-void endgrent(void) { g_group_walk = 0; }
-struct group *getgrent(void) {
+__attribute__((weak)) void setgrent(void) { g_group_walk = 0; }
+__attribute__((weak)) void endgrent(void) { g_group_walk = 0; }
+__attribute__((weak)) struct group *getgrent(void) {
+    if (g_group_walk < 0) return NULL;
     const int index = g_group_walk++;
     struct group *gr = decode_group(g_group_rec, &g_group, fetch(g_group_rec, [index](void *buf, int len, uint32_t *needed) {
         return __wasmify_host_proc_group_at(index, buf, len, needed);
     }));
-    if (!gr) g_group_walk = 0;
+    if (!gr) g_group_walk = -1;
     return gr;
 }
 
 /* The login name is that of the user the process runs as: ENOENT when the
- * database has no such user, the lookup's errno when it failed. */
-char *getlogin(void) {
-    const int saved = errno;
-    errno = 0;
-    struct passwd *pw = getpwuid(getuid());
-    if (!pw) {
-        if (errno == 0) errno = ENOENT;
-        return NULL;
+ * database has no such user, the lookup's errno when it failed. It is kept
+ * in storage of getlogin's own, so that the result of getpwnam or getpwuid
+ * stays as it was. The entry is read into a buffer that doubles until it
+ * holds it (getpwuid_r's ERANGE). */
+__attribute__((weak)) char *getlogin(void) {
+    static char *login = NULL;
+    for (size_t size = 1024;; size *= 2) {
+        char *buf = (char *)malloc(size);
+        if (!buf) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        struct passwd pw;
+        struct passwd *found = NULL;
+        const int rc = getpwuid_r(getuid(), &pw, buf, size, &found);
+        if (rc == ERANGE) {
+            free(buf);
+            continue;
+        }
+        char *kept = (rc == 0 && found) ? strdup(pw.pw_name) : NULL;
+        free(buf);
+        if (rc != 0 || !found) {
+            errno = rc != 0 ? rc : ENOENT;
+            return NULL;
+        }
+        if (!kept) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        free(login);
+        login = kept;
+        return login;
     }
-    errno = saved;
-    return pw->pw_name;
 }
 
 /* The login name, as getlogin has it (above), in a buffer of L_cuserid
  * bytes: the caller's, or this function's own. */
-char *cuserid(char *buf) {
+__attribute__((weak)) char *cuserid(char *buf) {
     static char name[L_cuserid];
     const char *login = getlogin();
     if (!buf) buf = name;

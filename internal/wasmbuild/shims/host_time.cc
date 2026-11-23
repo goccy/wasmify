@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <time.h>
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+#include <pthread.h>
+#endif
 
 #include "wasmify_posix.h"
 
@@ -31,6 +34,19 @@ struct __wasmify_zone {
 };
 
 namespace {
+
+/* The lock of the state below (musl's __tz.c has one too), where the
+ * program has threads (process.threads). A default mutex fails only when it
+ * is misused, which these pairs do not. */
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
+struct zone_locked {
+    zone_locked() { pthread_mutex_lock(&zone_lock); }
+    ~zone_locked() { pthread_mutex_unlock(&zone_lock); }
+};
+#else
+struct zone_locked {};
+#endif
 
 /* A struct tm points at its zone's abbreviation (tm_zone), so the
  * abbreviations a program has met stay where they are for its lifetime. */
@@ -91,6 +107,18 @@ void tz_remember() {
     tz_known = tz == NULL || tz_value != NULL;
 }
 
+/* tzset, with the lock held. */
+void tzset_locked() {
+    struct __wasmify_zone zone;
+    zone_at((long long)time(NULL), 0, &zone);
+    const char *standard = zone_name(zone.std_name);
+    tzname[0] = (char *)standard;
+    tzname[1] = (char *)(zone.dst_name[0] ? zone_name(zone.dst_name) : standard);
+    timezone = -(long)zone.std_offset;
+    daylight = zone.dst_name[0] != 0;
+    tz_remember();
+}
+
 } /* namespace */
 
 extern "C" {
@@ -121,7 +149,8 @@ int daylight = 0;
  * tzname, timezone and daylight are set for sets them first. */
 void __secs_to_zone(long long t, int local, int *isdst, long *offset, long *oppoff,
                     const char **zonename) {
-    if (!tz_current()) tzset();
+    zone_locked locked;
+    if (!tz_current()) tzset_locked();
     struct __wasmify_zone zone;
     zone_at(t, local, &zone);
     *isdst = zone.is_dst;
@@ -136,20 +165,15 @@ void __secs_to_zone(long long t, int local, int *isdst, long *offset, long *oppo
 const char *__tm_to_tzname(const struct tm *tm) {
     const char *name = tm->tm_zone;
     if (name == __utc) return name;
+    zone_locked locked;
     for (size_t i = 0; i < zone_name_count; i++)
         if (name == zone_names[i]) return name;
     return "";
 }
 
 void tzset(void) {
-    struct __wasmify_zone zone;
-    zone_at((long long)time(NULL), 0, &zone);
-    const char *standard = zone_name(zone.std_name);
-    tzname[0] = (char *)standard;
-    tzname[1] = (char *)(zone.dst_name[0] ? zone_name(zone.dst_name) : standard);
-    timezone = -(long)zone.std_offset;
-    daylight = zone.dst_name[0] != 0;
-    tz_remember();
+    zone_locked locked;
+    tzset_locked();
 }
 
 } /* extern "C" */

@@ -147,7 +147,7 @@ What a wasm needs of a POSIX system that WASI preview1 lacks (processes, sockets
 }
 ```
 
-The capabilities are `filesystem` {attributes, fifo, locking}, `network` {sockets, resolver}, `process` {spawn, fork, environment, job_control, resources, threads}, `signals` {timers}, `terminal` {pseudo}, `users` {database}, `ipc` {sysv} and `system` {info, logging, time_zones}. wasmify compiles and links the host shims of what is given (libc functions on imports of the module `wasip1_posix_extension`, which the host implements; the wasm2go runtime does), with their headers, `WASMIFY_HOST_*` macros and link wraps. Without `host` the wasm imports standard WASI only. The bridge flags `HostFS`, `HostSockets`, `HostSubprocess` and `HostThreads` are deprecated aliases. See [`docs/host-capabilities.md`](docs/host-capabilities.md).
+The capabilities are `filesystem` {attributes, fifo, locking}, `network` {sockets, resolver}, `process` {spawn, fork, environment, job_control, resources, threads}, `signals` {timers}, `terminal` {}, `users` {database}, `ipc` {sysv} and `system` {info, logging, time_zones}. wasmify compiles and links the host shims of what is given (libc functions on imports of the module `wasip1_posix_extension`, which the host implements; the wasm2go runtime does), with their headers, `WASMIFY_HOST_*` macros and link wraps. Without `host` the wasm imports standard WASI only. The bridge flags `HostFS`, `HostSockets`, `HostSubprocess` and `HostThreads` are deprecated aliases. See [`docs/host-capabilities.md`](docs/host-capabilities.md).
 
 ## Using the generated Go package
 

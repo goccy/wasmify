@@ -22,10 +22,12 @@
  * by the host's exec whitelist. */
 #ifdef WASMIFY_HOST_PROCESS_SPAWN
 
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <climits>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +37,53 @@
 #include "wasmify_posix.h"
 
 extern "C" {
+
+/* ---- close-on-exec at creation ---------------------------------------------
+ * O_CLOEXEC is a flag of its own (host-include's fcntl.h; wasi-libc's is
+ * 0). open, openat, pipe2 and dup3 take it off and mark the new descriptor
+ * close-on-exec with the host, which hands a command every descriptor that
+ * is not marked. __wasmify_mark_cloexec returns fd, or closes it (the
+ * caller does not get it) and returns -1 with the flag's errno; an error
+ * of that close has no way out. */
+int __wasmify_mark_cloexec(int fd) {
+    int old = 0;
+    const int rc = __wasmify_host_fd_cloexec(fd, 1, 1, &old);
+    if (rc == 0) return fd;
+    (void)close(fd);
+    errno = (rc < 0) ? -rc : rc;
+    return -1;
+}
+
+int __real_openat(int dirfd, const char *path, int oflag, ...);
+int __wrap_openat(int dirfd, const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+    const int fd = __real_openat(dirfd, path, oflag & ~O_CLOEXEC, mode);
+    if (fd < 0 || !(oflag & O_CLOEXEC)) return fd;
+    return __wasmify_mark_cloexec(fd);
+}
+
+#ifndef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
+/* (With filesystem.attributes, host_fs.cc's open is the wrapper.) */
+int __real_open(const char *path, int oflag, ...);
+int __wrap_open(const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+    const int fd = __real_open(path, oflag & ~O_CLOEXEC, mode);
+    if (fd < 0 || !(oflag & O_CLOEXEC)) return fd;
+    return __wasmify_mark_cloexec(fd);
+}
+#endif
 
 /* dup()/dup2()/dup3(): wasi-libc has neither (WASI preview1 has only
  * fd_renumber, whose move semantics close the source). The host imports
@@ -56,9 +105,10 @@ int dup2(int from, int to) {
 }
 
 int dup3(int from, int to, int flags) {
-    (void)flags;
-    if (from == to) { errno = EINVAL; return -1; }
-    return dup2(from, to);
+    if (from == to || (flags & ~O_CLOEXEC) != 0) { errno = EINVAL; return -1; }
+    if (dup2(from, to) < 0) return -1;
+    if (!(flags & O_CLOEXEC)) return to;
+    return __wasmify_mark_cloexec(to);
 }
 
 int posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa) {
@@ -132,8 +182,10 @@ int posix_spawn(pid_t *pid, const char *path,
  * each candidate path in turn and returns 0 or the errno it failed with; a
  * missing file moves on to the next, and a file that exists but cannot be
  * executed is remembered so that the search reports EACCES rather than
- * ENOENT. Without PATH the directories are the C library's default (musl's
- * execvp). Returns 0 or the errno of the search. */
+ * ENOENT; a directory whose candidate path would be PATH_MAX bytes or more
+ * is passed over, as musl's execvp passes it. Without PATH the directories
+ * are the C library's default (musl's execvp). Returns 0 or the errno of
+ * the search. */
 extern "C++" {
 template <typename Run>
 static int __wasmify_search_path(const char *file, Run run) {
@@ -148,6 +200,11 @@ static int __wasmify_search_path(const char *file, Run run) {
         const char *end = dir;
         while (*end != '\0' && *end != ':') end++;
         const size_t dir_len = static_cast<size_t>(end - dir);
+        if (dir_len + 1 + file_len >= PATH_MAX) {
+            if (*end == '\0') break;
+            dir = end + 1;
+            continue;
+        }
         /* An empty entry names the current directory. */
         std::string candidate;
         if (dir_len > 0) {
@@ -288,9 +345,9 @@ int execle(const char *path, const char *arg0, ...) {
 /* pipe()/pipe2(): host-backed pipe for subprocess capture_output. The host
  * creates an OS pipe and returns [readFd, writeFd]; the guest reads the read
  * end via fd_read while a spawned child writes the write end (wired as its
- * stdout/stderr by posix_spawn). pipe2 flags (O_CLOEXEC/O_NONBLOCK) are
- * accepted but not enforced — the host child fd space is separate and the
- * guest drives blocking. */
+ * stdout/stderr by posix_spawn). pipe2 makes both ends non-blocking with
+ * O_NONBLOCK and marks them close-on-exec with O_CLOEXEC; on a failure of
+ * either the ends are closed (an error of those closes has no way out). */
 int pipe(int fildes[2]) {
     if (fildes == nullptr) { errno = EFAULT; return -1; }
     int rc = __wasmify_host_pipe(fildes);
@@ -299,18 +356,47 @@ int pipe(int fildes[2]) {
 }
 
 int pipe2(int fildes[2], int flags) {
-    (void)flags;
-    return pipe(fildes);
+    if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0) { errno = EINVAL; return -1; }
+    int fds[2] = {-1, -1};
+    if (pipe(fds) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        int e = 0;
+        if ((flags & O_NONBLOCK) && fcntl(fds[i], F_SETFL, O_NONBLOCK) != 0) e = errno;
+        int old = 0;
+        if (e == 0 && (flags & O_CLOEXEC)) {
+            const int rc = __wasmify_host_fd_cloexec(fds[i], 1, 1, &old);
+            if (rc != 0) e = (rc < 0) ? -rc : rc;
+        }
+        if (e != 0) {
+            (void)close(fds[0]);
+            (void)close(fds[1]);
+            errno = e;
+            return -1;
+        }
+    }
+    fildes[0] = fds[0];
+    fildes[1] = fds[1];
+    return 0;
 }
 
+/* waitpid: pid > 0 waits for that child (proc_wait), -1 for any child
+ * (proc_wait_any), 0 for a child in the caller's process group and pid < -1
+ * for a child in group -pid (proc_wait_group). */
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     int st = 0;
     int reaped = static_cast<int>(pid);
-    /* pid -1 (and the process-group forms, which have no meaning here: the
-     * host tracks children, not groups) waits for any child. */
-    int rc = pid > 0
-        ? __wasmify_host_proc_wait(static_cast<int>(pid), options, &st)
-        : __wasmify_host_proc_wait_any(options, &reaped, &st);
+    int rc;
+    if (pid > 0) {
+        rc = __wasmify_host_proc_wait(static_cast<int>(pid), options, &st);
+    } else if (pid == -1) {
+        rc = __wasmify_host_proc_wait_any(options, &reaped, &st);
+    } else if (pid == INT_MIN) {
+        rc = -ESRCH; /* a group -pid cannot name, as Linux reports it */
+    } else {
+        int group = -static_cast<int>(pid);
+        rc = pid == 0 ? __wasmify_host_proc_getpgid(0, &group) : 0;
+        if (rc == 0) rc = __wasmify_host_proc_wait_group(group, options, &reaped, &st);
+    }
     if (rc == 0) {
         if (wstatus != nullptr) *wstatus = st;
         return static_cast<pid_t>(reaped);

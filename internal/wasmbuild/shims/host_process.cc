@@ -29,6 +29,9 @@
 #include <cstring>
 #include <time.h>
 #include <unistd.h>
+#if defined(WASMIFY_HOST_PROCESS_FORK) && defined(WASMIFY_HOST_PROCESS_THREADS)
+#include <pthread.h>
+#endif
 
 #include "wasmify_posix.h"
 
@@ -231,15 +234,27 @@ pid_t setsid(void) {
 #ifdef WASMIFY_HOST_PROCESS_FORK
 /* ---- fork ----------------------------------------------------------------------
  * What the child runs is kept here, where the child's copy of the memory
- * has it too. */
+ * has it too. Where the program has threads (process.threads), a lock keeps
+ * two forks from setting it at once; the child's copy is taken with the
+ * lock held, and the child starts its own lock afresh. (A default mutex
+ * fails only when it is misused, which these pairs do not.) */
 static int (*g_fork_child)(void *arg);
 static void *g_fork_arg;
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+static pthread_mutex_t g_fork_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 pid_t __wasmify_fork(int (*child)(void *arg), void *arg) {
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+    pthread_mutex_lock(&g_fork_lock);
+#endif
     g_fork_child = child;
     g_fork_arg = arg;
     int pid = -1;
     const int rc = __wasmify_host_proc_fork(&pid);
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+    pthread_mutex_unlock(&g_fork_lock);
+#endif
     if (rc != 0) return (pid_t)fail(-rc);
     return (pid_t)pid;
 }
@@ -249,6 +264,9 @@ pid_t __wasmify_fork(int (*child)(void *arg), void *arg) {
  * ends a process: the atexit handlers do not run and stdio is not flushed
  * (a child that wants them calls exit itself). */
 __attribute__((export_name("__wasip1_posix_extension_fork_child"))) int __wasmify_fork_child(void) {
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+    g_fork_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 #ifdef WASMIFY_HOST_SIGNALS
     __wasmify_signal_fork_child();
 #endif

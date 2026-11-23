@@ -22,8 +22,7 @@ type hostPart struct {
 // hostParts lists every part of the capability tree, in the order of the
 // schema. A part with nothing is one that changes the target
 // (process.threads: effectiveTarget, wasmCompileFlags and the link), a
-// base whose features bring all there is, or one that has nothing yet
-// (terminal.pseudo).
+// base whose features bring all there is.
 var hostParts = []hostPart{
 	{capability: hostcap.Filesystem, shims: []string{"host_fs.cc"}, headers: []string{"wasmify_posix.h"},
 		wraps: []string{"chdir", "__wasilibc_find_relpath_alloc"}},
@@ -35,30 +34,29 @@ var hostParts = []hostPart{
 
 	{capability: hostcap.Network, shims: []string{"host_sockets.cc"}, headers: []string{"wasmify_posix.h", "netdb.h"},
 		wraps: []string{"inet_ntop"}},
-	{capability: hostcap.Network, feature: "sockets", shims: []string{"host_sockets.cc"}},
+	{capability: hostcap.Network, feature: "sockets", shims: []string{"host_sockets.cc"}, headers: []string{"sys/socket.h"}},
 	{capability: hostcap.Network, feature: "resolver", shims: []string{"host_sockets.cc"}},
 
 	{capability: hostcap.Process},
 	{capability: hostcap.Process, feature: "spawn", shims: []string{"host_subprocess.cc", "host_fcntl.cc"},
-		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"}, wraps: []string{"fcntl"}},
+		headers: []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h", "fcntl.h"}, wraps: []string{"fcntl", "open", "openat"}},
 	{capability: hostcap.Process, feature: "fork", shims: []string{"host_process.cc"}, headers: []string{"wasmify_posix.h"}},
 	{capability: hostcap.Process, feature: "environment", shims: []string{"host_process.cc"}, headers: []string{"wasmify_posix.h"},
 		wraps: []string{"setenv", "unsetenv", "putenv", "clearenv"}},
-	{capability: hostcap.Process, feature: "job_control", shims: []string{"host_process.cc", "host_tty.cc"},
+	{capability: hostcap.Process, feature: "job_control", shims: []string{"host_process.cc"},
 		headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Process, feature: "resources", shims: []string{"host_process.cc"},
 		headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Process, feature: "threads"},
 
 	{capability: hostcap.Signals, shims: []string{"host_signal.cc"},
-		headers: []string{"wasmify_posix.h", "signal.h", "unistd.h"}, wraps: []string{"write", "writev", "send"}},
+		headers: []string{"wasmify_posix.h", "signal.h", "bits/alltypes.h", "unistd.h"}, wraps: []string{"write", "writev", "send"}},
 	{capability: hostcap.Signals, feature: "timers", shims: []string{"host_signal.cc"}, headers: []string{"sys/time.h"}},
 
 	{capability: hostcap.Terminal, shims: []string{"host_tty.cc"},
 		headers: []string{"wasmify_posix.h", "termios.h", "sys/ioctl.h", "unistd.h"}, wraps: []string{"ioctl"}},
-	{capability: hostcap.Terminal, feature: "pseudo"},
 
-	{capability: hostcap.Users, shims: []string{"host_users.cc"}, headers: []string{"wasmify_posix.h"}},
+	{capability: hostcap.Users, shims: []string{"host_users.cc"}, headers: []string{"wasmify_posix.h", "unistd.h"}},
 	{capability: hostcap.Users, feature: "database", shims: []string{"host_users.cc"}, headers: []string{"pwd.h", "grp.h"}},
 
 	{capability: hostcap.IPC},

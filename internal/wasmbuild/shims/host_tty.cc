@@ -10,7 +10,7 @@
  * reads the link /proc/self/fd/N, as Linux's C libraries do.
  *
  * Compiled when the host capability terminal is given (WASMIFY_HOST_TERMINAL);
- * tcgetpgrp and tcsetpgrp with process.job_control.
+ * tcgetpgrp and tcsetpgrp when process.job_control is given too.
  */
 #ifdef WASMIFY_HOST_TERMINAL
 

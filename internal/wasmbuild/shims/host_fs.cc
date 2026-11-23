@@ -323,32 +323,54 @@ __attribute__((weak)) int flock(int fd, int operation) {
 
 #endif
 #ifdef WASMIFY_HOST_FILESYSTEM_ATTRIBUTES
-/* futimes() is futimens() at microsecond resolution. */
+/* futimes() is futimens() at microsecond resolution; a microsecond count
+ * outside 0..999999 is EINVAL, as Linux has it. */
 __attribute__((weak)) int futimes(int fd, const struct timeval tv[2]) {
     if (tv == nullptr) return futimens(fd, nullptr);
     struct timespec ts[2];
     for (int i = 0; i < 2; i++) {
+        if (tv[i].tv_usec < 0 || tv[i].tv_usec >= 1000000) {
+            errno = EINVAL;
+            return -1;
+        }
         ts[i].tv_sec = tv[i].tv_sec;
         ts[i].tv_nsec = (long)tv[i].tv_usec * 1000;
     }
     return futimens(fd, ts);
 }
 
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
+int __wasmify_mark_cloexec(int fd); /* host_subprocess.cc */
+#endif
+
 /* open(): only a creating open has a mode to deliver; every other goes to
- * wasi-libc unchanged. */
+ * wasi-libc unchanged. With process.spawn, O_CLOEXEC marks the descriptor
+ * close-on-exec with the host (see host_subprocess.cc). */
 int __wrap_open(const char *path, int oflag, ...) {
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
+    const bool cloexec = (oflag & O_CLOEXEC) != 0;
+    oflag &= ~O_CLOEXEC;
+#endif
     /* An open without any access mode is a read-only open. Where O_RDONLY
      * is 0 — every common system — that is simply what such flags say, and
      * programs written there pass a literal 0 for "read only". wasi-libc's
      * O_RDONLY is a bit of its own, and its open rejects flags that have
      * none of the access bits (EINVAL). */
     if ((oflag & O_ACCMODE) == 0) oflag |= O_RDONLY;
-    if ((oflag & O_CREAT) == 0) return __real_open(path, oflag);
-    va_list ap;
-    va_start(ap, oflag);
-    mode_t mode = va_arg(ap, mode_t);
-    va_end(ap);
-    return __wasmify_fs_open_mode(path, oflag, mode);
+    int fd;
+    if ((oflag & O_CREAT) == 0) {
+        fd = __real_open(path, oflag);
+    } else {
+        va_list ap;
+        va_start(ap, oflag);
+        mode_t mode = va_arg(ap, mode_t);
+        va_end(ap);
+        fd = __wasmify_fs_open_mode(path, oflag, mode);
+    }
+#ifdef WASMIFY_HOST_PROCESS_SPAWN
+    if (fd >= 0 && cloexec) return __wasmify_mark_cloexec(fd);
+#endif
+    return fd;
 }
 
 int __wrap_mkdir(const char *path, mode_t mode) {
@@ -370,8 +392,11 @@ int __wrap_lstat(const char *path, struct stat *st) {
 
 /* chdir resolves path with realpath(3), which follows each symbolic link
  * and takes ".." from what it reached, before wasi-libc records it. The
- * host is told the directory (proc_chdir) once it is one the guest can
- * change to, and the guest changes to it only when the host takes it. */
+ * host is told the directory (proc_chdir) once the guest has changed to it;
+ * when the host refuses it, the guest changes back to where it was and the
+ * call fails with the host's errno. (Changing back fails only when that
+ * directory has gone meanwhile; the guest then stays in the new one, which
+ * the host has not taken.) */
 int __wrap_chdir(const char *path) {
     if (__wasmify_fs_no_path(path)) return -1;
     char out[PATH_MAX];
@@ -387,8 +412,13 @@ int __wrap_chdir(const char *path) {
      * permission allows): a directory of mode 0644 is refused with EACCES. */
     const int searchable = __wasmify_fs_access(out, X_OK, 1);
     if (searchable != 0 && searchable != -ENOSYS) return __wasmify_fs_result(searchable);
-    if (__wasmify_fs_result(__wasmify_host_proc_chdir(out, (int)strlen(out))) != 0) return -1;
-    return __real_chdir(out);
+    char prev[PATH_MAX];
+    if (getcwd(prev, sizeof(prev)) == nullptr) return -1;
+    if (__real_chdir(out) != 0) return -1;
+    const int told = __wasmify_host_proc_chdir(out, (int)strlen(out));
+    if (told == 0) return 0;
+    (void)__real_chdir(prev);
+    return __wasmify_fs_result(told);
 }
 
 } /* extern "C" */

@@ -127,6 +127,17 @@ int eai_of(int rc) {
     errno = -rc;
     return EAI_SYSTEM;
 }
+
+/* The h_errno of a failed gethostbyname or gethostbyaddr lookup's negative
+ * errno: a name the host has no address for is HOST_NOT_FOUND, one that may
+ * resolve later TRY_AGAIN, and any other failure NO_RECOVERY. */
+int herrno_of(int rc) {
+    switch (rc) {
+    case -ENOENT: return HOST_NOT_FOUND;
+    case -EAGAIN: return TRY_AGAIN;
+    }
+    return NO_RECOVERY;
+}
 #endif /* WASMIFY_HOST_NETWORK_RESOLVER */
 
 } /* namespace */
@@ -174,10 +185,11 @@ struct __wasmify_sockaddr_un {
 
 /* The flags of a send or a receive the host knows, by the host's own
  * numbering (libc's MSG_ numbers differ from libc to libc): a receive takes
- * all three, a send MSG_DONTWAIT alone. */
+ * PEEK, WAITALL and DONTWAIT, a send DONTWAIT and NOSIGNAL. */
 #define WASMIFY_MSG_PEEK 1     /* receive: leave it in place */
 #define WASMIFY_MSG_WAITALL 2  /* receive: until the buffer is full */
 #define WASMIFY_MSG_DONTWAIT 4 /* do not wait, whatever O_NONBLOCK says */
+#define WASMIFY_MSG_NOSIGNAL 8 /* send: a broken connection is EPIPE without SIGPIPE */
 
 /* The socket options the host knows, by the host's own numbering: libc's
  * numbers for them differ from libc to libc. */
@@ -333,14 +345,12 @@ static void __wasmify_sock_addr_out(const struct __wasmify_sock_addr *in,
         if (len > sizeof(sa.un.sun_path)) len = sizeof(sa.un.sun_path);
         memcpy(sa.un.sun_path, in->name, len);
         /* The lengths are Linux's, which is what tells the three kinds of
-         * address apart: a path is the whole structure, padded with NULs;
-         * an abstract name (one that starts with a NUL) has no terminator
-         * and ends where the address does; a socket without a name has an
-         * address that ends before the path. */
-        full = sizeof(sa.un);
-        if (len == 0 || in->name[0] == '\0') {
-            full = (socklen_t)(offsetof(struct __wasmify_sockaddr_un, sun_path) + len);
-        }
+         * address apart: a path ends with its terminating NUL (with none
+         * when it fills sun_path); an abstract name (one that starts with
+         * a NUL) has no terminator and ends where the address does; a
+         * socket without a name has an address that ends before the path. */
+        full = (socklen_t)(offsetof(struct __wasmify_sockaddr_un, sun_path) + len);
+        if (len != 0 && in->name[0] != '\0' && len < sizeof(sa.un.sun_path)) full++;
         break;
     }
     }
@@ -637,7 +647,7 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
                 }
             } else if (rc == 0) {
                 bad = EAI_FAIL;
-            } else if (rc != -ENOENT) {
+            } else if (rc != -ENOENT && rc != -EACCES) {
                 bad = eai_of(rc);
             }
             free(rec.data);
@@ -651,6 +661,13 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
     return 0;
 }
 
+/* h_errno: why the last gethostbyname or gethostbyaddr of the thread found
+ * nothing. */
+int *__h_errno_location(void) {
+    static thread_local int h;
+    return &h;
+}
+
 /* gethostbyname(): the host's gethostbyname lookup: the official name and
  * the IPv4 addresses of the name. The result lives in static storage, as
  * the interface has it. */
@@ -660,20 +677,37 @@ struct hostent *gethostbyname(const char *name) {
     static char **addr_list = nullptr;
     static size_t addr_cap = 0;
     static char *no_aliases[1];
-    if (name == nullptr) return nullptr;
+    if (name == nullptr) {
+        h_errno = HOST_NOT_FOUND;
+        return nullptr;
+    }
     /* the record: count, the addresses, the name */
     const int rc = fetch(rec, [name](void *buf, int len, unsigned int *needed) {
         return __wasmify_host_sock_host_by_name(name, (int)strlen(name), buf, len, needed);
     });
     if (rc != 0) {
         if (rc != -ENOENT) errno = -rc;
+        h_errno = herrno_of(rc);
         return nullptr;
     }
     uint32_t count = 0;
-    if (rec.len < 4) return nullptr;
+    if (rec.len < 4) {
+        h_errno = NO_RECOVERY;
+        return nullptr;
+    }
     memcpy(&count, rec.data, 4);
-    if (count == 0 || (rec.len - 4) / 4 < count) return nullptr;
-    if (!room(&addr_list, &addr_cap, (size_t)count + 1)) return nullptr;
+    if (count == 0) {
+        h_errno = NO_DATA;
+        return nullptr;
+    }
+    if ((rec.len - 4) / 4 < count) {
+        h_errno = NO_RECOVERY;
+        return nullptr;
+    }
+    if (!room(&addr_list, &addr_cap, (size_t)count + 1)) {
+        h_errno = NO_RECOVERY;
+        return nullptr;
+    }
     for (uint32_t i = 0; i < count; i++) addr_list[i] = rec.data + 4 + 4 * i;
     addr_list[count] = nullptr;
     rec.data[rec.len] = '\0';
@@ -696,7 +730,10 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
     static Record name;
     const int family = (type == AF_INET || type == AF_INET6) ? __wasmify_sock_family(type) : 0;
     const socklen_t size = type == AF_INET ? 4 : 16;
-    if (addr == nullptr || family == 0 || len < size) return nullptr;
+    if (addr == nullptr || family == 0 || len < size) {
+        h_errno = HOST_NOT_FOUND;
+        return nullptr;
+    }
     struct __wasmify_sock_addr rec;
     __wasmify_sock_addr_ip(&rec, family, addr);
     const int rc = fetch(name, [&rec](char *buf, int buf_len, unsigned int *needed) {
@@ -704,6 +741,7 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
     });
     if (rc != 0) {
         if (rc != -ENOENT) errno = -rc;
+        h_errno = herrno_of(rc);
         return nullptr;
     }
     name.data[name.len] = '\0';
@@ -736,14 +774,21 @@ static int __wasmify_sock_type(int family, int type, int protocol) {
     return 0;
 }
 
-/* Makes the count (1 or 2) descriptors non-blocking; on failure they are
- * closed and -1 is returned with fcntl's errno. */
-static int __wasmify_sock_nonblock(int *fds, int count) {
+/* Gives the count (1 or 2) new descriptors what flags asks: SOCK_NONBLOCK
+ * makes them non-blocking, SOCK_CLOEXEC marks them close-on-exec with the
+ * host. On failure they are closed and -1 is returned with errno set. */
+static int __wasmify_sock_flags(int *fds, int count, int flags) {
     for (int i = 0; i < count; i++) {
-        if (fcntl(fds[i], F_SETFL, O_NONBLOCK) != 0) {
-            const int e = errno;
+        int e = 0;
+        if ((flags & SOCK_NONBLOCK) && fcntl(fds[i], F_SETFL, O_NONBLOCK) != 0) e = errno;
+        int old = 0;
+        if (e == 0 && (flags & SOCK_CLOEXEC)) {
+            const int rc = __wasmify_host_fd_cloexec(fds[i], 1, 1, &old);
+            if (rc != 0) e = (rc < 0) ? -rc : rc;
+        }
+        if (e != 0) {
             /* The sockets are the caller's to discard, unseen by the
-             * program: the call fails with fcntl's errno whatever their
+             * program: the call fails with the flag's errno whatever their
              * close reports. */
             for (int j = 0; j < count; j++) close(fds[j]);
             errno = e;
@@ -763,7 +808,7 @@ int socket(int domain, int type, int protocol) {
     if (host_type == 0) { errno = EPROTONOSUPPORT; return -1; }
     int r = __wasmify_host_sock_open(family, host_type);
     if (r < 0) { errno = -r; return -1; }
-    if ((flags & SOCK_NONBLOCK) && __wasmify_sock_nonblock(&r, 1) != 0) return -1;
+    if (__wasmify_sock_flags(&r, 1, flags) != 0) return -1;
     return r;
 }
 
@@ -838,6 +883,8 @@ int accept4(int fd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
     __wasi_errno_t e = __wasi_sock_accept(
         fd, (flags & SOCK_NONBLOCK) ? __WASI_FDFLAGS_NONBLOCK : 0, &conn);
     if (e != 0) { errno = e; return -1; }
+    int fd_out = static_cast<int>(conn);
+    if (__wasmify_sock_flags(&fd_out, 1, flags & SOCK_CLOEXEC) != 0) return -1;
     if (addr != nullptr && addrlen != nullptr) {
         struct __wasmify_sock_addr name;
         int r = __wasmify_host_sock_name(static_cast<int>(conn), 1, &name);
@@ -997,7 +1044,7 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
     int fds[2] = {-1, -1};
     int r = __wasmify_host_sock_socketpair(family, host_type, fds);
     if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
-    if ((flags & SOCK_NONBLOCK) && __wasmify_sock_nonblock(fds, 2) != 0) return -1;
+    if (__wasmify_sock_flags(fds, 2, flags) != 0) return -1;
     sv[0] = fds[0];
     sv[1] = fds[1];
     return 0;
@@ -1010,14 +1057,14 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
  * and recvfrom is recv plus the peer's name. */
 /* Translates the MSG_ flags of a send or a receive into the host's. A flag
  * outside allowed is one the call does not have: -1, and the caller reports
- * EOPNOTSUPP. MSG_NOSIGNAL, which a send allows, has no flag of the host's:
- * sock_sendto_addr takes MSG_DONTWAIT alone. */
+ * EOPNOTSUPP. */
 static int __wasmify_msg_flags(int flags, int allowed) {
     if (flags & ~allowed) return -1;
     int host = 0;
     if (flags & MSG_PEEK) host |= WASMIFY_MSG_PEEK;
     if (flags & MSG_WAITALL) host |= WASMIFY_MSG_WAITALL;
     if (flags & MSG_DONTWAIT) host |= WASMIFY_MSG_DONTWAIT;
+    if (flags & MSG_NOSIGNAL) host |= WASMIFY_MSG_NOSIGNAL;
     return host;
 }
 
@@ -1034,11 +1081,25 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
             return -1;
         }
     }
-    if (len > INT_MAX) { errno = EMSGSIZE; return -1; }
+    /* A send of more than the host takes at once sends a part, as a stream
+     * socket's send may; a datagram that long is more than any socket
+     * carries, and the host refuses it (EMSGSIZE). */
+    if (len > INT_MAX) len = INT_MAX;
     int sent = 0;
     int r = __wasmify_host_sock_sendto(fd, buf, static_cast<int>(len), host_flags,
                                        addr != nullptr ? &to : nullptr, path, path_len, &sent);
-    if (r != 0) { errno = (r < 0) ? -r : r; return -1; }
+    if (r != 0) {
+        errno = (r < 0) ? -r : r;
+#ifdef WASMIFY_HOST_SIGNALS
+        /* the SIGPIPE the host posted with EPIPE, delivered before the call
+         * returns (see host_signal.cc) */
+        if (errno == EPIPE) {
+            __wasmify_signal_after_call();
+            errno = EPIPE;
+        }
+#endif
+        return -1;
+    }
     return sent;
 }
 
@@ -1231,21 +1292,21 @@ extern "C" {
 
 #ifdef WASMIFY_HOST_NETWORK_SOCKETS
 /* ---- sockets ----------------------------------------------------------------
- * shutdown: "how" is 0, 1 or 2 (SHUT_RD, SHUT_WR, SHUT_RDWR as
- * wasmify's <sys/socket.h> defines them, the numbers programs pass
- * literally); the WASI call takes one bit per direction. This definition
- * takes the place of wasi-libc's, which hands its argument over as the
- * bits. */
+ * shutdown: "how" is 0, 1 or 2 (SHUT_RD, SHUT_WR, SHUT_RDWR as every
+ * system numbers them, and as the <sys/socket.h> of host-include defines
+ * them; programs pass the numbers literally too); the WASI call takes one
+ * bit per direction. This definition takes the place of wasi-libc's, which
+ * hands its argument over as the bits. */
 int shutdown(int fd, int how) {
     __wasi_sdflags_t flags;
     switch (how) {
-    case SHUT_RD:
+    case 0: /* SHUT_RD */
         flags = __WASI_SDFLAGS_RD;
         break;
-    case SHUT_WR:
+    case 1: /* SHUT_WR */
         flags = __WASI_SDFLAGS_WR;
         break;
-    case SHUT_RDWR:
+    case 2: /* SHUT_RDWR */
         flags = __WASI_SDFLAGS_RD | __WASI_SDFLAGS_WR;
         break;
     default:

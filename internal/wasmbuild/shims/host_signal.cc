@@ -42,6 +42,9 @@
 #include <unistd.h>
 #include <sys/uio.h>
 #include <wasi/api.h>
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+#include <pthread.h>
+#endif
 
 #include "wasmify_posix.h"
 
@@ -95,38 +98,27 @@ const uint64_t kDefaultIgnored =
 const uint64_t kUnmaskable = sig_bit(SIGKILL) | sig_bit(SIGSTOP);
 
 /* ---- signal sets ----------------------------------------------------------
- * wasi-libc's sigset_t is a placeholder: one unsigned char. It cannot hold
- * a set, and programs are compiled against it (struct sigaction embeds
- * one), so its size is fixed. The byte therefore NAMES
- * a set: it is an index into this table of the distinct sets the process
- * has made, 0 being the empty set. A sigset_t is still a plain value —
- * copying it copies the set, since table entries never change. The table
- * has an entry for each value the byte can take; when every one names a
- * set, the function that needed a new entry fails with ENOMEM. */
-uint64_t g_sets[UCHAR_MAX + 1]; /* g_sets[0] == 0: the empty set */
-int g_set_count = 1;
+ * sigset_t is host-include's (bits/alltypes.h): the mask itself, signal n
+ * at bit n-1, as the host takes masks. */
+static_assert(sizeof(sigset_t) == sizeof(uint64_t), "sigset_t is host-include's 64-bit set");
 
-uint64_t set_mask(const sigset_t *set) {
-    const unsigned idx = (unsigned char)*set;
-    return idx < (unsigned)g_set_count ? g_sets[idx] : 0;
-}
+/* Every signal there is. */
+const uint64_t kAllSignals = sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1);
 
-/* Stores mask in *set. Returns 0, or -1 with errno set. */
-int set_assign(sigset_t *set, uint64_t mask) {
-    for (int i = 0; i < g_set_count; i++) {
-        if (g_sets[i] == mask) {
-            *set = (sigset_t)i;
-            return 0;
-        }
-    }
-    if (g_set_count == UCHAR_MAX + 1) {
-        errno = ENOMEM;
-        return -1;
-    }
-    g_sets[g_set_count] = mask;
-    *set = (sigset_t)g_set_count++;
-    return 0;
-}
+/* ---- the lock of the disposition table ------------------------------------
+ * Taken around each read and change of g_actions, where the program has
+ * threads (process.threads); never while a handler runs, which may change
+ * the table itself. A default mutex fails only when it is misused, which
+ * these pairs do not. */
+#ifdef WASMIFY_HOST_PROCESS_THREADS
+pthread_mutex_t g_actions_lock = PTHREAD_MUTEX_INITIALIZER;
+struct actions_locked {
+    actions_locked() { pthread_mutex_lock(&g_actions_lock); }
+    ~actions_locked() { pthread_mutex_unlock(&g_actions_lock); }
+};
+#else
+struct actions_locked {};
+#endif
 
 /* ---- dispositions and mask ------------------------------------------------ */
 typedef void (*info_handler_t)(int, siginfo_t *, void *);
@@ -144,7 +136,18 @@ struct action {
 };
 action g_actions[NSIG]; /* zero-initialised: every signal at SIG_DFL */
 uint64_t g_blocked = 0; /* the signal mask */
-uint64_t g_held = 0;    /* delivered while blocked: pending until unblocked */
+/* The mask the host was last told (report_dispositions) for the calling
+ * thread: the host keeps a mask for each thread, and keeps the signals a
+ * thread's mask blocks until they are unblocked, when that thread takes
+ * them. A new thread starts with none at the host and here. g_blocked is
+ * wider while a handler runs, with the handler's own mask, which the host
+ * is not told. A forked child's copy is that of the thread that forked;
+ * where that thread has registered (proc_signal_register), the host gives
+ * the child's thread its mask too. */
+thread_local uint64_t g_reported = 0;
+/* Taken from the host while g_blocked blocked them (a handler's mask):
+ * pending until unblocked. */
+uint64_t g_held = 0;
 /* Counts handler runs, so that pause and sigsuspend know one happened. */
 unsigned long g_handler_runs = 0;
 
@@ -155,6 +158,9 @@ unsigned long g_handler_runs = 0;
  * for. The host always takes them (proc_signal_dispositions returns 0). */
 void report_dispositions() {
     uint64_t handled = 0, ignored = 0;
+    /* Reported under the lock, so that two threads' reports reach the host
+     * in the order of their tables (the host calls nothing of the guest). */
+    actions_locked locked;
     for (int sig = 1; sig < NSIG; sig++) {
         const handler_t h = g_actions[sig].handler;
         if (h == SIG_IGN)
@@ -163,25 +169,31 @@ void report_dispositions() {
             handled |= sig_bit(sig);
     }
     (void)__wasmify_host_proc_signal_dispositions(handled, ignored, g_blocked);
+    g_reported = g_blocked;
 }
 
 void release_held();
+uint64_t absorb_posted();
 
 /* Delivers a signal that is not blocked: runs its handler, or takes its
  * default action. */
 void deliver(int sig) {
-    const action act = g_actions[sig];
+    action act;
+    {
+        actions_locked locked;
+        act = g_actions[sig];
+        if (act.handler != SIG_IGN && act.handler != SIG_DFL && (act.flags & SA_RESETHAND)) {
+            g_actions[sig].handler = SIG_DFL;
+            g_actions[sig].info = NULL;
+            g_actions[sig].flags &= ~SA_SIGINFO;
+        }
+    }
     if (act.handler == SIG_IGN) return;
     if (act.handler == SIG_DFL) {
         if (kDefaultIgnored & sig_bit(sig)) return;
         __wasmify_host_proc_terminate(sig);
     }
-    if (act.flags & SA_RESETHAND) {
-        g_actions[sig].handler = SIG_DFL;
-        g_actions[sig].info = NULL;
-        g_actions[sig].flags &= ~SA_SIGINFO;
-        report_dispositions();
-    }
+    if (act.flags & SA_RESETHAND) report_dispositions();
     /* The handler runs with its own mask added, as sigaction specifies. The
      * host is not told about this short-lived mask: it only matters to
      * signals the handler sends to its own process, which are delivered
@@ -200,6 +212,13 @@ void deliver(int sig) {
         act.handler(sig);
     }
     g_blocked = saved;
+    /* A handler that told the host of the dispositions (sigaction) told it
+     * of its own mask too, which the host is to be told is gone; what the
+     * host kept meanwhile is delivered as the handler returns. */
+    if (g_reported != g_blocked) {
+        report_dispositions();
+        absorb_posted();
+    }
     release_held();
 }
 
@@ -207,7 +226,11 @@ void deliver(int sig) {
  * blocked. */
 void arrive(int sig) {
     if (g_blocked & sig_bit(sig)) {
-        const handler_t h = g_actions[sig].handler;
+        handler_t h;
+        {
+            actions_locked locked;
+            h = g_actions[sig].handler;
+        }
         /* An ignored signal is discarded even while blocked. */
         if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig)))) return;
         g_held |= sig_bit(sig);
@@ -228,16 +251,23 @@ void release_held() {
 }
 
 /* Takes the signals the host has recorded for this process and lets each
- * arrive. proc_signal_take fails only for memory out of range (EFAULT),
- * which posted is not; nothing has been taken then. */
-void absorb_posted() {
+ * arrive. The host hands over the ones the mask it was told does not block
+ * and keeps the others, which it also reports: those stay the host's until
+ * they are unblocked, and are returned (pending, not taken). A signal is
+ * thus taken once, and delivered once. proc_signal_take fails only for
+ * memory out of range (EFAULT), which posted is not; nothing has been taken
+ * then. */
+uint64_t absorb_posted() {
     uint64_t posted = 0;
-    if (__wasmify_host_proc_signal_take(&posted) != 0) return;
-    while (posted) {
-        const int sig = __builtin_ctzll(posted) + 1;
-        posted &= posted - 1;
+    if (__wasmify_host_proc_signal_take(&posted) != 0) return 0;
+    const uint64_t kept = posted & g_reported;
+    uint64_t taken = posted & ~g_reported;
+    while (taken) {
+        const int sig = __builtin_ctzll(taken) + 1;
+        taken &= taken - 1;
         if (sig_valid(sig)) arrive(sig);
     }
+    return kept;
 }
 
 /* Blocks until the host reports a signal for this process. The wait is a
@@ -304,71 +334,64 @@ extern "C" {
 void __SIG_IGN(int) {}
 void __SIG_ERR(int) {}
 
-int sigemptyset(sigset_t *set) { return set_assign(set, 0); }
+int sigemptyset(sigset_t *set) {
+    *set = 0;
+    return 0;
+}
 
 int sigfillset(sigset_t *set) {
-    return set_assign(set, sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1));
+    *set = kAllSignals;
+    return 0;
 }
 
 int sigaddset(sigset_t *set, int sig) {
-    if (!sig_valid(sig)) {
-        errno = EINVAL;
-        return -1;
-    }
-    return set_assign(set, set_mask(set) | sig_bit(sig));
+    if (!sig_valid(sig)) return fail(EINVAL);
+    *set |= sig_bit(sig);
+    return 0;
 }
 
 int sigdelset(sigset_t *set, int sig) {
-    if (!sig_valid(sig)) {
-        errno = EINVAL;
-        return -1;
-    }
-    return set_assign(set, set_mask(set) & ~sig_bit(sig));
+    if (!sig_valid(sig)) return fail(EINVAL);
+    *set &= ~sig_bit(sig);
+    return 0;
 }
 
 int sigismember(const sigset_t *set, int sig) {
-    if (!sig_valid(sig)) {
-        errno = EINVAL;
-        return -1;
-    }
-    return (set_mask(set) & sig_bit(sig)) != 0;
+    if (!sig_valid(sig)) return fail(EINVAL);
+    return (*set & sig_bit(sig)) != 0;
 }
 
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
-    if (!sig_valid(sig)) {
-        errno = EINVAL;
-        return -1;
+    if (!sig_valid(sig)) return fail(EINVAL);
+    if (act && (sig == SIGKILL || sig == SIGSTOP)) return fail(EINVAL);
+    action prev;
+    {
+        actions_locked locked;
+        prev = g_actions[sig];
+        if (act) {
+            action next;
+            /* SIG_DFL and SIG_IGN given through sa_sigaction are SIG_DFL and
+             * SIG_IGN (the two members share the storage). */
+            const bool info = (act->sa_flags & SA_SIGINFO) != 0 && act->sa_handler != SIG_DFL &&
+                              act->sa_handler != SIG_IGN;
+            next.handler = info ? info_handler_mark : act->sa_handler;
+            next.info = info ? act->sa_sigaction : NULL;
+            next.mask = act->sa_mask & kAllSignals;
+            next.flags = act->sa_flags;
+            g_actions[sig] = next;
+        }
     }
-    if (act && (sig == SIGKILL || sig == SIGSTOP)) {
-        errno = EINVAL;
-        return -1;
-    }
-    /* The old action is written out first: a set table that has no room
-     * for its mask fails the call with nothing changed. */
-    const action prev = g_actions[sig];
     if (old) {
-        sigset_t prev_mask;
-        if (set_assign(&prev_mask, prev.mask) != 0) return -1;
         memset(old, 0, sizeof(*old));
         if (prev.info)
             old->sa_sigaction = prev.info;
         else
             old->sa_handler = prev.handler;
         old->sa_flags = prev.flags;
-        old->sa_mask = prev_mask;
+        old->sa_mask = prev.mask;
     }
     if (act) {
-        action next;
-        /* SIG_DFL and SIG_IGN given through sa_sigaction are SIG_DFL and
-         * SIG_IGN (the two members share the storage). */
-        const bool info = (act->sa_flags & SA_SIGINFO) != 0 && act->sa_handler != SIG_DFL &&
-                          act->sa_handler != SIG_IGN;
-        next.handler = info ? info_handler_mark : act->sa_handler;
-        next.info = info ? act->sa_sigaction : NULL;
-        next.mask = set_mask(&act->sa_mask);
-        next.flags = act->sa_flags;
-        g_actions[sig] = next;
-        const handler_t h = g_actions[sig].handler;
+        const handler_t h = act->sa_handler;
         /* Setting a signal to be ignored discards it if it is pending. */
         if (h == SIG_IGN || (h == SIG_DFL && (kDefaultIgnored & sig_bit(sig))))
             g_held &= ~sig_bit(sig);
@@ -377,40 +400,50 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
     return 0;
 }
 
-handler_t signal(int sig, handler_t handler) {
+/* signal(): a handler with SA_RESTART, as musl's signal and bsd_signal
+ * set it; __sysv_signal's handler is reset when it runs and is not
+ * blocked while it does. (wasi-libc's emulation defines bsd_signal and
+ * __sysv_signal next to its signal(); defining them here keeps that object
+ * file out of the link for a program that names them.) */
+static handler_t install(int sig, handler_t handler, int flags) {
     struct sigaction act, old;
     memset(&act, 0, sizeof(act));
     act.sa_handler = handler;
-    act.sa_flags = SA_RESTART;
+    act.sa_flags = flags;
     if (sigaction(sig, &act, &old) != 0) return SIG_ERR;
     return old.sa_handler;
 }
 
+handler_t signal(int sig, handler_t handler) { return install(sig, handler, SA_RESTART); }
+
+handler_t bsd_signal(int sig, handler_t handler) { return install(sig, handler, SA_RESTART); }
+
+handler_t __sysv_signal(int sig, handler_t handler) {
+    return install(sig, handler, SA_RESETHAND | SA_NODEFER);
+}
+
 int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     const uint64_t prev = g_blocked;
+    uint64_t next = prev;
     if (set) {
-        const uint64_t mask = set_mask(set);
         switch (how) {
         case SIG_BLOCK:
-            g_blocked = prev | mask;
+            next = prev | *set;
             break;
         case SIG_UNBLOCK:
-            g_blocked = prev & ~mask;
+            next = prev & ~*set;
             break;
         case SIG_SETMASK:
-            g_blocked = mask;
+            next = *set;
             break;
         default:
-            errno = EINVAL;
-            return -1;
+            return fail(EINVAL);
         }
-        g_blocked &= ~kUnmaskable;
+        next &= kAllSignals & ~kUnmaskable;
     }
-    if (old && set_assign(old, prev) != 0) {
-        g_blocked = prev;
-        return -1;
-    }
-    if (set && g_blocked != prev) {
+    if (old) *old = prev;
+    if (next != prev) {
+        g_blocked = next;
         report_dispositions();
         /* What the host held back while it was blocked, and what was held
          * here, is delivered before sigprocmask returns. */
@@ -425,27 +458,25 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
  * of mask, 1 unblocks them, 2 makes mask the mask, 3 only asks; a signal it
  * unblocks that came meanwhile is delivered before it returns, as
  * sigprocmask delivers it. *old receives the mask before. Returns 0, or -1
- * with errno set and the mask unchanged. */
+ * with errno set (EINVAL for another kind) and the mask unchanged. */
 int __wasmify_signal_native_mask(int kind, uint64_t mask, uint64_t *old) {
     if (kind < 0 || kind > 3) return fail(EINVAL);
-    /* the set in one entry of the table, not one for each signal added */
-    sigset_t set = 0, prev = 0;
-    if (kind != 3 && set_assign(&set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1))) != 0)
-        return -1;
+    const sigset_t set = mask;
     const int how = kind == 0 ? SIG_BLOCK : kind == 1 ? SIG_UNBLOCK : SIG_SETMASK;
+    sigset_t prev = 0;
     if (sigprocmask(how, kind == 3 ? NULL : &set, &prev) != 0) return -1;
-    *old = set_mask(&prev);
+    *old = prev;
     return 0;
 }
 
 /* The mask a sigset_t of the program's holds, and a sigset_t made to hold
- * a mask, in one entry of the table (the sets native code hands
- * sigprocmask). __wasmify_signal_set_store returns 0, or -1 with errno set
- * when the table is full. */
-uint64_t __wasmify_signal_set_mask(const void *set) { return set_mask((const sigset_t *)set); }
+ * a mask (the sets native code hands sigprocmask). __wasmify_signal_set_store
+ * returns 0. */
+uint64_t __wasmify_signal_set_mask(const void *set) { return *(const sigset_t *)set; }
 
 int __wasmify_signal_set_store(void *set, uint64_t mask) {
-    return set_assign((sigset_t *)set, mask & (sig_bit(NSIG - 1) | (sig_bit(NSIG - 1) - 1)));
+    *(sigset_t *)set = mask & kAllSignals;
+    return 0;
 }
 
 /* What the host posted while a call of the program's was made, delivered
@@ -456,16 +487,18 @@ void __wasmify_signal_after_call(void) {
     absorb_posted();
 }
 
+/* The blocked signals that came: the ones the host keeps, and the ones
+ * taken while a handler's mask blocked them. */
 int sigpending(sigset_t *set) {
-    absorb_posted(); /* the host holds the blocked signals it recorded */
-    return set_assign(set, g_held);
+    *set = absorb_posted() | g_held;
+    return 0;
 }
 
 /* Waits, with the signal mask replaced by *mask, until a handler has run. */
 int sigsuspend(const sigset_t *mask) {
     const uint64_t saved = g_blocked;
     const unsigned long runs = g_handler_runs;
-    g_blocked = set_mask(mask) & ~kUnmaskable;
+    g_blocked = *mask & kAllSignals & ~kUnmaskable;
     report_dispositions();
     absorb_posted();
     release_held();
@@ -554,6 +587,7 @@ int getitimer(int which, struct itimerval *current) {
         errno = EINVAL;
         return -1;
     }
+    if (current == NULL) return fail(EFAULT);
     __wasmify_timer_state state = {0, 0};
     const int rc = __wasmify_host_proc_itimer(0, 0, 0, &state);
     if (rc != 0) {
@@ -668,7 +702,8 @@ int killpg(pid_t pgrp, int sig) {
  * its handlers at its next safe point) has marked it by then. So the posted
  * signals are delivered as such a call returns. The C library's calls are
  * wrapped at link time (the link wraps write, writev and send with
- * signals). */
+ * signals); network.sockets's sendto (host_sockets.cc), which its send
+ * calls, delivers them itself. */
 extern "C" ssize_t __real_write(int fd, const void *buf, size_t count);
 extern "C" ssize_t __wrap_write(int fd, const void *buf, size_t count) {
     const ssize_t r = __real_write(fd, buf, count);
