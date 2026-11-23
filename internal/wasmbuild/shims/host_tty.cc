@@ -41,6 +41,13 @@ int fail(int error) {
     return -1;
 }
 
+/* darwin's requests of a pseudo-terminal's master side, which Linux has none
+ * of (grantpt, unlockpt and ptsname of darwin's C library), in darwin's
+ * numbers (sys/ttycom.h): fd_ioctl makes them on darwin. */
+constexpr unsigned int darwin_TIOCPTYGRANT = 0x20007454U;
+constexpr unsigned int darwin_TIOCPTYUNLK = 0x20007452U;
+constexpr unsigned int darwin_TIOCPTYGNAME = 0x40807453U;
+
 /* What a request of a terminal takes: nothing, an int, or an address; not
  * one of a terminal's (other). The requests are those fd_ioctl makes. */
 enum class Takes { nothing, value, address, other };
@@ -50,7 +57,11 @@ Takes argument_of(unsigned int request) {
     case TIOCEXCL:
     case TIOCNXCL:
     case TIOCNOTTY:
+    case darwin_TIOCPTYGRANT:
+    case darwin_TIOCPTYUNLK:
         return Takes::nothing;
+    case darwin_TIOCPTYGNAME:
+        return Takes::address;
     case TCSBRK:
     case TCXONC:
     case TCFLSH:
