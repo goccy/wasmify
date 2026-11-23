@@ -129,6 +129,42 @@ static int cloexec(void) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 8;
 }
 
+static volatile int term_pending = -1;
+
+/* Raises SIGTERM while the handler's mask blocks it, and notes whether it
+ * is pending then. */
+static void raise_term(int sig) {
+    (void)sig;
+    sigset_t pending;
+    if (raise(SIGTERM) != 0 || sigpending(&pending) != 0) return;
+    term_pending = sigismember(&pending, SIGTERM);
+}
+
+/* The process ignores SIGHUP, SIGUSR2 and SIGTERM by actions the program
+ * did not set (the runner's SignalIgnored): sigaction reports SIG_IGN for
+ * one the program left at its default, one that comes is ignored, also
+ * while a handler's mask blocks it, and a signal the process does not
+ * ignore keeps its default action. */
+static int process_ignores(void) {
+    if (__wasmify_host_proc_signal_register(&word) != 0) return 1;
+    struct sigaction old;
+    if (sigaction(SIGHUP, NULL, &old) != 0) return 2;
+    printf("hup: %d\n", old.sa_handler == SIG_IGN);
+    if (sigaction(SIGINT, NULL, &old) != 0) return 3;
+    printf("int: %d\n", old.sa_handler == SIG_DFL);
+    if (raise(SIGUSR2) != 0) return 4;
+    if (sigaction(SIGUSR2, NULL, &old) != 0) return 5;
+    printf("usr2: %d\n", old.sa_handler == SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = raise_term;
+    if (sigemptyset(&sa.sa_mask) != 0 || sigaddset(&sa.sa_mask, SIGTERM) != 0) return 6;
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) return 7;
+    if (raise(SIGUSR1) != 0) return 8;
+    printf("term while blocked: %d\n", term_pending);
+    return 0;
+}
+
 /* waitpid(0) waits for a child of the caller's group (a command stays in
  * it), and a group with no child, or none left, is ECHILD. */
 static int waitgroup(void) {
@@ -151,5 +187,6 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "nosignal") == 0) return nosignal();
     if (strcmp(argv[1], "cloexec") == 0) return cloexec();
     if (strcmp(argv[1], "waitgroup") == 0) return waitgroup();
+    if (strcmp(argv[1], "ignored") == 0) return process_ignores();
     return 101;
 }

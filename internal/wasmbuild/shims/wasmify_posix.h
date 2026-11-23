@@ -240,6 +240,11 @@ int __wasmify_host_proc_signal_dispositions(uint64_t handled, uint64_t ignored, 
 /* Takes the signals the host has recorded for this process. */
 WASMIFY_POSIX_IMPORT(proc_signal_take)
 int __wasmify_host_proc_signal_take(uint64_t *mask);
+/* 1 when the process this program runs as ignores sig by an action the
+ * program did not set (inherited when it started, or set by code outside
+ * the program that shares the process), 0 when it does not. */
+WASMIFY_POSIX_IMPORT(proc_signal_ignored)
+int __wasmify_host_proc_signal_ignored(int sig);
 /* Sends sig to pid as kill(2) does (0 or less: a process group); a signal
  * posted to this process is taken as raise's is. */
 WASMIFY_POSIX_IMPORT(proc_kill)

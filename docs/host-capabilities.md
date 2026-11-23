@@ -113,6 +113,13 @@ they return. A program that has registered no word has no handlers run:
 the host gives every signal for it its default action, which ends the
 process for most signals. The shim registers no word of its own.
 
+Every signal starts at its default action. Of a signal the program leaves
+at its default, the shim asks the host (`proc_signal_ignored`) whether the
+process ignores it by an action the program did not set (inherited when
+the process started, or set by code outside the program that shares the
+process) when `sigaction` reports the action and when the signal comes;
+such a signal is ignored by the program from then on.
+
 ## Deprecated flags
 
 The bridge flags of earlier versions are still read, as aliases of parts of

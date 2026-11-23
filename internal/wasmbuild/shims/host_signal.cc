@@ -172,12 +172,27 @@ void report_dispositions() {
     g_reported = g_blocked;
 }
 
+/* The process's action of a signal the program left at its default, when
+ * the process ignores it by an action the program did not set (inherited
+ * when it started, or set by code outside the program that shares the
+ * process): it is the program's from then on, as it is in a process of one
+ * C library (sigaction reports SIG_IGN, and the signal is not delivered). */
+void adopt_process_action(int sig) {
+    {
+        actions_locked locked;
+        if (g_actions[sig].handler != SIG_DFL || __wasmify_host_proc_signal_ignored(sig) != 1) return;
+        g_actions[sig] = action{SIG_IGN, NULL, 0, 0};
+    }
+    report_dispositions();
+}
+
 void release_held();
 uint64_t absorb_posted();
 
 /* Delivers a signal that is not blocked: runs its handler, or takes its
  * default action. */
 void deliver(int sig) {
+    adopt_process_action(sig);
     action act;
     {
         actions_locked locked;
@@ -226,6 +241,7 @@ void deliver(int sig) {
  * blocked. */
 void arrive(int sig) {
     if (g_blocked & sig_bit(sig)) {
+        adopt_process_action(sig);
         handler_t h;
         {
             actions_locked locked;
@@ -364,6 +380,7 @@ int sigismember(const sigset_t *set, int sig) {
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
     if (!sig_valid(sig)) return fail(EINVAL);
     if (act && (sig == SIGKILL || sig == SIGSTOP)) return fail(EINVAL);
+    if (old) adopt_process_action(sig);
     action prev;
     {
         actions_locked locked;

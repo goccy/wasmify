@@ -26,7 +26,11 @@ import (
 //     made, and inherits the rest (the guest's descriptor numbers being the
 //     host's);
 //   - waitgroup: waitpid(0) reaps a child of the caller's group, and a
-//     group with no child is ECHILD.
+//     group with no child is ECHILD;
+//   - ignored: of the signals the process ignores by actions the program
+//     did not set (WASIConfig.SignalIgnored), one the program left at its
+//     default reads as SIG_IGN and one that comes is ignored, also while a
+//     handler's mask blocks it.
 //
 // Skipped where no wasi-sdk is installed.
 func TestHostShimsRun(t *testing.T) {
@@ -70,15 +74,17 @@ func TestHostShimsRun(t *testing.T) {
 			for _, tt := range []struct {
 				mode            string
 				hostDescriptors bool
+				processIgnores  bool
 				want            string
 			}{
-				{"signals", false, "blocked: 0 1\nunblocked: 1\nsigsuspend: -1 1 1\nwait_mask: 1 0 1\nsets: 0 8\n"},
-				{"nosignal", false, "nosignal: -1 1\nsigpipe: -1 1 1\n"},
-				{"cloexec", true, "open\nclosed\nclosed\nclosed\nclosed\nclosed\n"},
-				{"waitgroup", false, "group: 1 3\nnone left: -1 1\nother group: -1 1\n"},
+				{"signals", false, false, "blocked: 0 1\nunblocked: 1\nsigsuspend: -1 1 1\nwait_mask: 1 0 1\nsets: 0 8\n"},
+				{"nosignal", false, false, "nosignal: -1 1\nsigpipe: -1 1 1\n"},
+				{"cloexec", true, false, "open\nclosed\nclosed\nclosed\nclosed\nclosed\n"},
+				{"waitgroup", false, false, "group: 1 3\nnone left: -1 1\nother group: -1 1\n"},
+				{"ignored", false, true, "hup: 1\nint: 1\nusr2: 1\nterm while blocked: 0\n"},
 			} {
 				t.Run(tt.mode, func(t *testing.T) {
-					out, status := runHostShimsProgram(t, runner, tt.mode, tt.hostDescriptors)
+					out, status := runHostShimsProgram(t, runner, tt.mode, tt.hostDescriptors, tt.processIgnores)
 					if status != 0 || out != tt.want {
 						t.Errorf("status %d, output:\n%s\nwant status 0, output:\n%s", status, out, tt.want)
 					}
@@ -92,7 +98,9 @@ func TestHostShimsRun(t *testing.T) {
 // that runs it once per invocation: its arguments are the module's, its
 // output the module's, and its exit status the module's. The environment
 // variable HOST_SHIMS_RUN_HOST_DESCRIPTORS set gives the guest the host's
-// descriptor numbers (WASIConfig.HostDescriptors).
+// descriptor numbers (WASIConfig.HostDescriptors), and
+// HOST_SHIMS_RUN_PROCESS_IGNORES set has the process ignore SIGHUP, SIGUSR2
+// and SIGTERM by actions the guest did not set (WASIConfig.SignalIgnored).
 func transpileRunner(t *testing.T, wasmPath, dir string) string {
 	t.Helper()
 	wasmBin, err := os.ReadFile(wasmPath)
@@ -151,6 +159,11 @@ func main() {
 	cfg := guest.HostWASIConfig()
 	cfg.Args = append([]string{"host_shims_run"}, os.Args[1:]...)
 	cfg.HostDescriptors = os.Getenv("HOST_SHIMS_RUN_HOST_DESCRIPTORS") != ""
+	if os.Getenv("HOST_SHIMS_RUN_PROCESS_IGNORES") != "" {
+		cfg.SignalIgnored = func(_ guest.SignalTarget, sig int32) (bool, error) {
+			return sig == 1 || sig == 12 || sig == 15, nil
+		}
+	}
 	m := guest.NewWithWASI(guest.NewWASI(cfg))
 	defer func() {
 		r := recover()
@@ -177,12 +190,15 @@ func main() {
 
 // runHostShimsProgram runs the transpiled program with one argument and
 // returns what it printed and its exit status.
-func runHostShimsProgram(t *testing.T, runner, arg string, hostDescriptors bool) (string, int) {
+func runHostShimsProgram(t *testing.T, runner, arg string, hostDescriptors, processIgnores bool) (string, int) {
 	t.Helper()
 	cmd := exec.Command(runner, arg)
 	cmd.Env = os.Environ()
 	if hostDescriptors {
 		cmd.Env = append(cmd.Env, "HOST_SHIMS_RUN_HOST_DESCRIPTORS=1")
+	}
+	if processIgnores {
+		cmd.Env = append(cmd.Env, "HOST_SHIMS_RUN_PROCESS_IGNORES=1")
 	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
