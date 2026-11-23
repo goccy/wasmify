@@ -1,18 +1,24 @@
 // Package hostcap is what a wasm build is given of the host it runs on:
 // the capabilities of a POSIX system that WASI preview1 does not have,
-// which wasmify's host shims implement on host imports of the module
-// "wasi_snapshot_preview1" (wasmify.json's "host").
+// which wasmify's host shims implement on imports of the module
+// "wasip1_posix_extension" (wasmify.json's "host").
 //
 // The capabilities follow the option groups of POSIX.1-2017 (Annex E),
 // each with the features that belong inside it:
 //
-//	filesystem  {attributes}
-//	network     {sockets}
-//	process     {spawn, threads}
+//	filesystem  {attributes, fifo, locking}
+//	network     {sockets, resolver}
+//	process     {spawn, fork, environment, job_control, resources, threads}
+//	signals     {timers}
+//	terminal    {}
+//	users       {database}
+//	ipc         {sysv}
+//	system      {info, logging, time_zones}
 //
 // A capability is given as true (with all its features) or as an object of
 // the features it is given (a feature left out is not). A capability that
-// is given at all also brings what it is without any feature (its base).
+// is given at all also brings what it is without any feature (its base). A
+// feature that needs another capability says so (Validate).
 package hostcap
 
 import (
@@ -29,6 +35,11 @@ const (
 	Filesystem = "filesystem"
 	Network    = "network"
 	Process    = "process"
+	Signals    = "signals"
+	Terminal   = "terminal"
+	Users      = "users"
+	IPC        = "ipc"
+	System     = "system"
 )
 
 // capabilityFeatures is a capability of the schema and its features.
@@ -39,9 +50,14 @@ type capabilityFeatures struct {
 
 // The features of each capability, in the order of the schema.
 var schema = []capabilityFeatures{
-	{Filesystem, []string{"attributes"}},
-	{Network, []string{"sockets"}},
-	{Process, []string{"spawn", "threads"}},
+	{Filesystem, []string{"attributes", "fifo", "locking"}},
+	{Network, []string{"sockets", "resolver"}},
+	{Process, []string{"spawn", "fork", "environment", "job_control", "resources", "threads"}},
+	{Signals, []string{"timers"}},
+	{Terminal, nil},
+	{Users, []string{"database"}},
+	{IPC, []string{"sysv"}},
+	{System, []string{"info", "logging", "time_zones"}},
 }
 
 func features(capability string) ([]string, bool) {
@@ -108,6 +124,18 @@ func (s Set) Feature(capability, feature string) bool {
 
 // Empty reports whether no capability is given.
 func (s Set) Empty() bool { return len(s.caps) == 0 }
+
+// Validate refuses a set in which a feature lacks what it needs.
+func (s Set) Validate() error {
+	var errs []string
+	if s.Feature(Process, "fork") && !s.Feature(Process, "spawn") {
+		errs = append(errs, "process.fork needs process.spawn (a forked child is waited for with waitpid)")
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("host: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
 
 // Macros are the -D macros of the set, sorted: WASMIFY_HOST_<CAPABILITY>
 // for each capability given and WASMIFY_HOST_<CAPABILITY>_<FEATURE> for
@@ -238,15 +266,15 @@ type Aliases struct {
 func (a Aliases) Any() bool { return a.FS || a.Sockets || a.Subprocess || a.Threads }
 
 // Set is what the aliases stand for: HostFS the file system with its
-// attributes; HostSockets the network's sockets; HostSubprocess
-// process.spawn; HostThreads process.threads.
+// attributes and locks; HostSockets the network's sockets and resolver;
+// HostSubprocess process.spawn; HostThreads process.threads.
 func (a Aliases) Set() Set {
 	var s Set
 	if a.FS {
-		s.Enable(Filesystem, "attributes")
+		s.Enable(Filesystem, "attributes", "locking")
 	}
 	if a.Sockets {
-		s.Enable(Network, "sockets")
+		s.Enable(Network, "sockets", "resolver")
 	}
 	if a.Subprocess {
 		s.Enable(Process, "spawn")
@@ -258,14 +286,18 @@ func (a Aliases) Set() Set {
 }
 
 // Resolve is the capabilities of a build: the tree, or what the aliases
-// stand for. given is whether wasmify.json has the "host" key (an empty
-// tree included); giving it and an alias is an error.
+// stand for, validated. given is whether wasmify.json has the "host" key
+// (an empty tree included); giving it and an alias is an error.
 func Resolve(tree Set, given bool, aliases Aliases) (Set, error) {
 	if given && aliases.Any() {
 		return Set{}, fmt.Errorf("host: give the capabilities either as wasmify.json's \"host\" or by the deprecated HostFS/HostSockets/HostSubprocess/HostThreads flags (or their WASMIFY_HOST_* variables), not both")
 	}
+	s := tree
 	if aliases.Any() {
-		return aliases.Set(), nil
+		s = aliases.Set()
 	}
-	return tree, nil
+	if err := s.Validate(); err != nil {
+		return Set{}, err
+	}
+	return s, nil
 }

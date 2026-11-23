@@ -37,7 +37,7 @@ type WasmConfig struct {
 	DryRun              bool            // Only generate wasm-build.json without executing
 	NoCache             bool            // Disable build cache
 	PosixCompatDir      string          // Path to POSIX compatibility headers (injected via -isystem)
-	HostIncludeDir      string          // Path to the build-local headers of the host capabilities (spawn.h, netdb.h, ... for the parts given), injected via -I on every compile when a capability is given
+	HostIncludeDir      string          // Path to the build-local headers of the host capabilities (wasmify_posix.h, spawn.h, netdb.h, ... for the parts given), injected via -I on every compile when a capability is given
 	ProjectRoot         string          // Absolute project root; added to the bridge compile -I so generated api_bridge.cc's project-relative includes (e.g. "embed/foo.h") resolve
 	CustomBridgeSources []string        // Absolute paths to the project's hand-written bridge implementation sources (declared in wasmify.json bridge.CustomBridgeSources); each is compiled and linked, with -I of its own dir so its sibling-relative includes resolve
 	StackSize           int             // Wasm stack size in bytes (default: DefaultStackSize)

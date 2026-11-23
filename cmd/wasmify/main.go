@@ -1514,7 +1514,8 @@ func cmdWasmBuild(args []string) error {
 		fmt.Fprintf(os.Stderr, "[wasm-build] POSIX compat headers: %s\n", compatDir)
 	}
 
-	// The headers of the host capabilities (spawn.h, netdb.h) go on EVERY
+	// The headers of the host capabilities (wasmify_posix.h, spawn.h,
+	// netdb.h) go on EVERY
 	// wasm-build compile's -I (via wasmCompileFlags), together with their -D
 	// macros, so cfg must carry the include dir before TransformSteps runs. The upstream sources resolve
 	// them WITHOUT touching the shared wasi-sdk sysroot; the upstream's own
@@ -1716,7 +1717,10 @@ func cmdWasmBuild(args []string) error {
 			base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
 			extraNames = append(extraNames, "wasmify_bridge_"+base+".o")
 		}
-		extraNames = append(extraNames, "wasmify_shim_host_sockets.o", "wasmify_shim_host_subprocess.o", "wasmify_shim_host_fs.o")
+		for _, src := range shimSrcs {
+			base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+			extraNames = append(extraNames, "wasmify_shim_"+base+".o")
+		}
 		var extraObjects []string
 		for _, name := range extraNames {
 			obj := filepath.Join(cfg.BuildDir, "obj", name)

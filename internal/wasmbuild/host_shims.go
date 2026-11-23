@@ -2,7 +2,9 @@ package wasmbuild
 
 import (
 	"embed"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -10,13 +12,25 @@ import (
 )
 
 // hostShimFS holds wasmify's host shims: the libc functions of the host
-// capabilities (wasmify.json's "host"). Each source is guarded inside by the
-// macro of the deprecated flag it served (WASMIFY_HOST_FS,
-// WASMIFY_HOST_SOCKETS, WASMIFY_HOST_SUBPROCESS), which hostcap.Set.Macros
-// defines for the part that stands for it (see hostParts).
+// capabilities (wasmify.json's "host"). Each source is guarded inside by
+// the macros of hostcap.Set.Macros of the parts it serves.
 //
 //go:embed shims/*.cc
 var hostShimFS embed.FS
+
+// wasmifyPosixHeader declares every import of the "wasip1_posix_extension"
+// module the shims are built on. The shims and an application include it
+// from the host-include directory.
+//
+//go:embed shims/wasmify_posix.h
+var wasmifyPosixHeader string
+
+// hostIncludeFS holds wasmify's own host-include headers: a C library
+// header, with the declarations of the functions the shims define that the
+// C library does not declare.
+//
+//go:embed shims/include
+var hostIncludeFS embed.FS
 
 // hostShim returns the content of one of the shims.
 func hostShim(name string) ([]byte, error) {
@@ -28,13 +42,26 @@ func hostShim(name string) ([]byte, error) {
 }
 
 // hostHeaderContent returns the content of a header a capability part puts
-// in host-include: netdb.h, which is the POSIX-compat overlay's (the same
-// file under both, so that a project and the socket shim see one layout of
-// struct addrinfo whether or not the overlay is on); or the stub registry's
-// (spawn.h, sys/wait.h).
+// in host-include: wasmify_posix.h; one of hostIncludeFS (unistd.h, time.h,
+// fcntl.h, bits/alltypes.h, sys/time.h, syslog.h, termios.h, sys/ioctl.h, sys/ipc.h, sys/msg.h,
+// sys/sem.h, sys/shm.h); netdb.h, signal.h and sys/socket.h, which are the
+// POSIX-compat overlay's (the same file under both, so that a project and
+// the shims see one layout of struct addrinfo and struct sigaction, and one
+// numbering of shutdown's SHUT_ names, whether or not the overlay is on); or
+// the stub registry's (spawn.h, sys/wait.h).
 func hostHeaderContent(name string) (string, error) {
-	if name == "netdb.h" {
-		data, err := posixCompatFS.ReadFile("stubs/include/netdb.h")
+	if name == "wasmify_posix.h" {
+		return wasmifyPosixHeader, nil
+	}
+	data, err := hostIncludeFS.ReadFile("shims/include/" + name)
+	if err == nil {
+		return string(data), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("embedded header <%s>: %w", name, err)
+	}
+	if name == "netdb.h" || name == "signal.h" || name == "sys/socket.h" {
+		data, err := posixCompatFS.ReadFile("stubs/include/" + name)
 		if err != nil {
 			return "", fmt.Errorf("missing embedded header <%s>: %w", name, err)
 		}
@@ -53,7 +80,14 @@ const HostIncludeSubdir = "host-include"
 // DeployHostHeaders writes the headers of the given host capabilities into
 // <buildDir>/host-include and returns that directory ("" when no given part
 // has a header): per capability part the headers wasi-libc does not have
-// (spawn.h and sys/wait.h with process.spawn, netdb.h with network).
+// (wasmify_posix.h with every part that has a shim on its imports;
+// spawn.h, sys/wait.h and fcntl.h with process.spawn; unistd.h with process.spawn,
+// process.resources, process.job_control, signals, terminal and users; netdb.h
+// with network; sys/socket.h with network.sockets; signal.h and
+// bits/alltypes.h with signals; sys/time.h with signals.timers;
+// termios.h and sys/ioctl.h with terminal; syslog.h with system.logging;
+// pwd.h and grp.h with users.database; sys/ipc.h, sys/msg.h, sys/sem.h and
+// sys/shm.h with ipc.sysv; time.h with system.time_zones).
 //
 // The directory is added to every wasm-build compile's include path (see
 // wasmCompileFlags), so the upstream sources and wasmify's shims resolve the

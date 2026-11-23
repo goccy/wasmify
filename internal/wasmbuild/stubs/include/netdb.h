@@ -136,6 +136,55 @@ int getnameinfo(const struct sockaddr *__restrict, socklen_t,
 struct hostent *gethostbyname(const char *);
 struct hostent *gethostbyaddr(const void *, socklen_t, int);
 
+/* h_errno: why gethostbyname or gethostbyaddr found nothing. */
+#ifndef HOST_NOT_FOUND
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
+#define NO_ADDRESS     NO_DATA
+#endif
+int *__h_errno_location(void);
+#define h_errno (*__h_errno_location())
+
+/* --- the networks, services and protocols databases --- */
+
+struct netent {
+    char         *n_name;
+    char        **n_aliases;
+    int           n_addrtype;
+    uint32_t      n_net;
+};
+struct servent {
+    char  *s_name;
+    char **s_aliases;
+    int    s_port;
+    char  *s_proto;
+};
+struct protoent {
+    char  *p_name;
+    char **p_aliases;
+    int    p_proto;
+};
+struct hostent  *gethostent(void);
+struct netent   *getnetent(void);
+struct netent   *getnetbyname(const char *);
+struct netent   *getnetbyaddr(uint32_t, int);
+struct servent  *getservent(void);
+struct servent  *getservbyname(const char *, const char *);
+struct servent  *getservbyport(int, const char *);
+struct protoent *getprotoent(void);
+struct protoent *getprotobyname(const char *);
+struct protoent *getprotobynumber(int);
+void sethostent(int);
+void endhostent(void);
+void setnetent(int);
+void endnetent(void);
+void setservent(int);
+void endservent(void);
+void setprotoent(int);
+void endprotoent(void);
+
 #ifdef __cplusplus
 }
 #endif

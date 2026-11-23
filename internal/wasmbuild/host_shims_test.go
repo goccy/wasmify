@@ -120,10 +120,31 @@ func TestDeployHostShims(t *testing.T) {
 		host      hostcap.Set
 		wantShims []string
 	}{
+		{hostWith("network"), []string{"host_sockets.cc"}},
 		{hostWith("network.sockets"), []string{"host_sockets.cc"}},
-		{hostWith("process.spawn"), []string{"host_subprocess.cc"}},
+		{hostWith("network.resolver"), []string{"host_sockets.cc"}},
+		{hostWith("process.spawn"), []string{"host_subprocess.cc", "host_fcntl.cc"}},
+		{hostWith("process"), nil},
+		{hostWith("process.environment"), []string{"host_process.cc"}},
+		{hostWith("process.job_control"), []string{"host_process.cc"}},
+		{hostWith("process.resources"), []string{"host_process.cc"}},
+		{hostWith("terminal"), []string{"host_tty.cc"}},
+		{hostWith("ipc"), nil},
+		{hostWith("ipc.sysv"), []string{"host_ipc.cc"}},
+		{hostWith("process.spawn", "process.fork"), []string{"host_subprocess.cc", "host_fcntl.cc", "host_process.cc"}},
+		{hostWith("signals"), []string{"host_signal.cc"}},
+		{hostWith("signals.timers"), []string{"host_signal.cc"}},
+		{hostWith("process.resources", "system.logging"), []string{"host_process.cc", "host_syslog.cc"}},
+		{hostWith("filesystem"), []string{"host_fs.cc"}},
 		{hostWith("filesystem.attributes"), []string{"host_fs.cc"}},
+		{hostWith("filesystem.fifo"), []string{"host_fs.cc"}},
+		{hostWith("filesystem.locking"), []string{"host_fcntl.cc", "host_fs.cc"}},
 		{hostWith("process.threads"), nil},
+		{hostWith("users"), []string{"host_users.cc"}},
+		{hostWith("users.database"), []string{"host_users.cc"}},
+		{hostWith("system"), nil},
+		{hostWith("system.info"), []string{"host_system.cc"}},
+		{hostWith("system.time_zones"), []string{"host_time.cc"}},
 	} {
 		buildDir := t.TempDir()
 		paths, err := DeployHostShims(buildDir, tt.host)
@@ -163,7 +184,7 @@ func TestDeployHostHeaders(t *testing.T) {
 	if want := filepath.Join(buildDir, HostIncludeSubdir); incDir != want {
 		t.Fatalf("include dir %q, want %q", incDir, want)
 	}
-	for _, header := range []string{"spawn.h", "sys/wait.h"} {
+	for _, header := range []string{"wasmify_posix.h", "spawn.h", "sys/wait.h", "unistd.h"} {
 		if _, err := os.Stat(filepath.Join(incDir, header)); err != nil {
 			t.Errorf("%s not deployed: %v", header, err)
 		}
@@ -171,6 +192,46 @@ func TestDeployHostHeaders(t *testing.T) {
 	for _, header := range []string{"netdb.h"} {
 		if _, err := os.Stat(filepath.Join(incDir, header)); err == nil {
 			t.Errorf("%s deployed without the part that needs it", header)
+		}
+	}
+	fsDir, err := DeployHostHeaders(t.TempDir(), hostWith("filesystem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fsDir, "wasmify_posix.h")); err != nil {
+		t.Errorf("wasmify_posix.h not deployed with filesystem: %v", err)
+	}
+	for _, tt := range []struct {
+		part    string
+		headers []string
+		absent  []string
+	}{
+		{"network", []string{"wasmify_posix.h", "netdb.h"}, nil},
+		{"users", []string{"wasmify_posix.h"}, []string{"pwd.h", "grp.h"}},
+		{"users.database", []string{"wasmify_posix.h", "pwd.h", "grp.h"}, nil},
+		{"system.time_zones", []string{"wasmify_posix.h", "time.h"}, nil},
+		{"signals", []string{"wasmify_posix.h", "signal.h", "unistd.h"}, []string{"sys/time.h"}},
+		{"process.resources", []string{"wasmify_posix.h", "unistd.h"}, []string{"signal.h"}},
+		{"signals.timers", []string{"wasmify_posix.h", "sys/time.h"}, nil},
+		{"system.logging", []string{"wasmify_posix.h", "syslog.h"}, nil},
+		{"process.environment", []string{"wasmify_posix.h"}, []string{"unistd.h"}},
+		{"process.job_control", []string{"wasmify_posix.h", "unistd.h"}, []string{"termios.h", "sys/ioctl.h"}},
+		{"terminal", []string{"wasmify_posix.h", "termios.h", "sys/ioctl.h", "unistd.h"}, nil},
+		{"ipc.sysv", []string{"wasmify_posix.h", "sys/ipc.h", "sys/msg.h", "sys/sem.h", "sys/shm.h"}, nil},
+	} {
+		dir, err := DeployHostHeaders(t.TempDir(), hostWith(tt.part))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, header := range tt.headers {
+			if _, err := os.Stat(filepath.Join(dir, header)); err != nil {
+				t.Errorf("%s not deployed with %s: %v", header, tt.part, err)
+			}
+		}
+		for _, header := range tt.absent {
+			if _, err := os.Stat(filepath.Join(dir, header)); err == nil {
+				t.Errorf("%s deployed with %s", header, tt.part)
+			}
 		}
 	}
 }
@@ -190,8 +251,8 @@ func TestApplyEnvOverridesHostCapabilities(t *testing.T) {
 	if err := env.ResolveHost(); err != nil {
 		t.Fatal(err)
 	}
-	if !env.Host.Feature(hostcap.Network, "sockets") {
-		t.Fatalf("WASMIFY_HOST_SOCKETS should give network.sockets, got %v", env.Host.Macros())
+	if !env.Host.Feature(hostcap.Network, "sockets") || !env.Host.Feature(hostcap.Network, "resolver") {
+		t.Fatalf("WASMIFY_HOST_SOCKETS should give network.sockets and network.resolver, got %v", env.Host.Macros())
 	}
 	if env.Host.Has(hostcap.Process) {
 		t.Fatalf("only sockets was set, process should stay off")

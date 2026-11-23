@@ -22,8 +22,10 @@ func TestSetFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !s.Feature(Network, "sockets") {
-		t.Error("network.sockets not given by network: true")
+	for _, f := range []string{"sockets", "resolver"} {
+		if !s.Feature(Network, f) {
+			t.Errorf("network.%s not given by network: true", f)
+		}
 	}
 	if !s.Feature(Process, "spawn") || s.Feature(Process, "threads") {
 		t.Errorf("process: spawn %v threads %v; want true false",
@@ -36,8 +38,9 @@ func TestSetFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !base.Has(Network) || base.Feature(Network, "sockets") {
-		t.Errorf("network: {} gives the base alone, got has %v sockets %v", base.Has(Network), base.Feature(Network, "sockets"))
+	if !base.Has(Network) || base.Feature(Network, "sockets") || base.Feature(Network, "resolver") {
+		t.Errorf("network: {} gives the base alone, got has %v sockets %v resolver %v", base.Has(Network),
+			base.Feature(Network, "sockets"), base.Feature(Network, "resolver"))
 	}
 }
 
@@ -77,6 +80,42 @@ func TestSetJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// A feature that needs another capability is refused without it, and by
+// Resolve.
+func TestValidate(t *testing.T) {
+	for _, tt := range []struct{ text, want string }{
+		{`{"process": {"job_control": true}}`, ""},
+		{`{"process": true}`, ""},
+		{`{"process": {"fork": true}}`, "process.fork needs process.spawn"},
+		{`{"process": {"fork": true, "spawn": true}}`, ""},
+		{`{"process": {"job_control": true}, "terminal": {}}`, ""},
+		{`{"process": true, "terminal": true, "ipc": true}`, ""},
+		{`{"terminal": true}`, ""},
+	} {
+		s, err := parse(t, tt.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Validate()
+		switch {
+		case tt.want == "" && err != nil:
+			t.Errorf("%s: %v", tt.text, err)
+		case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+			t.Errorf("%s: error %v, want one containing %q", tt.text, err, tt.want)
+		}
+	}
+	var all Set
+	all.EnableAll()
+	if err := all.Validate(); err != nil {
+		t.Errorf("every capability: %v", err)
+	}
+	var fork Set
+	fork.Enable(Process, "fork")
+	if _, err := Resolve(fork, true, Aliases{}); err == nil {
+		t.Error("Resolve takes process.fork without process.spawn")
+	}
+}
+
 // The deprecated bridge flags stand for the features they covered; giving
 // them and the tree is an error.
 func TestResolveAliases(t *testing.T) {
@@ -85,11 +124,15 @@ func TestResolveAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range [][2]string{
-		{Filesystem, "attributes"}, {Network, "sockets"}, {Process, "spawn"}, {Process, "threads"},
+		{Filesystem, "attributes"}, {Filesystem, "locking"}, {Network, "sockets"}, {Network, "resolver"},
+		{Process, "spawn"}, {Process, "threads"},
 	} {
 		if !s.Feature(f[0], f[1]) {
 			t.Errorf("the aliases do not give %s.%s", f[0], f[1])
 		}
+	}
+	if s.Feature(Filesystem, "fifo") {
+		t.Errorf("the aliases give more than they covered: %v", s.Macros())
 	}
 	var tree Set
 	tree.Enable(Network, "sockets")

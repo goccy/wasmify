@@ -386,15 +386,17 @@ type BridgeConfig struct {
 	Wasm2GoImportPath string `json:"Wasm2GoImportPath,omitempty"`
 
 	// Deprecated: HostSockets is an alias of the "host" capabilities
-	// {"network": {"sockets": true}}; giving both is an error.
+	// {"network": {"sockets": true, "resolver": true}}; giving both is an
+	// error.
 	//
-	// HostSockets opts into host-provided outbound sockets. WASI preview1
-	// has no socket()/connect()/getaddrinfo(), so by default the generated
-	// wasm imports only standard wasi_snapshot_preview1 and is portable to
-	// any wasi runtime. When this is true, the bridge compile is given
-	// -DWASMIFY_HOST_SOCKETS, which activates the project's socket shim
-	// (libc socket()/connect()/getaddrinfo() backed by sock_socket/
-	// sock_connect/sock_getaddrinfo host imports). The resulting wasm then
+	// HostSockets opts into host-provided sockets. WASI preview1 has no
+	// socket()/connect()/getaddrinfo(), so by default the generated wasm
+	// imports only standard wasi_snapshot_preview1 and is portable to any
+	// wasi runtime. When this is true, every compile is given
+	// -DWASMIFY_HOST_NETWORK, -DWASMIFY_HOST_NETWORK_SOCKETS,
+	// -DWASMIFY_HOST_NETWORK_RESOLVER and -DWASMIFY_HOST_SOCKETS, activating
+	// the socket shim (the libc socket and resolver functions backed by
+	// sock_* imports of wasip1_posix_extension). The resulting wasm then
 	// requires a host that implements those imports (e.g. the wasm2go
 	// runtime). Off by default to keep the wasm portable.
 	HostSockets bool `json:"HostSockets,omitempty"`
@@ -403,23 +405,31 @@ type BridgeConfig struct {
 	// {"process": {"spawn": true}}; giving both is an error.
 	//
 	// HostSubprocess opts into host-provided process spawning. WASI preview1
-	// cannot spawn processes; when this is true the bridge compile is given
-	// -DWASMIFY_HOST_SUBPROCESS, activating the project's posix_spawn/waitpid
-	// shim (backed by proc_spawn/proc_wait host imports). The resulting wasm
+	// cannot spawn processes; when this is true every compile is given
+	// -DWASMIFY_HOST_PROCESS, -DWASMIFY_HOST_PROCESS_SPAWN and
+	// -DWASMIFY_HOST_SUBPROCESS, activating the posix_spawn/waitpid shim
+	// (backed by proc_spawn/proc_wait imports of wasip1_posix_extension) and
+	// wrapping fcntl for the close-on-exec flag. The resulting wasm
 	// then requires a host that implements those imports and EXECUTES HOST
 	// BINARIES, so it is off by default to keep the wasm portable and sandboxed.
 	HostSubprocess bool `json:"HostSubprocess,omitempty"`
 
 	// Deprecated: HostFS is an alias of the "host" capabilities
-	// {"filesystem": {"attributes": true}}; giving both is an error.
+	// {"filesystem": {"attributes": true, "locking": true}}; giving both is
+	// an error.
 	//
-	// HostFS opts into host-backed filesystem fidelity. WASI preview1 can
-	// neither change file modes nor report permission bits, and wasi-libc's
-	// cwd bookkeeping keeps ".." components live; when this is true the
-	// compile is given -DWASMIFY_HOST_FS and every link gets -Wl,--wrap=
-	// flags for chmod/stat/lstat/chdir, activating the shim that backs
-	// chmod and stat-mode reporting with path_chmod/path_filestat_mode
-	// host imports and normalizes chdir lexically. The resulting wasm
+	// HostFS opts into host-backed filesystem fidelity. WASI preview1 has
+	// no file modes, owners, creation masks or locks, and wasi-libc's cwd
+	// bookkeeping keeps ".." components live; when this is true every
+	// compile is given -DWASMIFY_HOST_FILESYSTEM,
+	// -DWASMIFY_HOST_FILESYSTEM_ATTRIBUTES, -DWASMIFY_HOST_FILESYSTEM_LOCKING
+	// and -DWASMIFY_HOST_FS, and every link gets -Wl,--wrap= flags for chdir,
+	// __wasilibc_find_relpath_alloc, chmod, fchmod, stat, lstat, fstat, open,
+	// mkdir, access, faccessat and fcntl, activating the shim that backs
+	// chmod, the mode and owner stat reports, the mode of a created file or
+	// directory, umask, access, the owners, flock and the record locks with
+	// imports of wasip1_posix_extension, refuses the empty path and finds
+	// chdir's directory as the kernel does. The resulting wasm
 	// requires a host that implements those imports (e.g. the wasm2go
 	// runtime). Off by default to keep the wasm portable.
 	HostFS bool `json:"HostFS,omitempty"`

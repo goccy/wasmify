@@ -4533,6 +4533,7 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 	}
 
 	fmt.Fprintf(b, "        int64_t _rc = wasmify_callback_invoke(_callback_id, %d, _pw.data_, _pw.size_);\n", methodID)
+	writeTrampolineUnwound(b, m.ReturnType)
 	b.WriteString("        uintptr_t _resp_ptr;\n")
 	b.WriteString("        int32_t _resp_len;\n")
 	b.WriteString("        decode_result(_rc, &_resp_ptr, &_resp_len);\n")
@@ -4678,6 +4679,32 @@ func writeTrampolineMethod(b *strings.Builder, m *apispec.Function, methodID int
 		}
 	}
 	b.WriteString("    }\n")
+}
+
+// writeTrampolineUnwound emits the trampoline's answer to a callback that
+// unwound: callback_invoke returns -1 (callbackJumped of the generated Go
+// bridge) when the callback ended with an exception of the guest pending.
+// No answer was written, so nothing is read or freed; the override returns
+// at once: with the configured error of an error-only result (the error
+// reconstruction's ErrorExpr, saying the callback unwound), a
+// value-initialized result of any other kind, which the pending exception
+// keeps from being used, or a trap for a reference result, which has no
+// such value.
+func writeTrampolineUnwound(b *strings.Builder, ret apispec.TypeRef) {
+	b.WriteString("        if (_rc == -1) {\n")
+	spec, errorOnly := bridgeConfig.ErrorReconstruct[matchErrorOnlyReturnType(ret)]
+	switch {
+	case ret.Kind == apispec.TypeVoid:
+		b.WriteString("            return;\n")
+	case errorOnly:
+		errExpr := strings.ReplaceAll(spec.ErrorExpr, "{err_msg}", `std::string("callback unwound")`)
+		fmt.Fprintf(b, "            return %s;\n", errExpr)
+	case ret.IsRef:
+		b.WriteString("            __builtin_trap();\n")
+	default:
+		b.WriteString("            return {};\n")
+	}
+	b.WriteString("        }\n")
 }
 
 // writeStatusOrTrampolineRead emits the C++ for a trampoline override

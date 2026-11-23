@@ -30,7 +30,7 @@ func TestGenerateModule_InitOptions(t *testing.T) {
 		"func InitWith(opts Options) error",
 		"WASI base.Wasi_snapshot_preview1Imports",
 		"MemoryReserveBytes int",
-		"wasi = base.DefaultWASI()",
+		"wasi = base.NewWASI(base.HostWASIConfig())",
 		// The engine's constructor takes one parameter per import module in
 		// wasm2go's fixed wasi, env, wasmify order.
 		"wasm2go.NewWithWASIReserve(wasi, env, opts.MemoryReserveBytes)",
@@ -54,7 +54,7 @@ func TestGenerateModule_InitOptions(t *testing.T) {
 	}
 	for _, unwanted := range []string{
 		"base.Wasi_snapshot_preview1Imports",
-		"base.DefaultWASI()",
+		"base.NewWASI(",
 		"MemoryReserveBytes",
 		"NewWithWASIReserve",
 	} {
