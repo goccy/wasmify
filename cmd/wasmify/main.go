@@ -1833,6 +1833,7 @@ func cmdParseHeaders(args []string) error {
 	// typedef for the same name). We use these groups to build safe
 	// umbrella headers.
 	var headerGroups [][]string
+	var customHeaders []customBridgeHeader
 	if len(headerFiles) == 0 {
 		if b == nil {
 			return fmt.Errorf("no --header specified and build.json not found. Run 'wasmify generate-build' first or specify --header")
@@ -1851,14 +1852,17 @@ func cmdParseHeaders(args []string) error {
 		// for the common case where the user has already declared the
 		// type permitted in I/F signatures.
 		runBatchAllowedExternalClasses = nil
-		if s, err := state.Load(outDir); err == nil &&
-			s != nil && s.Bridge != nil {
-			if len(s.Bridge.ExternalTypes) > 0 {
-				runBatchAllowedExternalClasses = append([]string(nil), s.Bridge.ExternalTypes...)
+		var bridge *state.BridgeConfig
+		if s, err := state.Load(outDir); err == nil && s != nil {
+			bridge = s.Bridge
+		}
+		if bridge != nil {
+			if len(bridge.ExternalTypes) > 0 {
+				runBatchAllowedExternalClasses = append([]string(nil), bridge.ExternalTypes...)
 				fmt.Fprintf(os.Stderr, "[parse-headers] External classes allowed via bridge.ExternalTypes: %d\n", len(runBatchAllowedExternalClasses))
 			}
-			if len(s.Bridge.IncludeExternalHeaders) > 0 {
-				extras := externalHeadersFromBuild(b, s.Bridge.IncludeExternalHeaders)
+			if len(bridge.IncludeExternalHeaders) > 0 {
+				extras := externalHeadersFromBuild(b, bridge.IncludeExternalHeaders)
 				for h := range extras {
 					projectHeaders[h] = true
 				}
@@ -1869,6 +1873,16 @@ func cmdParseHeaders(args []string) error {
 		if len(headerFiles) == 0 {
 			return fmt.Errorf("no project headers found in build dependency files. Run 'wasmify validate-build' to ensure build artifacts exist")
 		}
+		if bridge != nil && len(bridge.CustomBridgeHeaders) > 0 {
+			customHeaders, err = resolveCustomBridgeHeaders(outDir, bridge.CustomBridgeHeaders)
+			if err != nil {
+				return err
+			}
+			headerFiles, headerGroups = addCustomBridgeHeaders(headerFiles, headerGroups, customHeaders)
+			fmt.Fprintf(os.Stderr, "[parse-headers] Custom bridge headers (from CustomBridgeHeaders): %d files\n", len(customHeaders))
+		}
+	} else if s, err := state.Load(outDir); err == nil && s != nil && s.Bridge != nil && len(s.Bridge.CustomBridgeHeaders) > 0 {
+		fmt.Fprintf(os.Stderr, "[parse-headers] warn: bridge.CustomBridgeHeaders is ignored with --header; list them as --header too\n")
 	}
 
 	// Collect compile flags from build.json
@@ -1957,6 +1971,9 @@ func cmdParseHeaders(args []string) error {
 			fmt.Fprintf(os.Stderr, "[parse-headers] group cache miss; recomputed\n")
 		}
 		fmt.Fprintf(os.Stderr, "[parse-headers] Merged into %d umbrella batches\n", len(batches))
+		if err := checkCustomBridgeHeadersBatched(customHeaders, batches); err != nil {
+			return err
+		}
 
 		spec, hits, misses, batchDigests, err := runBatchesWithCache(clangPath, batches, compileFlags, version, dataDir, forceRebuild, groupCacheHit)
 		if err != nil {
@@ -1968,6 +1985,9 @@ func cmdParseHeaders(args []string) error {
 				fmt.Fprintf(os.Stderr, "[parse-headers] cached groups appear stale; recomputing and retrying once\n")
 				_ = os.Remove(filepath.Join(parsecache.CacheDir(dataDir), "groups.json"))
 				batches = mergeCompatibleGroupsFn(clangPath, headerGroups, compileFlags)
+				if err := checkCustomBridgeHeadersBatched(customHeaders, batches); err != nil {
+					return err
+				}
 				spec, hits, misses, batchDigests, err = runBatchesWithCache(clangPath, batches, compileFlags, version, dataDir, forceRebuild, false)
 			}
 			if err != nil {
@@ -2029,6 +2049,7 @@ func cmdParseHeaders(args []string) error {
 	if len(merged.Functions) == 0 && len(merged.Classes) == 0 && len(merged.Enums) == 0 {
 		return fmt.Errorf("no API declarations found in headers")
 	}
+	relativizeCustomBridgeHeaders(merged, customHeaders)
 
 	// Save api-spec.json (to outDir, which is dataDir when --output-dir is not specified)
 	if err := apispec.Save(outDir, merged); err != nil {
@@ -2347,6 +2368,122 @@ func parseDependencyFile(path string) []string {
 func isHeaderFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return ext == ".h" || ext == ".hpp" || ext == ".hxx"
+}
+
+// customBridgeHeader is one bridge.CustomBridgeHeaders entry: abs is the
+// symlink-resolved path clang sees (and reports as a declaration's
+// SourceFile); declared is the path as written in wasmify.json.
+type customBridgeHeader struct {
+	abs      string
+	declared string
+}
+
+// resolveCustomBridgeHeaders resolves each bridge.CustomBridgeHeaders entry
+// against the config dir, as for CustomBridgeSources. Symlinks are resolved
+// so an entry matches the same header when the .d files also list it.
+func resolveCustomBridgeHeaders(configDir string, entries []string) ([]customBridgeHeader, error) {
+	headers := make([]customBridgeHeader, 0, len(entries))
+	for _, entry := range entries {
+		path := entry
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(configDir, path)
+		}
+		abs, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, fmt.Errorf("bridge.CustomBridgeHeaders: %q: %w", entry, err)
+		}
+		headers = append(headers, customBridgeHeader{abs: abs, declared: filepath.Clean(entry)})
+	}
+	return headers, nil
+}
+
+// addCustomBridgeHeaders adds the custom headers as one more header group,
+// as if a compile step had included them together, so the umbrella merge
+// batches them with the discovered headers when they compile together. A
+// header the .d files already listed is not added to the file list twice.
+func addCustomBridgeHeaders(headerFiles []string, headerGroups [][]string, custom []customBridgeHeader) ([]string, [][]string) {
+	seen := make(map[string]bool, len(headerFiles))
+	for _, h := range headerFiles {
+		seen[h] = true
+	}
+	group := make([]string, 0, len(custom))
+	for _, c := range custom {
+		if !seen[c.abs] {
+			seen[c.abs] = true
+			headerFiles = append(headerFiles, c.abs)
+		}
+		group = append(group, c.abs)
+	}
+	return headerFiles, append(headerGroups, group)
+}
+
+// checkCustomBridgeHeadersBatched reports a custom header the umbrella merge
+// left out of every batch. The merge silently drops a header that does not
+// compile even alone, which is tolerable for a discovered header but would
+// make an explicitly requested one vanish from the API without a trace.
+func checkCustomBridgeHeadersBatched(custom []customBridgeHeader, batches [][]string) error {
+	if len(custom) == 0 {
+		return nil
+	}
+	batched := make(map[string]bool)
+	for _, b := range batches {
+		for _, h := range b {
+			batched[h] = true
+		}
+	}
+	for _, c := range custom {
+		if !batched[c.abs] {
+			return fmt.Errorf("bridge.CustomBridgeHeaders: %q does not compile with the project's compile flags", c.declared)
+		}
+	}
+	return nil
+}
+
+// relativizeCustomBridgeHeaders records declarations from a custom header
+// under the path written in wasmify.json instead of the absolute path clang
+// reported. gen-proto includes a declaration's SourceFile as is in the
+// generated bridge, and the bridge compile has -I of the config dir, so the
+// declared path keeps the committed bridge free of machine-specific paths.
+func relativizeCustomBridgeHeaders(spec *apispec.APISpec, custom []customBridgeHeader) {
+	if len(custom) == 0 {
+		return
+	}
+	declared := make(map[string]string, len(custom))
+	for _, c := range custom {
+		declared[c.abs] = c.declared
+	}
+	// clang reports the path a header was first included by, which need not
+	// be the symlink-resolved one; resolve each distinct path once.
+	resolved := make(map[string]string)
+	rewrite := func(f *string) {
+		if *f == "" {
+			return
+		}
+		r, ok := resolved[*f]
+		if !ok {
+			r = *f
+			if real, err := filepath.EvalSymlinks(*f); err == nil {
+				r = real
+			}
+			resolved[*f] = r
+		}
+		if d, ok := declared[r]; ok {
+			*f = d
+		}
+	}
+	for i := range spec.Functions {
+		rewrite(&spec.Functions[i].SourceFile)
+	}
+	for i := range spec.Classes {
+		c := &spec.Classes[i]
+		rewrite(&c.SourceFile)
+		for j := range c.Methods {
+			rewrite(&c.Methods[j].SourceFile)
+		}
+	}
+	for i := range spec.Enums {
+		rewrite(&spec.Enums[i].SourceFile)
+	}
 }
 
 // generateUmbrellaHeader creates a temporary .h file that #includes all target headers.

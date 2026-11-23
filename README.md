@@ -115,6 +115,12 @@ Project decisions live under typed sections:
     "ExternalTypes":      [ "absl::Status", "absl::string_view" ],
     "ErrorTypes":         { "absl::Status": "if (!{result}.ok()) { _pw.write_error(std::string({result}.message())); }" },
     "ExportEnumPrefixes": [ "mylib::" ],
+    // Hand-written helpers on top of the library: the sources are
+    // compiled into the bridge, and the headers are parsed on top of
+    // the ones the build's .d files list, even outside root_dir, so
+    // their declarations can be exported like the library's own.
+    "CustomBridgeSources": [ "helper.cc" ],
+    "CustomBridgeHeaders": [ "helper.h" ],
     // Concrete classes the user wants to subclass from Go. Abstract
     // classes are picked up automatically; concrete classes with
     // virtuals require this opt-in because C++ has no language-level

@@ -340,6 +340,16 @@ type BridgeConfig struct {
 	// may name it `.c` while it uses C++ constructs. Example: ["py.c"].
 	CustomBridgeSources []string `json:"CustomBridgeSources,omitempty"`
 
+	// CustomBridgeHeaders lists the project's own headers (paths relative
+	// to the directory holding wasmify.json, as CustomBridgeSources
+	// resolves them) that parse-headers
+	// always parses, on top of the headers it discovers from the build's
+	// .d files. Their declarations stay in api-spec.json even when the
+	// header lives outside project.root_dir — typically the header of a
+	// CustomBridgeSources helper that only the bridge compiles, so no
+	// captured compile step ever included it. Example: ["helper.h"].
+	CustomBridgeHeaders []string `json:"CustomBridgeHeaders,omitempty"`
+
 	// IncludeExternalHeaders lists header files outside the project
 	// root that the parser should still walk. Used when the project
 	// exposes types from an external library (typically declared
