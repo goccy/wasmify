@@ -108,13 +108,19 @@ static int cloexec(void) {
     if (dup3(keep[0], copy, O_CLOEXEC) != copy) return 4;
     const int fds[] = {keep[0], drop[0], file, at, sock, copy};
     char script[256];
-    int n = snprintf(script, sizeof(script), "for fd in");
+    size_t n = 0;
+    int w = snprintf(script, sizeof(script), "for fd in");
+    if (w < 0 || (size_t)w >= sizeof(script)) return 9;
+    n = (size_t)w;
     for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++) {
         if (fds[i] >= 10) return 5;
-        n += snprintf(script + n, sizeof(script) - n, " %d", fds[i]);
+        w = snprintf(script + n, sizeof(script) - n, " %d", fds[i]);
+        if (w < 0 || (size_t)w >= sizeof(script) - n) return 9;
+        n += (size_t)w;
     }
-    snprintf(script + n, sizeof(script) - n,
-             "; do if { : >&$fd; } 2>/dev/null; then echo open; else echo closed; fi; done");
+    w = snprintf(script + n, sizeof(script) - n,
+                 "; do if { : >&$fd; } 2>/dev/null; then echo open; else echo closed; fi; done");
+    if (w < 0 || (size_t)w >= sizeof(script) - n) return 9;
     char *argv[] = {"sh", "-c", script, NULL};
     pid_t pid;
     if (posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ) != 0) return 6;
