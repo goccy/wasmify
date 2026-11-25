@@ -858,7 +858,9 @@ func lookupUnqualified(name, ns, classQual string, known map[string]bool, parent
 
 // bareTypeName strips cv qualifiers, pointer/reference markers,
 // and elaborated-type-specifier keywords from a clang qualType
-// string and returns the bare identifier. Returns "" when the
+// string and returns the bare identifier. A leading `::` is kept: it
+// makes the name fully qualified (from the global scope), so it must
+// not be looked up as an unqualified name. Returns "" when the
 // remainder is not a single identifier (e.g. template
 // instantiations -- those keep their existing form because
 // qualification of template arguments would land on
@@ -877,7 +879,6 @@ func bareTypeName(qt string) string {
 		s = strings.TrimPrefix(s, "struct ")
 		s = strings.TrimPrefix(s, "union ")
 		s = strings.TrimPrefix(s, "enum ")
-		s = strings.TrimPrefix(s, "::")
 		s = strings.TrimSpace(s)
 		if s == prev {
 			break
@@ -2896,6 +2897,17 @@ func (p *Parser) classifyType(qualType string) apispec.TypeRef {
 
 	// Remove leading const again (for "const std::string &")
 	t = strings.TrimPrefix(t, "const ")
+	// A leading `::` (protoc spells every type it names from the global
+	// scope: `::int32_t`, `::mylib::Foo_Kind`) names the same type as the
+	// spelling without it, which is the form the primitive set, the enum
+	// and class names and every downstream lookup use. A bare global name
+	// other than a builtin alias keeps it: without it `::Foo` would read as
+	// an unqualified name, which alias tables keyed by short name could
+	// resolve to a namespace's own `Foo`. QualType keeps the spelling as
+	// written.
+	if rest, ok := strings.CutPrefix(t, "::"); ok && (strings.Contains(rest, "::") || isPrimitiveType(rest)) {
+		t = rest
+	}
 	ref.Name = t
 
 	// Namespace-scope typedef expansion is intentionally deferred to
