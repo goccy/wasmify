@@ -4,7 +4,7 @@ go 1.25.12
 
 require (
 	github.com/bufbuild/protocompile v0.14.1
-	github.com/goccy/wasm2go v0.6.4
+	github.com/goccy/wasm2go v0.6.5
 	google.golang.org/protobuf v1.36.11
 )
 
