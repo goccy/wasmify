@@ -1836,7 +1836,39 @@ func cmdParseHeaders(args []string) error {
 	// compatible; headers across groups may conflict (e.g., different
 	// typedef for the same name). We use these groups to build safe
 	// umbrella headers.
+	var bridge *state.BridgeConfig
+	if s, err := state.Load(outDir); err == nil && s != nil {
+		bridge = s.Bridge
+	}
+	// bridge.ExternalTypes drives the parser allow-list: classes whose
+	// qualified name appears here are retained even when declared in
+	// non-project headers. This subsumes the older IncludeExternalHeaders /
+	// IncludeExternalClasses workaround for the common case where the user
+	// has already declared the type permitted in I/F signatures. It decides
+	// which declarations to keep, not which headers to parse, so it applies
+	// to --header too.
+	runBatchAllowedExternalClasses = nil
+	if bridge != nil && len(bridge.ExternalTypes) > 0 {
+		runBatchAllowedExternalClasses = append([]string(nil), bridge.ExternalTypes...)
+		fmt.Fprintf(os.Stderr, "[parse-headers] External classes allowed via bridge.ExternalTypes: %d\n", len(runBatchAllowedExternalClasses))
+	}
+
+	explicitHeaders := len(headerFiles) > 0
 	var headerGroups [][]string
+	if len(headerFiles) > 1 {
+		// Explicit headers form one group, as if one compile step had
+		// included them all; the umbrella merge still splits them if they
+		// conflict. The umbrella header lives in a temp dir, so its
+		// #includes need absolute paths.
+		for i, h := range headerFiles {
+			abs, err := filepath.Abs(h)
+			if err != nil {
+				return fmt.Errorf("--header %s: %w", h, err)
+			}
+			headerFiles[i] = abs
+		}
+		headerGroups = [][]string{headerFiles}
+	}
 	if len(headerFiles) == 0 {
 		if b == nil {
 			return fmt.Errorf("no --header specified and build.json not found. Run 'wasmify generate-build' first or specify --header")
@@ -1848,26 +1880,12 @@ func cmdParseHeaders(args []string) error {
 		// their methods parsed alongside the project headers. Each
 		// config entry is matched as a path substring against the
 		// .d file dependency lines.
-		// bridge.ExternalTypes drives the parser allow-list: classes
-		// whose qualified name appears here are retained even when
-		// declared in non-project headers. This subsumes the older
-		// IncludeExternalHeaders / IncludeExternalClasses workaround
-		// for the common case where the user has already declared the
-		// type permitted in I/F signatures.
-		runBatchAllowedExternalClasses = nil
-		if s, err := state.Load(outDir); err == nil &&
-			s != nil && s.Bridge != nil {
-			if len(s.Bridge.ExternalTypes) > 0 {
-				runBatchAllowedExternalClasses = append([]string(nil), s.Bridge.ExternalTypes...)
-				fmt.Fprintf(os.Stderr, "[parse-headers] External classes allowed via bridge.ExternalTypes: %d\n", len(runBatchAllowedExternalClasses))
+		if bridge != nil && len(bridge.IncludeExternalHeaders) > 0 {
+			extras := externalHeadersFromBuild(b, bridge.IncludeExternalHeaders)
+			for h := range extras {
+				projectHeaders[h] = true
 			}
-			if len(s.Bridge.IncludeExternalHeaders) > 0 {
-				extras := externalHeadersFromBuild(b, s.Bridge.IncludeExternalHeaders)
-				for h := range extras {
-					projectHeaders[h] = true
-				}
-				fmt.Fprintf(os.Stderr, "[parse-headers] External headers (from IncludeExternalHeaders): %d files\n", len(extras))
-			}
+			fmt.Fprintf(os.Stderr, "[parse-headers] External headers (from IncludeExternalHeaders): %d files\n", len(extras))
 		}
 		headerFiles, headerGroups = discoverProjectHeadersFromBuild(absPath, b, projectHeaders)
 		if len(headerFiles) == 0 {
@@ -1906,14 +1924,9 @@ func cmdParseHeaders(args []string) error {
 	if len(headerFiles) == 1 {
 		// Single header: direct processing
 		fmt.Fprintf(os.Stderr, "[parse-headers] Parsing: %s\n", headerFiles[0])
-		reader, cleanup, err := clangast.DumpASTStream(clangPath, headerFiles[0], compileFlags)
-		if err != nil {
-			return fmt.Errorf("failed to start clang: %w", err)
-		}
-		merged, err = clangast.ParseStream(reader, headerFiles[0])
-		if waitErr := cleanup(); waitErr != nil && err == nil {
-			err = waitErr
-		}
+		// The header is its own umbrella: parse it as a one-header batch,
+		// with the same options as any batch.
+		merged, err = runBatchClang(clangPath, headerFiles[0], headerFiles, compileFlags)
 		if err != nil {
 			return fmt.Errorf("failed to parse header: %w", err)
 		}
@@ -1960,6 +1973,14 @@ func cmdParseHeaders(args []string) error {
 			batches = mergeCompatibleGroupsFn(clangPath, headerGroups, compileFlags)
 			fmt.Fprintf(os.Stderr, "[parse-headers] group cache miss; recomputed\n")
 		}
+		// The umbrella merge drops a header that does not compile on its
+		// own. For discovered headers that is a skip; a header the user
+		// named must not vanish from api-spec.json without a word.
+		if explicitHeaders {
+			if missing := headersMissingFromBatches(headerFiles, batches); len(missing) > 0 {
+				return fmt.Errorf("--header: does not compile with the build's flags: %s", strings.Join(missing, ", "))
+			}
+		}
 		fmt.Fprintf(os.Stderr, "[parse-headers] Merged into %d umbrella batches\n", len(batches))
 
 		spec, hits, misses, batchDigests, err := runBatchesWithCache(clangPath, batches, compileFlags, version, dataDir, forceRebuild, groupCacheHit)
@@ -1981,30 +2002,17 @@ func cmdParseHeaders(args []string) error {
 		merged = spec
 		fmt.Fprintf(os.Stderr, "[parse-headers] batch cache: %d hit, %d miss\n", hits, misses)
 
-		// Re-run enum reclassification on the merged spec so that enum
-		// definitions living in one batch can be matched to TypeRefs from
-		// another batch (per-batch postProcessEnumTypes can't see the full
-		// enum universe). See the comment on PostProcessEnumTypes for why
-		// this is load-bearing for multi-batch parses.
-		clangast.PostProcessEnumTypes(merged)
-		// Same reasoning for handle-class promotion: a class definition
-		// might live in one batch while its by-value TypeRefs appear in
-		// another. Re-run after the full merge so cross-batch references
-		// are promoted to TypeHandle.
-		clangast.PostProcessHandleClasses(merged)
-		// Re-resolve any unqualified type spellings against the merged
-		// class / enum universe. The per-batch pass inside
-		// ParseStreamMultiWithOptions can only see classes from its own
-		// batch, so a method declared in batch A whose parameter type is
-		// defined in batch B would have stayed unqualified. Running the
-		// pass again on the merged spec gives every reference a chance to
-		// resolve against the full universe.
-		clangast.PostProcessQualifyShortNames(merged)
-
 		// Defer cache writes until after the spec is known good; if
 		// PostProcess panics or apispec.Save fails the next run will
 		// still see the previous (good) cache.
 		defer func() {
+			// groups.json and the prune keep-set describe one header set.
+			// An --header run is a side trip: writing its set would make
+			// the next discovery run recompute its groups and re-parse
+			// every batch.
+			if explicitHeaders {
+				return
+			}
 			if !groupCacheHit {
 				gc := &parsecache.GroupCache{
 					WasmifyVersion:   version,
@@ -2029,6 +2037,27 @@ func cmdParseHeaders(args []string) error {
 			}
 		}()
 	}
+
+	// Re-run enum reclassification on the merged spec so that enum
+	// definitions living in one batch can be matched to TypeRefs from
+	// another batch (per-batch postProcessEnumTypes can't see the full
+	// enum universe). See the comment on PostProcessEnumTypes for why
+	// this is load-bearing for multi-batch parses. A single header needs
+	// it too: the per-batch pass leaves short-name promotion off.
+	clangast.PostProcessEnumTypes(merged)
+	// Same reasoning for handle-class promotion: a class definition
+	// might live in one batch while its by-value TypeRefs appear in
+	// another. Re-run after the full merge so cross-batch references
+	// are promoted to TypeHandle.
+	clangast.PostProcessHandleClasses(merged)
+	// Re-resolve any unqualified type spellings against the merged
+	// class / enum universe. The per-batch pass inside
+	// ParseStreamMultiWithOptions can only see classes from its own
+	// batch, so a method declared in batch A whose parameter type is
+	// defined in batch B would have stayed unqualified. Running the
+	// pass again on the merged spec gives every reference a chance to
+	// resolve against the full universe.
+	clangast.PostProcessQualifyShortNames(merged)
 
 	if len(merged.Functions) == 0 && len(merged.Classes) == 0 && len(merged.Enums) == 0 {
 		return fmt.Errorf("no API declarations found in headers")
@@ -2442,6 +2471,24 @@ func checkUmbrellaCompiles(clangPath string, headers []string, compileFlags []st
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	return cmd.Run() == nil
+}
+
+// headersMissingFromBatches returns the headers that no batch contains,
+// in their given order.
+func headersMissingFromBatches(headers []string, batches [][]string) []string {
+	in := make(map[string]bool)
+	for _, b := range batches {
+		for _, h := range b {
+			in[h] = true
+		}
+	}
+	var missing []string
+	for _, h := range headers {
+		if !in[h] {
+			missing = append(missing, h)
+		}
+	}
+	return missing
 }
 
 func generateUmbrellaHeader(headerFiles []string) (string, error) {
